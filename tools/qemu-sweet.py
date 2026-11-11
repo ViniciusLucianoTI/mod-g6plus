@@ -230,6 +230,9 @@ def main():
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     ap.add_argument('--fb', help='framebuffer BASE:WxH handed to the kernel (default 0x9c000000:1080x2400 = sweet; '
                     'Moto G6 Plus / evert: 0x9d400000:1080x2160, with --cpu cortex-a53)')
+    ap.add_argument('--trace', action='append', default=[], metavar='EVENT',
+                    help='QEMU trace event (or pattern) written to qemu.log, repeatable, e.g. --trace gicv3_dist_write '
+                    '--trace gicv3_redist_write (the order of the kernel\'s GIC register writes)')
     a = ap.parse_args()
     if a.fb:
         global FB_BASE, FB_W, FB_H, FB_STRIDE
@@ -290,6 +293,8 @@ def main():
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    for event in a.trace:
+        cmd += ['-trace', event]
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
 

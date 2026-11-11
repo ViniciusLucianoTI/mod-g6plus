@@ -1,0 +1,65 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 5408cf3a9a38fa516ed0146d6373e83853dd12c8..56044481b72f55bd2a13ab69dacd6dcd152f7539 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -143,6 +143,30 @@ pe_init_fiq()
+ 		gicr_size = gicr_size_prop;
+ 	}
+ 
++#if defined(SWEET)
++	/*
++	 * patch 1030: distributor before redistributor, the order Linux (gic_dist_init, then gic_cpu_init) and
++	 * Enxerto's test_gic use. While GICD_CTLR.ARE_NS is 0 the SGI/PPI priority and enable registers of the
++	 * redistributor frame are RAZ/WI (their function is in the legacy GICD_*0 registers).
++	 *   SM7150/SDM845: ARE_NS reads as one, ABL hands over GICD_CTLR 0x10, so the order did not matter.
++	 *   SDM630 (Moto G6 Plus): ARE_NS is programmable and ABL hands over 0x0 (Enxerto: "GICD 0x0 -> 0x12").
++	 *   With the distributor written last, the IPRIORITYR/ISENABLER0 writes below were dropped: neither the
++	 *   virtual timer nor SGI1 was ever forwarded and the boot stopped at the first IOSleep.
++	 * Both enable bits are written because a write that changes ARE is decoded in the format in force before
++	 * it: EnableGrp1 (bit 0) with ARE_NS 0, EnableGrp1A (bit 1) with ARE_NS 1. ABL leaves both clear, which
++	 * the 0 -> 1 change of ARE_NS requires.
++	 */
++	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
++	gicd_write32(GICD_CTLR, gicd_ctlr | GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1);
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++	if (gicd_read32(GICD_CTLR) != gicd_ctlr) {
++		/* boot CPU only: later CPUs find it set */
++		kprintf("SWEET GIC: GICD_CTLR 0x%x -> 0x%x\n", gicd_ctlr, gicd_read32(GICD_CTLR));
++	}
++#endif /* SWEET */
++
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+ 
+@@ -175,7 +199,13 @@ pe_init_fiq()
+ 	for (unsigned int i = 0; i < 32; i += 4) {
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+-	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	const uint32_t gicr_enable = (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI);
++	gicr_write32(GICR_ISENABLER0, gicr_enable);
++	if ((gicr_read32(GICR_ISENABLER0) & gicr_enable) != gicr_enable) {
++		/* What patch 1030 fixes looked like this: the write is silently dropped. Not fatal, but say so. */
++		kprintf("SWEET GIC: redistributor kept ISENABLER0 0x%x, wanted 0x%x (GICD_CTLR 0x%x)\n",
++		    gicr_read32(GICR_ISENABLER0), gicr_enable, gicd_read32(GICD_CTLR));
++	}
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+@@ -204,13 +234,7 @@ pe_init_fiq()
+ 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
+ 
+ #if defined(SWEET)
+-	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
+-	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+-	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
+-	gicd_write32(GICD_CTLR, gicd_ctlr);
+-	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
+-		;
+-	}
++	// The distributor (ARE_NS | EnableGrp1A | EnableGrp1) is enabled before the redistributor, above
+ 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
+ #else
