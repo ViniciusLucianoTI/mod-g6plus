@@ -86,6 +86,10 @@ The A53 is ARMv8.0 and lacks instructions Apple compiles in unconditionally:
   the shared cache (branch to an LL/SC trampoline: changes code layout, a major new Renegade stage);
   (c) a different, older iOS userland built for ARMv8.0 (iOS <= 10-era 64-bit devices; would
   abandon the Bergamota stack). **Decide this before writing drivers.**
+* **Chosen 2026-11-10 (user): option (a) first, to measure.** Implemented as
+  `xnu/patches-12377/1020-sweet-lse-emulation.patch` + `tools/lseemu/` (host-verified against the Mac's
+  LSE hardware; not yet run on the phone, which needs a G6-bootable kernel first). Its log gives the
+  trap rate per class and process, which decides whether (b) is needed.
 
 Kernel side (fixable): `0004-sweet-machine-config.patch` builds XNU with `-march=armv8.2-a+crypto`
 (LSE can be emitted) -> `armv8-a+crypto`; `__ARM_PAN_AVAILABLE__ 1` must go (no PAN on A53);
