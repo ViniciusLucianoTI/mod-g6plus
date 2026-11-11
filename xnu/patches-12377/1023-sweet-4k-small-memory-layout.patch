@@ -21,3 +21,20 @@ index 5f4b512..a664ca7 100644
  
  ifeq ($(ARM64_LARGE_MEMORY),1)
  	ARM64_EXTRA_BUILD_FLAGS += -DARM_LARGE_MEMORY=1
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 9edf8c5..ede1590 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -167,7 +167,11 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_MAX_CHUNK_ALLOC_NUM        (10)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if   XNU_PLATFORM_MacOSX
++/*
++ * SWEET (patch 1023): the small-memory kernel layout leaves ~112 GB of kernel VA, less than macOS's 128 GB
++ * zone map alone (QEMU: kmem_range_init "hole < size" for kmem_ptr_range_0): use the iOS sizes.
++ */
++#if   XNU_PLATFORM_MacOSX && !defined(ARM64_BOARD_CONFIG_SWEET)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else
