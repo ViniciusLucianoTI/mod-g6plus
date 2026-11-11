@@ -1,0 +1,122 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -37,11 +37,35 @@
+ 	register uint64_t x1 __asm__("x1") = target;
+ 	register uint64_t x2 __asm__("x2") = entry;
+ 	register uint64_t x3 __asm__("x3") = context;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++/* patch 1033: PSCI AFFINITY_INFO (0 on, 1 off, 2 on pending) and the per-CPU boot stage markers */
++extern "C" uint8_t sweet_cpu_stage[];
++static int32_t
++sweet_psci_affinity_info(uint64_t target)
++{
++	register uint64_t x0 __asm__("x0") = 0xC4000004ULL;
++	register uint64_t x1 __asm__("x1") = target;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
+ 	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+ 	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+ 	    "x14", "x15", "x16", "x17", "cc", "memory");
+ 	return (int32_t)x0;
+ }
++static unsigned
++sweet_cpu_stage_read(unsigned cpu)
++{
++	volatile uint8_t *slot = &sweet_cpu_stage[(cpu & 7) * 64];
++	/* stage 1 is written with the caches off: drop this CPU's copy of the (never written here) line */
++	__asm__ volatile("dc civac, %0" : : "r"(slot) : "memory");
++	__builtin_arm_isb(ISB_SY);
++	return *slot;
++}
+ 
+ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+@@ -202,6 +226,11 @@
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
++				for (unsigned int j = 0; j < topology->num_cpus; j++) {
++					kprintf("SWEET CPU: cpu=%u mpidr=0x%x stage=%u psci_affinity=%d\n", j,
++					    topology->cpus[j].phys_id, sweet_cpu_stage_read(j),
++					    sweet_psci_affinity_info(topology->cpus[j].phys_id));
++				}
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			{
+@@ -253,6 +282,7 @@
+ 	assert(cpu_number() == (int)getCPUNumber());
+ 
+ 	/* patch 1026: breadcrumbs for the SDM630 hang (shown with sweetearlyfb=2) */
++	sweet_cpu_stage[(getCPUNumber() & 7) * 64] = 5;
+ 	kprintf("SWEET CPU: cpu=%u initCPU: broadcast CPU_BOOTED\n", getCPUNumber());
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
+ 	kprintf("SWEET CPU: cpu=%u initCPU: self SGI1\n", getCPUNumber());
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -716,11 +716,19 @@
+  *    Runs on S2R resume (all CPUs) and SMP boot (non-boot CPUs only).
+  */
+ 
++#if defined(SWEET)
++/* patch 1033: how far each secondary got (1 entry, 2 arm_init_cpu, 3 before "online", 4 cpu_machine_init, 5 initCPU) */
++uint8_t sweet_cpu_stage[8 * 64] __attribute__((aligned(64)));
++#endif
++
+ void
+ arm_init_cpu(
+ 	cpu_data_t      *cpu_data_ptr,
+ 	uint64_t __unused hib_header_phys)
+ {
++#if defined(SWEET)
++	sweet_cpu_stage[(cpu_data_ptr->cpu_number & 7) * 64] = 2;
++#endif
+ #if __ARM_PAN_AVAILABLE__
+ 	__builtin_arm_wsr("pan", 1);
+ #endif
+@@ -827,6 +835,9 @@
+ #endif
+ 
+ 
++#if defined(SWEET)
++	sweet_cpu_stage[(cpu_data_ptr->cpu_number & 7) * 64] = 3;
++#endif
+ 	if (should_kprintf) {
+ 		kprintf("arm_cpu_init(): cpu %d online\n", cpu_data_ptr->cpu_number);
+ 	}
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -754,6 +754,12 @@
+ 
+ 	bool started = os_atomic_or_orig(&cpu_data_ptr->cpu_flags, StartedState, relaxed) & StartedState;
+ 
++#if defined(SWEET)
++	{
++		extern uint8_t sweet_cpu_stage[];       /* patch 1033 */
++		sweet_cpu_stage[(cpu_data_ptr->cpu_number & 7) * 64] = 4;
++	}
++#endif
+ 	/* Note: this calls IOCPURunPlatformActiveActions when resuming on boot cpu */
+ 	PE_cpu_machine_init(cpu_data_ptr->cpu_id, !started);
+ 
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -302,6 +302,14 @@
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
+ 	msr		DAIFSet, #0xf
++	/* patch 1033: stage 1 = firmware entered the kernel (x0 = PSCI context = logical CPU). One 64-byte
++	 * slot per CPU; MMU and caches are off, the reader evicts its copy of the line before reading. */
++	adrp	x1, EXT(sweet_cpu_stage)@page
++	add		x1, x1, EXT(sweet_cpu_stage)@pageoff
++	and		x2, x0, #7
++	add		x1, x1, x2, lsl #6
++	mov		w2, #1
++	strb	w2, [x1]
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
