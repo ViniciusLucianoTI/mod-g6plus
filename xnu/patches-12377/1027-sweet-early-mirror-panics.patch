@@ -1,0 +1,22 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index fa60ee4..8828e8d 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -118,7 +118,7 @@ sweet_early_draw(char c)
+ void
+ sweet_early_putc(char c)
+ {
+-	if (early_disabled) {
++	if (early_disabled && !early_mirror) {     /* patch 1027: the mirror keeps panics visible */
+ 		return;
+ 	}
+ 	if (!early_flushed && early_ring_len < EARLY_RING) {
+@@ -165,7 +165,7 @@ sweet_early_mark(unsigned int stage, const char *label)
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	if ((early_disabled && !early_mirror) || early_panicking) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
