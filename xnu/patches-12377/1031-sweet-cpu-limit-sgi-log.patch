@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -289,11 +289,18 @@
+ 	    (((mpidr >> 16) & 0xff) << 32) |
+ 	    (((mpidr >> 8) & 0xff) << 16) |
+ 	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
+-	kprintf("SWEET CPU: SGI1 -> cpu=%u mpidr=0x%llx ICC_SGI1R=0x%llx\n", logical, mpidr, sgi);
++	/* patch 1031: only the first IPIs are logged; with several CPUs every IPI would hit the console */
++	static uint32_t sweet_sgi_logged;
++	bool log_sgi = __atomic_fetch_add(&sweet_sgi_logged, 1, __ATOMIC_RELAXED) < 12;
++	if (log_sgi) {
++		kprintf("SWEET CPU: SGI1 -> cpu=%u mpidr=0x%llx ICC_SGI1R=0x%llx\n", logical, mpidr, sgi);
++	}
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	__builtin_arm_isb(ISB_SY);
+-	kprintf("SWEET CPU: SGI1 written\n");
++	if (log_sgi) {
++		kprintf("SWEET CPU: SGI1 written\n");
++	}
+ 	{
+ 		static int sweet_sgi_reports;
+ 		if (sweet_sgi_reports++ < 2) {
