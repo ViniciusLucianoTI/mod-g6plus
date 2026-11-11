@@ -58,6 +58,35 @@ index 3fd8a91..9984086 100644
  
  
  #
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 13c4b97..9958c5d 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -11601,11 +11601,24 @@ static_assert((_COMM_PAGE32_BASE_ADDRESS & ~ARM_TT_L2_OFFMASK) >= VM_MAX_ADDRESS
+  */
+ 
+ #elif (ARM_PGSHIFT == 12)
++#if defined(SWEET)
++/**
++ * SWEET 4K granule (SDM630, patch 1021) with the extended user VA
++ * (MACH_VM_MAX_ADDRESS 0x7FFFFE000000): like the 16K macOS case above, the
++ * commpage lies inside the user VA range. With 4K pages it is nested at L1, so
++ * what must hold is that the 1GB L1 entry holding it is exactly the commpage
++ * nesting region every user map reserves (vm_reserved_regions[], "commpage
++ * nesting"), so no user mapping can land in the shared table.
++ */
++static_assert((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) == _COMM_PAGE64_NESTING_START);
++static_assert(_COMM_PAGE64_NESTING_SIZE == ARM_TT_L1_SIZE);
++#else
+ /**
+  * Ensure that 64-bit devices using 4K pages can nest the commpage completely
+  * above the maximum userspace VA.
+  */
+ static_assert((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) >= MACH_VM_MAX_ADDRESS);
++#endif /* SWEET */
+ #else
+ #error Nested shared page mapping is unsupported on this config
+ #endif
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 index 9e8f61d..52f5a7d 100644
 --- a/osfmk/arm64/arm_vm_init.c
