@@ -1,0 +1,23 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 5f4b512..a664ca7 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -455,6 +455,18 @@ ARM64_PLKSEG_ADDR  = 0xfffffe0004004000
+ ARM64_LINK_ADDR    = 0xfffffe0007004000
+ endif
+ 
++# SWEET (patch 1023): the kernel uses the 4K translation granule since patch 1021 (SDM630 Cortex-A53 has no
++# 16K granule). ARM_LARGE_MEMORY puts the kernel at -2TB (0xfffffe0007004000), which a 4K TTBR1 only covers
++# with a level-0 root, but the 4K bootstrap (start.s create_bootstrap_mapping, T1SZ_BOOT 25/26) builds an L1
++# root: the first kernel-VA fetch after the MMU comes on takes a level-0 translation fault (QEMU cortex-a53,
++# 2026-11-11). Use the small-memory layout of the 4K iOS kernels instead: VM_MIN_KERNEL_ADDRESS
++# 0xffffffe000000000, link 0xfffffff007004000, sub-page L1 roots (T0SZ/T1SZ 26).
++ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ARM64_LARGE_MEMORY = 0
++ARM64_PLKSEG_ADDR  = 0xfffffff004004000
++ARM64_LINK_ADDR    = 0xfffffff007004000
++endif
++
+ 
+ ifeq ($(ARM64_LARGE_MEMORY),1)
+ 	ARM64_EXTRA_BUILD_FLAGS += -DARM_LARGE_MEMORY=1

@@ -228,7 +228,15 @@ def main():
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
+    ap.add_argument('--fb', help='framebuffer BASE:WxH handed to the kernel (default 0x9c000000:1080x2400 = sweet; '
+                    'Moto G6 Plus / evert: 0x9d400000:1080x2160, with --cpu cortex-a53)')
     a = ap.parse_args()
+    if a.fb:
+        global FB_BASE, FB_W, FB_H, FB_STRIDE
+        base, wh = a.fb.split(':')
+        FB_BASE = int(base, 0)
+        FB_W, FB_H = (int(v) for v in wh.split('x'))
+        FB_STRIDE = FB_W * 4
 
     if a.check_env:
         ok = check_qemu_dependency(a.cpu)
@@ -268,6 +276,9 @@ def main():
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
     mon = f'{out}/mon.sock'
+    if len(mon) > 100:	# AF_UNIX path limit (104 on macOS): put the socket in a short temporary directory
+        import tempfile
+        mon = os.path.join(tempfile.mkdtemp(prefix='qs'), 'mon.sock')
     if os.path.exists(mon):
         os.unlink(mon)
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).

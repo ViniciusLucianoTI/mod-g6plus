@@ -1,8 +1,8 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 52f5a7d..d9a401a 100644
+index 52f5a7d..bb60df4 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1844,6 +1844,45 @@ sweet_early_map_final(void)
+@@ -1844,6 +1844,46 @@ sweet_early_map_final(void)
  	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
  	__asm__ volatile("dsb ishst" ::: "memory");
  }
@@ -23,7 +23,8 @@ index 52f5a7d..d9a401a 100644
 +	if (!sweet_early_fb_mapped) {
 +		return;
 +	}
-+	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	/* the 4K kernel root is a sub-page L1 (T1SZ_BOOT 26): index it like arm_vm_init does */
++	tt_entry_t l1 = cpu_tte[L1_TABLE_T1_INDEX(va, TCR_EL1_BOOT)];
 +	unsigned int idx = (unsigned int)((va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
 +	if (va + n * ARM_TT_L2_SIZE > gVirtBase || idx + n > TTE_PGENTRIES ||
 +	    (l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) != (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
@@ -48,7 +49,7 @@ index 52f5a7d..d9a401a 100644
  #endif
  
  void
-@@ -2200,7 +2239,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2200,7 +2240,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	kasan_init();
  #endif /* KASAN */
  
@@ -57,7 +58,7 @@ index 52f5a7d..d9a401a 100644
  	/* phystokv() must still refer to the bootstrap aperture here. */
  	sweet_early_map_final();
  #endif
-@@ -2209,9 +2248,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2209,9 +2249,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  
  	ml_enable_monitor();
  

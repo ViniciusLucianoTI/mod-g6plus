@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium|evert] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
 """
 import hashlib, os, struct, sys
 
@@ -70,6 +70,25 @@ BOARDS = {
         # /arm-io/bluetooth for bluetoothd/BlueTool (docs/BT_IOS_TRANSPORT.md 3.2). Sweet has no
         # Bluetooth driver: the node is beryllium only.
         bluetooth=True),
+    # Moto G6 Plus (mod-g6plus), SDM630, values from the phone's live FDT (2026-11-11): GICR 0x17b00000,
+    # cont_splash_region@9d400000 0x23ff000, panel 1080x2160. Eight Kryo 260 (Cortex-A53 class) in two
+    # clusters, in the live DT's order: cpu0-3 = MPIDR 0x100-0x103 (boot cluster, 2.208 GHz), cpu4-7 =
+    # 0x0-0x3 (1.8432 GHz).
+    'evert': dict(
+        fb=(0x9d400000, 0x23ff000), fb_wh=(1080, 2160),
+        compat=['motorola,evert', 'xiaomi,sweet', 'qcom,sdm630'],
+        cpu_compat='qcom,kryo260',
+        mpidr=[0x100, 0x101, 0x102, 0x103, 0x000, 0x001, 0x002, 0x003],
+        cpu_freqs=[2208000000] * 4 + [1843200000] * 4, big_from=8, freqs=(0, 0),
+        gicr=0x17b00000,
+        # Kernel RAM: 0xb0000000 + 1.25 GB, inside the Linux System RAM range 0xaf0c0000-0x17e4bffff (above
+        # ramoops/tzlog/wdog_cpu, which end at 0xaf0c0000; all fixed carve-outs are below 0x9f800000). It
+        # stays in L1 entries 2-3, so with the KVA side the 4K bootstrap tables need at most 7 of their 8
+        # pages, it is > 1 GB (arm_init keeps 16K VM pages for userland) and below 4 GB. ABL put the
+        # boot.img ramdisk at 0x84200000 (live FDT linux,initrd-start), far below.
+        mem=(0xb0000000, 0x50000000),
+        # no UFS node: the G6 boots from eMMC (sdhc_1), which the kernel has no driver for yet
+        ufs=False),
 }
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
@@ -171,7 +190,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x}: must be 16K aligned inside {LOWPOOL_MIN:#x}..{LOWPOOL_MAX:#x}')
         if lp_base < phys_base + mem_size and phys_base < lp_base + lp_size:
             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x} overlaps the kernel RAM {phys_base:#x}+{mem_size:#x}')
-    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, b.get('gicr', GICR), TIMEBASE)
     # 256 bytes: xnu-12377 asks the bootloader for 4 * SHA-512 (prng_random.c, panics "Expected 256 seed bytes from
     # bootloader, but got 64"); older kernels copy only the 64 they ask for (PE_get_random_seed clamps)
     seed = seed if seed is not None else os.urandom(256)
@@ -235,7 +254,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
             ('device_type', cstr('cpu')),
             # SweetCPU matches IONameMatch 'qcom,kryo470': keep it after the real core name
             ('compatible', cstr(b['cpu_compat']) + (cstr('qcom,kryo470') if b['cpu_compat'] != 'qcom,kryo470' else b'') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            # actual MPIDR Aff1:Aff0, NOT logical ID (QEMU virt's single CPU is MPIDR 0)
+            ('reg', u32(b['mpidr'][core] if 'mpidr' in b and not qemu else core << 8)),
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -245,7 +265,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(b['freqs'][core >= b['big_from']])),
+            ('clock-frequency', u32(b['cpu_freqs'][core] if 'cpu_freqs' in b else b['freqs'][core >= b['big_from']])),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -342,7 +362,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or not b.get('ufs', True) else [ufs]))
 
 
 if __name__ == '__main__':
