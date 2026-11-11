@@ -104,6 +104,17 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # ...and its arm64 slice must be ARMv8.0 like the kernel (xnu 1021, SDM630 Cortex-A53): Apple clang
+          # otherwise compiles it for apple-m1 (LSE, LDAPR). Only the plain arm64 slice, which only SWEET links.
+          python3 - <<'PY'
+          p = 'dxb/build.sh'
+          s = open(p).read()
+          old = 'VALID_ARCHS="x86_64 arm64e arm64"'
+          assert s.count(old) == 1, 'libfirehose_kernel xcodebuild line changed'
+          s = s.replace(old, old + " 'OTHER_CFLAGS[arch=arm64]=$(inherited) -mcpu=cortex-a53'")
+          open(p, 'w').write(s)
+          PY
+          grep -c "OTHER_CFLAGS\[arch=arm64\]" dxb/build.sh
           # dxb only warns and carries on when a patch does not apply; for ours that would silently
           # produce a kernel without it, so make it fatal.
           python3 - <<'PY'
