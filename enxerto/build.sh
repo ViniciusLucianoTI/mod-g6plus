@@ -3,7 +3,7 @@
 #   BOARD=sweet (default)  boot.img v2 mirroring the stock PixelOS header, DTB in the header
 #   BOARD=beryllium        boot.img v1, Image.gz + appended DTB like the Poco F1 ROM (SDM845 ABL)
 #   BOARD=evert            Moto G6 Plus (SDM630): boot.img v0, Image.gz + appended DTB (msm-4.4 era ABL),
-#                          4K MMU granule, eMMC (EMMC_WRITE=1 enables writes), SPMI arbiter v3, USB not
+#                          4K MMU granule, eMMC read-only (boot-only phone), SPMI arbiter v3, USB not
 #                          ported yet, CHARGER=0 by default. Without its DTB only the Image and the host
 #                          tests are built.
 # Usage: [BOARD=..] [DTB=..] ./build.sh [payload.bin]
@@ -39,8 +39,9 @@ case $BOARD in
 sweet)		DTB=${DTB:-../dtb/boot_unpacked/dtb} ;;
 beryllium)	DTB=${DTB:-../dtb/beryllium/dtb}; BOARDDEF=-DBOARD_BERYLLIUM ;;
 evert)		DTB=${DTB:-../dtb/evert/dtb}; BOARDDEF=-DBOARD_EVERT; STORAGE_SRC=emmc.c
-		# EMMC_WRITE=1: the eMMC write path (emmc.h); off until the read path is checked on the phone
-		[ "${EMMC_WRITE:-0}" = 0 ] || CFLAGS="$CFLAGS -DEMMC_WRITE=1" ;;
+		# The user keeps Android 15 on this phone and only wants iOS booted with `fastboot boot` (2026-11-11):
+		# Enxerto must never write its eMMC, so the write path (emmc.h EMMC_WRITE) is not buildable here.
+		[ "${EMMC_WRITE:-0}" = 0 ] || { echo "error: EMMC_WRITE refused for evert (boot-only, Android stays intact)" >&2; exit 1; } ;;
 *)		echo "error: unknown BOARD=$BOARD" >&2; exit 1 ;;
 esac
 CFLAGS="$CFLAGS $BOARDDEF"
