@@ -1,6 +1,6 @@
 # Moto G6 Plus (evert) hardware facts, and what Bergamota hardcodes for the Poco F1
 
-Status 2026-11-10: **desk research only, nothing read from a real G6 Plus yet.** Marks:
+Status 2026-11-10: desk research plus **one collection from the user's phone (section 0)**. Marks:
 **(src)** read in public source, **(inf)** inference, **(dev)** must be read on the device
 (`tools/g6plus/collect.sh`, Enxerto's diagnostic screens).
 
@@ -9,6 +9,41 @@ Sources: LineageOS `android_device_motorola_evert` + `android_device_motorola_ms
 `arch/arm/boot/dts/qcom/sdm630*`), mainline `arch/arm64/boot/dts/qcom/sdm630.dtsi`,
 `lineage_wiki/_data/devices/evert.yml`. Spot-checked by hand: msm-id/board-id, `c0c4000.sdhci`,
 `Image.gz-dtb`, A/B, pagesize, 8x `arm,cortex-a53`.
+
+## 0. Measured on the user's phone (2026-11-10, `tools/g6plus/collect.sh`, Magisk root)
+
+Device: XT1926-8, hwrev 0xC100 / pvt1, radio Brazil, carrier retbr, LineageOS 22 (Android 15),
+kernel 4.4.302, bootloader `MBM-3.0-evert_retail-83f0397e7a-200825`, slot `_a`, unlocked
+(`bl_state=2`, verifiedbootstate orange). Raw data: `backup/evert/20261110-235509/` (git-ignored).
+
+* **CPU: 8x MIDR implementer 0x51 (Qualcomm), part 0x801, variant 0xa, revision 4** = Kryo 260 Silver-class,
+  an A53 derivative (not plain ARM 0xd03). `Features: fp asimd evtstrm aes pmull sha1 sha2 crc32`:
+  **no `atomics` (LSE), no `lrcpc`, no `fphp/asimdhp`, no `asimddp`** -> ARMv8.0 + crypto, confirmed.
+  The LSE blocker in section 2 is real. ID_AA64MMFR0 (16K granule) not readable from EL0 on this 4.4
+  kernel; read it from Enxerto.
+* Topology: cpu0-3 = package 1, max 2.208 GHz (boot cluster); cpu4-7 = package 0, max 1.8432 GHz.
+* RAM: 4 GB model (MemTotal 3.83 GB). System RAM ranges 0x80000000-0x855fffff, 0x88f00000-0x8abfffff,
+  0x94b00000-0xaefcefff, 0xaf0c0000-0x17e4bffff.
+* Storage: eMMC `mmcblk0` 59640 MiB (64 GB) behind `c0c4000.sdhci`; SD at `c084000.sdhci`. The UFS PHY
+  (0x1da7000) and UFS ICE exist in the DT but no UFS host is bound. Rootfs `root=/dev/mmcblk0p67` (system_a).
+* **Partitions (70, A/B):** `xbl_a/b` (p1/p2), `tz`, `rpm`, `hyp`, `devcfg`, `pmic`, **`abl_a/b` (p13/14, 1 MiB)**
+  -> the bootloader is Qualcomm XBL + ABL (Motorola "MBM-3.0"), like SDM845. `boot_a/b` p44/p45 64 MiB,
+  **`dto_a/b` p46/47 16 MiB** (DT overlay partition, check whether it is used), `logo_a/b` p56/57 32.6 MiB,
+  `vbmeta_a/b`, `modem_a/b` 110 MiB, `modemst1/2`, `fsg_a/b`, `persist` 32 MiB, `utags`, `hw`, `oem_a/b` 240 MiB,
+  `system_a/b` 2752 MiB, `vendor_a/b` 912 MiB, **`userdata` p69 51200 MiB**.
+* Display: panel `mipi_mot_vid_tianma_1080p_593` (`mdss_mdp.panel=1:dsi:0:qcom,mdss_dsi_mot_tianma_593_1080p_vid_v0`),
+  1080x2160 @60, video mode, fb0 virtual 1080x4320 (double buffer). MDSS is the old fbdev `mdss_fb` driver.
+* **Touch: Goodix GT9xx at i2c-3 0x5d (`gt9xx-mmi`, bound to `Goodix-TS`).** The FocalTech node at 3-0038
+  is present but unbound (not fitted).
+* Other I2C: i2c-2 Cypress SAR sensor `sf3155` @0x1d, Cirrus `cs35l35` amp @0x40; i2c-6 NXP NFC @0x28.
+* Keys: `qpnp_pon` input (power, vol-down) + gpio-keys.
+* GPU: `Adreno508v1`, 700 MHz max; firmware present: `a530_pfp.fw`, `a530_pm4.fw`, `a508_zap.mdt/.b00-.b02`.
+* MMIO seen in /proc/iomem: GCC 0x00100000, PS_HOLD 0x010ac000, TLMM 0x03000000-0x03bfffff, MSS qdsp6
+  0x04080000, KGSL 0x05000000, GPU SMMU 0x05040000, GPUCC 0x05065000, **SPMI cnfg 0x0800a000, core 0x0800f000,
+  chnls 0x08400000, obsrvr 0x09400000, intr 0x0a400000**, DWC3 0x0a800000, QMP USB3 PHY 0x0c010000,
+  QUSB2 0x0c012000 (+ second 0x0c014000).
+* Physical note: the phone's USB data link is flaky (first it enumerated only as a charger; later it dropped
+  off USB mid-session). Clean the port / try another cable before any flashing.
 
 ## 1. G6 Plus vs Poco F1
 

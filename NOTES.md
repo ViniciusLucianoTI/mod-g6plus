@@ -6,7 +6,8 @@
 * **Blocker found (not yet measured on device):** iOS 18/26 userland uses LSE atomics (~426k sites) and LDAPR (~94k), which ARMv8.0 lacks; Renegade cannot rewrite LSE 1:1. A strategy (trap emulation, out-of-line shared-cache rewrite, or another userland) must be chosen before driver work.
 * `tools/g6plus/collect.sh`: read-only adb collector (raw to `backup/evert/`, redacted `summary.txt`, live DT to `dtb/evert/live.dtb`, `--backup` dd's partitions except OS/user). Syntax and redaction tested on the Mac; **never run against a phone** (adb/fastboot were not installed on 2026-11-10).
 * **Device state (user, 2026-11-10):** bootloader already unlocked; LineageOS (Android 15) installed; rooted with Magisk. platform-tools now installed on the Mac (/opt/homebrew/bin/adb, fastboot); phone not yet seen by `adb devices`.
-* Next: user installs platform-tools, connects the G6 Plus; check unlock state (`fastboot getvar all`), run collect.sh, confirm ID registers (LSE absent), then decide the LSE strategy.
+* **collect.sh run on the phone (2026-11-10, boot slot _a):** results in `docs/G6PLUS_HARDWARE.md` section 0. Observed: MIDR 0x51/0x801 (Kryo 260 Silver, A53-class) on all 8 cores, Features without atomics/lrcpc/fphp/asimddp -> **LSE blocker confirmed**; 4 GB; eMMC 64 GB; xbl+abl partitions (ABL); boot_a/b, dto_a/b, logo_a/b, userdata p69 50 GiB; Tianma panel; **Goodix GT9xx touch @ i2c-3 0x5d**; live DT in `dtb/evert/live.dtb` (dtc not installed yet). collect.sh fixed: no `adb root`, su via stdin, cpuinfo Serial redacted. Partition backups (`--backup`) NOT taken yet; USB link dropped mid-session.
+* Next (old): user installs platform-tools, connects the G6 Plus; check unlock state (`fastboot getvar all`), run collect.sh, confirm ID registers (LSE absent), then decide the LSE strategy.
 
 ---
 
