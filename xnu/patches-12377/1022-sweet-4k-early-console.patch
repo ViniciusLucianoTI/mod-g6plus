@@ -1,18 +1,21 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 52f5a7d..bb60df4 100644
+index 52f5a7d..60a2531 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1844,6 +1844,46 @@ sweet_early_map_final(void)
+@@ -1844,6 +1844,49 @@ sweet_early_map_final(void)
  	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
  	__asm__ volatile("dsb ishst" ::: "memory");
  }
 +#elif defined(SWEET)
 +/*
 + * 4K granule (patch 1022): the same idea with SWEET_EARLY_FB_BLOCKS 2MB blocks right above the
-+ * low-globals block. Every condition is checked instead of asserted: a failed placement only turns
-+ * the early console back into a log (sweet_early_fb_mapped = 0) instead of an invisible panic.
++ * low-globals block. With the small-memory layout (patch 1023) VM_MIN_KERNEL_ADDRESS has no tables
++ * yet, but LOW_GLOBAL_BASE_ADDRESS (0xfffffff000000000) shares its 1GB L1 entry with the kernel
++ * (0xfffffff007004000), and L2 slots 1-6 of that table lie between the low globals and the kernel.
++ * Every condition is checked instead of asserted: a failed placement only turns the early console
++ * back into a log (sweet_early_fb_mapped = 0) instead of an invisible panic.
 + */
-+#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++#define SWEET_EARLY_FB_VA (LOW_GLOBAL_BASE_ADDRESS + ARM_TT_L2_SIZE)
 +
 +static void
 +sweet_early_map_final(void)
@@ -49,7 +52,7 @@ index 52f5a7d..bb60df4 100644
  #endif
  
  void
-@@ -2200,7 +2240,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2200,7 +2243,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	kasan_init();
  #endif /* KASAN */
  
@@ -58,7 +61,7 @@ index 52f5a7d..bb60df4 100644
  	/* phystokv() must still refer to the bootstrap aperture here. */
  	sweet_early_map_final();
  #endif
-@@ -2209,9 +2249,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2209,9 +2252,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  
  	ml_enable_monitor();
  

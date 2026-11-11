@@ -75,7 +75,11 @@ BOARDS = {
     # clusters, in the live DT's order: cpu0-3 = MPIDR 0x100-0x103 (boot cluster, 2.208 GHz), cpu4-7 =
     # 0x0-0x3 (1.8432 GHz).
     'evert': dict(
-        fb=(0x9d400000, 0x23ff000), fb_wh=(1080, 2160),
+        # sweet-fbcon covers only the 1080x2160x4 framebuffer (16K rounded), not the whole 36 MB
+        # cont_splash_region: serial_init io_maps it twice, and with 4K pages arm_vm_init's early I/O L3
+        # tables (2 MB + 10 MB per 256 MB of RAM + the framebuffer) are rounded to 2 MB, not 32 MB
+        # (QEMU: second mapping -> panic "pmap_map_bd").
+        fb=(0x9d400000, 0x8e8000), fb_wh=(1080, 2160),
         compat=['motorola,evert', 'xiaomi,sweet', 'qcom,sdm630'],
         cpu_compat='qcom,kryo260',
         mpidr=[0x100, 0x101, 0x102, 0x103, 0x000, 0x001, 0x002, 0x003],
