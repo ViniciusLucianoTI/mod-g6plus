@@ -44,17 +44,20 @@ index bed0aa3..de1fc96 100644
  		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
  	}
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index 3fd8a91..9984086 100644
+index 3fd8a91..5f4b512 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
-@@ -93,7 +93,9 @@ MACHINE_FLAGS_ARM64_T8132 = -DARM64_BOARD_CONFIG_T8132			-mcpu=apple-m4
+@@ -93,7 +93,12 @@ MACHINE_FLAGS_ARM64_T8132 = -DARM64_BOARD_CONFIG_T8132			-mcpu=apple-m4
  MACHINE_FLAGS_ARM64_T8142 = -DARM64_BOARD_CONFIG_T8142 			-mcpu=apple-m4+memtag+predres2
  
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a+sme2
 -MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
-+# SWEET: ARMv8.0 + crypto, the common subset of SM7150/SDM845 (v8.2) and SDM630 (Cortex-A53 class, v8.0):
-+# no LSE, RDM, FP16 or DotProd may be emitted in the kernel (patch 1021).
-+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto
++# SWEET: ARMv8.0 + crypto (AES/SHA2/CRC32), the common subset of SM7150/SDM845 (v8.2) and SDM630
++# (Cortex-A53 class, v8.0): no LSE, RCpc, RDM, FP16 or DotProd may be emitted in the kernel (patch 1021).
++# It must be -mcpu, not -march: for arm64-apple-macos Apple clang keeps its default CPU (apple-m1) for
++# code generation whatever -march says (only the __ARM_FEATURE_* macros follow -march), so
++# -march=armv8-a+crypto still emitted LDADDAL/CAS/LDAPR (CI 42958761390: 2051 LSE + 278 LDAPR).
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53
  
  
  #
