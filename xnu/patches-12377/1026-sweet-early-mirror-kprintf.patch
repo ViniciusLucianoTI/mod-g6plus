@@ -1,0 +1,105 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index ba85385..fa60ee4 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -246,6 +246,13 @@ sweet_early_relocate(uint64_t base)
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+ 
++/* kprintf() asks first (patch 1026), so the formatting is skipped while the mirror is off. */
++int
++sweet_early_mirror_enabled(void)
++{
++	return early_mirror && EARLY_FB_MAPPED && !early_panicking;
++}
++
+ /* console_write() hook (serial_console.c): see early_mirror. Drops bytes rather than nesting. */
+ void
+ sweet_early_mirror(const char *s, int n)
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 90f2d70..2bf9b28 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -34,6 +34,7 @@ void sweet_early_disable(void);
+ void sweet_early_set_cmdline(const char *cmdline);
+ void sweet_early_flush_log(void);
+ void sweet_early_mirror(const char *s, int n);
++int sweet_early_mirror_enabled(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+@@ -44,6 +45,7 @@ static inline void sweet_early_disable(void) {}
+ static inline void sweet_early_set_cmdline(const char *cmdline) { (void)cmdline; }
+ static inline void sweet_early_flush_log(void) {}
+ static inline void sweet_early_mirror(const char *s, int n) { (void)s; (void)n; }
++static inline int sweet_early_mirror_enabled(void) { return 0; }
+ static inline void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+ 	(void)pa;
+diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
+index efa7b63..78982bc 100644
+--- a/pexpert/arm/pe_kprintf.c
++++ b/pexpert/arm/pe_kprintf.c
+@@ -96,6 +96,20 @@ _kprintf(const char *format, ...)
+ 
+ static int      cpu_last_locked = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * sweetearlyfb=2 (patches 1025/1026): kprintf goes to the serial port only, which the SDM630 phone does not have;
++ * mirror it onto the panel through the synchronous early console too (cpu_start, initCPU, ... trails).
++ */
++extern int sweet_early_mirror_enabled(void);
++extern void sweet_early_mirror(const char *s, int n);
++static void
++sweet_kprintf_mirror_putc(char c)
++{
++	sweet_early_mirror(&c, 1);
++}
++#endif
++
+ __attribute__((noinline, not_tail_called))
+ void
+ kprintf(const char *fmt, ...)
+@@ -105,6 +119,14 @@ kprintf(const char *fmt, ...)
+ 	boolean_t       state;
+ 	void           *caller = __builtin_return_address(0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_early_mirror_enabled()) {
++		va_list mirror;
++		va_start(mirror, fmt);
++		_doprnt_log(fmt, &mirror, sweet_kprintf_mirror_putc, 16);
++		va_end(mirror);
++	}
++#endif
+ 	if (!disable_serial_output && !disable_kprintf_output) {
+ 		va_start(listp, fmt);
+ 		va_copy(listp2, listp);
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index de1fc96..86c3a32 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -233,7 +233,10 @@ SweetCPU::initCPU(bool boot)
+ 	}
+ 	assert(cpu_number() == (int)getCPUNumber());
+ 
++	/* patch 1026: breadcrumbs for the SDM630 hang (shown with sweetearlyfb=2) */
++	kprintf("SWEET CPU: cpu=%u initCPU: broadcast CPU_BOOTED\n", getCPUNumber());
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
++	kprintf("SWEET CPU: cpu=%u initCPU: self SGI1\n", getCPUNumber());
+ 
+ 	/* Secondary startup runs at splsched: queue the self-IPI and return.
+ 	 * startAll waits for its delivery after the startup thread unmasks IRQs.
+@@ -267,9 +270,11 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	    (((mpidr >> 16) & 0xff) << 32) |
+ 	    (((mpidr >> 8) & 0xff) << 16) |
+ 	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
++	kprintf("SWEET CPU: SGI1 -> cpu=%u mpidr=0x%llx ICC_SGI1R=0x%llx\n", logical, mpidr, sgi);
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	__builtin_arm_isb(ISB_SY);
++	kprintf("SWEET CPU: SGI1 written\n");
+ }
+ 
+ kern_return_t
