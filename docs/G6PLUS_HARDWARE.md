@@ -42,6 +42,13 @@ kernel 4.4.302, bootloader `MBM-3.0-evert_retail-83f0397e7a-200825`, slot `_a`, 
   0x04080000, KGSL 0x05000000, GPU SMMU 0x05040000, GPUCC 0x05065000, **SPMI cnfg 0x0800a000, core 0x0800f000,
   chnls 0x08400000, obsrvr 0x09400000, intr 0x0a400000**, DWC3 0x0a800000, QMP USB3 PHY 0x0c010000,
   QUSB2 0x0c012000 (+ second 0x0c014000).
+* **`dtb/evert/live.dtb` from this run is TRUNCATED** (232960 of 317131 bytes): collect.sh's `adb exec-out su -c cat`
+  pipe cut it. Fixed in collect.sh (temp copy + adb pull + size/SHA-256 check); re-run to get the full DT. Until then
+  the SoC/board facts Enxerto uses come from the LineageOS kernel DT (sdm630.dtsi, sdm660-common.dtsi,
+  msm-pm660.dtsi, msm-pm660l.dtsi, sdm630-evert.dtsi): GICR 0x17b00000, PS_HOLD 0x010ac000, IMEM 0x146bf000,
+  cont_splash 0x9d400000 (0x23ff000), SDHC1 0x0c0c4000 (sdhci-msm-v5, 8 bit), SPMI ee 0 / reserved chan 511,
+  PM660 SID 0/1 (PON with resin = Volume Down, SMB2 charger 0x1000.., FG gen3 0x4000..), PM660L SID 2/3
+  (WLED 0xd800/0xd900, strings 0+1 on evert), timer PPIs 1/2/3/0 (vtimer INTID 19 as on SDM845).
 * Physical note: the phone's USB data link is flaky (first it enumerated only as a charger; later it dropped
   off USB mid-session). Clean the port / try another cable before any flashing.
 

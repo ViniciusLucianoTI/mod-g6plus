@@ -22,6 +22,7 @@
 #define USB_E_RESET	(-12)	/* DCTL.CSFTRST stuck */
 #define USB_E_EP0	(-13)	/* an endpoint-0 command failed */
 #define USB_E_RUN	(-14)	/* controller never left halt */
+#define USB_E_BOARD	(-15)	/* not ported to this board (BOARD_EVERT): nothing touched */
 
 enum usb_state {
 	USB_ST_DOWN,		/* not initialised / stopped */

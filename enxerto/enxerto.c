@@ -16,7 +16,13 @@
 #include "charge_mode.h"
 #include "charger.h"
 #include "usb_power.h"
+#if defined(STORAGE_EMMC)
+#include "emmc.h"
+#define STORAGE_NAME	"EMMC"
+#else
 #include "ufs.h"
+#define STORAGE_NAME	"UFS"
+#endif
 #include "fdt.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
@@ -192,12 +198,12 @@ static void __attribute__((unused)) test_smp(void)
 	int64_t ret[NR_CPUS];
 
 	for (int i = 1; i < NR_CPUS; i++)
-		ret[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, i);
+		ret[i] = smc(PSCI_CPU_ON, CPU_MPIDR(i), (uintptr_t)secondary_entry, i);
 	delay_ms(500);
 	for (int i = 1; i < NR_CPUS; i++) {
 		char label[] = "CPU0";
 		label[3] = '0' + i;
-		if (((uint64_t)i << 8) == self)
+		if (CPU_MPIDR(i) == self)
 			con_str(label, "is boot cpu");
 		else
 			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=",
@@ -437,16 +443,20 @@ void enxerto_main(uint64_t dtb)
 	stage = "fdt";
 	con_set_scale(2);
 	fdt_board_info(dtb);
-	con_str("NEXT", "UFS probe in 15 s");
+	con_str("NEXT", STORAGE_NAME " probe in 15 s");
 	delay_ms(15000);
 	con_clear(BG_BOOT);
 	con_set_scale(3);
 
-	/* Then probe the internal UFS while the MMU is still off. */
-	stage = "ufs";
+	/* Then probe the internal storage while the MMU is still off. */
+	stage = "storage";
+#if defined(STORAGE_EMMC)
+	test_emmc();
+#else
 	test_ufs();
+#endif
 	con_skip();
-	con_str("UFS", "probe done, GIC/timer test in 15 s");
+	con_str(STORAGE_NAME, "probe done, GIC/timer test in 15 s");
 	delay_ms(15000);
 
 	/* Does the virtual timer (what xnu uses) reach us as a Group 1 IRQ? */

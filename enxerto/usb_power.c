@@ -107,6 +107,15 @@ static const uint16_t phy_seq[][2] = {
 
 int usb_power_up(void)
 {
+#if defined(BOARD_EVERT)
+	/*
+	 * Not ported: the sequence below is SDM845's (GCC USB30_PRIM offsets, QUSB2 at 0x088e2000). On SDM630
+	 * the GCC USB30 branches sit elsewhere (gcc-sdm660.c: master 0xf008, sleep 0xf00c, mock_utmi 0xf010)
+	 * and the QUSB2 PHY is at 0x0c012000: touching SDM845 offsets here could gate unrelated clocks.
+	 */
+	con_str("USBPWR", "not ported to " BOARD_NAME " (untouched)");
+	return -4;
+#endif
 	uint32_t gd = rd(GCC + USB30_GDSCR), m = rd(GCC + MASTER_CBCR), n = rd(GCC + CFG_NOC_CBCR);
 
 	if (alive()) {

@@ -11,4 +11,8 @@ The Bergamota Project's bootloader (*enxerto*, Portuguese for "graft": the piece
 BOARD=beryllium enxerto/build.sh [payload.bin]   # -> enxerto/out/enxerto-boot.img, bergamota-fastboot.img (what the Mac app boots with `fastboot boot`), charge-test.img, out/preview/*.ppm
 ```
 
-`build.sh` also runs the host tests: it renders every screen to `out/preview/` and checks the fastboot state machine. Images built before the rename are called `shim/out/shim-boot-*.img`, and Bergamota still lists them.
+```sh
+BOARD=evert enxerto/build.sh                     # Moto G6 Plus (SDM630, mod-g6plus): 4K MMU, eMMC (EMMC_WRITE=1 for writes), SPMI v3; USB not ported yet
+```
+
+`BOARD=evert` also runs `mmu_test`, `pmic_test` and `emmc_test` (simulated MMU walk, SPMI arbiter, SDHCI host + eMMC card). `build.sh` also runs the host tests: it renders every screen to `out/preview/` and checks the fastboot state machine. Images built before the rename are called `shim/out/shim-boot-*.img`, and Bergamota still lists them.

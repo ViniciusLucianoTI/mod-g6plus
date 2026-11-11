@@ -693,6 +693,7 @@ const char *usb_dwc3_errstr(int err)
 	case USB_E_RESET: return "DCTL soft reset stuck";
 	case USB_E_EP0: return "ep0 command failed";
 	case USB_E_RUN: return "controller will not run";
+	case USB_E_BOARD: return "USB not ported to this board yet";
 	default: return "?";
 	}
 }
@@ -727,6 +728,11 @@ static int ensure_clocks(void)
 
 int usb_dwc3_init(int use_smmu)
 {
+#if defined(BOARD_EVERT)
+	/* SDM845 addresses throughout (DWC3 0x0a600000, QSCRATCH, QUSB2, apps SMMU stream): see usb_power.c */
+	(void)use_smmu;
+	return USB_E_BOARD;
+#endif
 	int rc = ensure_clocks();
 	if (rc)
 		return rc;

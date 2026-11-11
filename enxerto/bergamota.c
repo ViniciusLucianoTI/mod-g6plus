@@ -26,7 +26,11 @@
 #include "loader.h"
 #include "mmu.h"
 #include "storage.h"
+#if defined(STORAGE_EMMC)
+#include "emmc.h"
+#else
 #include "ufs.h"
+#endif
 #include "usb_dwc3.h"
 
 /*
@@ -495,7 +499,6 @@ static int win_depth;
 static struct mmu_range win_r[3];
 static uint64_t last_info_ms;
 
-#define PAGE16K	0x4000UL
 
 /*
  * Cached window (see the file comment): the scratch area and [lo, hi) become Normal write-back, the image
@@ -521,7 +524,7 @@ static void st_cached(void *ctx, int on, const void *lo, const void *hi)
 		win_r[0] = (struct mmu_range){ mi.img_lo, mi.img_hi };
 		for (unsigned i = 0; i < 2; i++) {
 			struct mmu_range r = ex[i < n ? i : 0];
-			win_r[1 + i] = (struct mmu_range){ r.lo & ~(PAGE16K - 1), (r.hi + PAGE16K - 1) & ~(PAGE16K - 1) };
+			win_r[1 + i] = (struct mmu_range){ r.lo & ~(MMU_PAGE - 1), (r.hi + MMU_PAGE - 1) & ~(MMU_PAGE - 1) };
 		}
 		return;
 	}
@@ -554,15 +557,23 @@ static void st_progress(void *ctx, uint64_t bytes)
 static const char *st_ensure(void)
 {
 	if (!stor_up) {
+#if defined(STORAGE_EMMC)
+		int rc = emmc_init();
+		if (rc)
+			return emmc_errstr(rc);
+		emmc_blkdev(&g_stor.bd);
+		emmc_set_idle(ui_tick);
+#else
 		int rc = ufs_init();
 		if (rc)
 			return ufs_errstr(rc);
 		ufs_blkdev(&g_stor.bd);
+		ufs_set_idle(ui_tick);
+#endif
 		g_stor.ctx = 0;
 		g_stor.scratch = (uint8_t *)scratch_base;
 		g_stor.cached = st_cached;
 		g_stor.progress = st_progress;
-		ufs_set_idle(ui_tick);
 		/* stale dirty lines ABL left in the scratch area must never be evicted over our data */
 		dc_flush(g_stor.scratch, STOR_SCRATCH);
 		stor_up = 1;
@@ -586,7 +597,7 @@ static const char *p_part_info(void *ctx, const char *name, uint64_t *size)
 	p = stor_find(&g_stor, name, &why);
 	if (!p)
 		return why;
-	*size = p->nblk * STOR_BLK;
+	*size = stor_part_bytes(&g_stor, p);
 	return 0;
 }
 
@@ -712,7 +723,11 @@ static const char *p_part_selftest(void *ctx, const char *name)
 static void p_set_ufs_depth(void *ctx, int n)
 {
 	(void)ctx;
+#if defined(STORAGE_EMMC)
+	(void)n;	/* one command at a time on eMMC */
+#else
 	ufs_set_depth(n);
+#endif
 }
 
 static void p_set_verify(void *ctx, int on)
@@ -739,7 +754,7 @@ static void p_gpt_info(void *ctx, struct fb *fb)
 		line[0] = 0;
 		sb_str(&b, "lun "); sb_u(&b, l);
 		sb_str(&b, g_stor.lun_info[l].valid ? " gpt ok " : " no valid gpt ");
-		sb_u(&b, g_stor.lun_info[l].blocks >> 8); sb_str(&b, " MiB");
+		sb_u(&b, g_stor.lun_info[l].blocks * stor_blksz(&g_stor) >> 20); sb_str(&b, " MiB");
 		fb_info(fb, line);
 	}
 	for (unsigned i = 0; i < g_stor.nparts; i++) {
@@ -748,7 +763,7 @@ static void p_gpt_info(void *ctx, struct fb *fb)
 		line[0] = 0;
 		sb_str(&b, p->name); sb_str(&b, " lun "); sb_u(&b, p->lun);
 		sb_str(&b, " lba "); sb_hex(&b, (uint32_t)p->first);
-		sb_str(&b, " "); sb_u(&b, p->nblk >> 8); sb_str(&b, " MiB");
+		sb_str(&b, " "); sb_u(&b, stor_part_bytes(&g_stor, p) >> 20); sb_str(&b, " MiB");
 		if (p->dup)
 			sb_str(&b, " AMBIGUOUS");
 		fb_info(fb, line);

@@ -16,10 +16,18 @@ struct mmu_range {
 int mmu_enable(struct mmu_info *info);
 /*
  * Like mmu_enable, plus Normal write-back for each extra range (rounded out to
- * 16K pages; whole 32MB blocks when a range covers them). Only pass memory
+ * MMU_PAGE pages; whole blocks when a range covers them). Only pass memory
  * that is ours (payload, kernel destination): see the XPU note in mmu.c.
+ * 0 = MMU on; -1 = too many ranges / out of tables, -2 = the CPU lacks the
+ * board's granule (MMU stays off, everything still works uncached).
  */
 int mmu_enable_ranges(struct mmu_info *info, const struct mmu_range *r, int n);
+/*
+ * The table builder behind mmu_enable_ranges (host-testable): tables in [pool, pool + max * MMU_PAGE)
+ * (pool MMU_PAGE aligned), Device for the first 8GB, framebuffer Normal-NC, wb[0..n) Normal write-back
+ * (rounded out to MMU_PAGE). Returns the top table (TTBR0 value) or 0; *n_tables = tables used.
+ */
+uintptr_t mmu_build(uintptr_t pool, int max, const struct mmu_range *wb, int n, int *n_tables);
 /*
  * Leave the MMU and caches and jump: clean+invalidate every range to PoC
  * (also the image, so the stack is in memory), turn off M/C/I, invalidate the

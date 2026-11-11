@@ -21,6 +21,16 @@ int stor_name_allowed(const char *name)
 	return str_eq(name, "userdata") || str_eq(name, "boot") || str_eq(name, "logo");
 }
 
+uint32_t stor_blksz(const struct stor *s)
+{
+	return s->bd.blksz ? s->bd.blksz : STOR_BLK;
+}
+
+uint64_t stor_part_bytes(const struct stor *s, const struct stor_part *p)
+{
+	return p->nblk * stor_blksz(s);
+}
+
 static uint32_t le32(const uint8_t *p)
 {
 	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
@@ -48,8 +58,9 @@ static uint32_t crc32(const uint8_t *p, uint64_t n, uint32_t skip_from, uint32_t
 /* Parse the GPT of one LUN (cap blocks); record allowlisted partitions. Returns 1 if the GPT is valid. */
 static int scan_lun(struct stor *s, unsigned lun, uint64_t cap, uint32_t *entries_out)
 {
+	uint32_t blk = stor_blksz(s);
 	uint8_t *hdr = s->scratch, *ents = s->scratch + STOR_BLK;
-	const char *e = s->bd.read(s->bd.ctx, lun, 1, 1, hdr);
+	const char *e = (blk & (blk - 1)) || blk < 512 || blk > STOR_BLK ? "bad block size" : s->bd.read(s->bd.ctx, lun, 1, 1, hdr);
 
 	if (e)
 		return 0;
@@ -58,7 +69,7 @@ static int scan_lun(struct stor *s, unsigned lun, uint64_t cap, uint32_t *entrie
 		if (hdr[i] != (uint8_t)sig[i])
 			return 0;
 	uint32_t hsz = le32(hdr + 12);
-	if (hsz < 92 || hsz > STOR_BLK || crc32(hdr, hsz, 16, 20) != le32(hdr + 16))
+	if (hsz < 92 || hsz > blk || crc32(hdr, hsz, 16, 20) != le32(hdr + 16))
 		return 0;
 	if (le64(hdr + 24) != 1)
 		return 0;
@@ -66,7 +77,7 @@ static int scan_lun(struct stor *s, unsigned lun, uint64_t cap, uint32_t *entrie
 	uint32_t nent = le32(hdr + 80), esz = le32(hdr + 84), ecrc = le32(hdr + 88);
 	if (esz != 128 || nent == 0 || nent > 128 || elba < 2 || last_usable >= cap || first_usable > last_usable)
 		return 0;
-	uint32_t eb = (nent * esz + STOR_BLK - 1) / STOR_BLK;
+	uint32_t eb = (nent * esz + blk - 1) / blk;
 	if (elba + eb > first_usable)
 		return 0;
 	if (s->bd.read(s->bd.ctx, lun, elba, eb, ents))
@@ -138,7 +149,7 @@ const char *stor_scan(struct stor *s)
 			s->lun_info[lun].valid = 1;
 	}
 	if (!s->luns_found)
-		return s->scan_err = "no UFS LUN answered";
+		return s->scan_err = "no storage LUN answered";
 	if (!s->nparts)
 		return s->scan_err = "no userdata/boot/logo partition in any GPT";
 	return 0;
@@ -173,9 +184,10 @@ static const char *check_range(const struct stor *s, const struct stor_part *p, 
 {
 	if (p < s->parts || p >= s->parts + s->nparts || !stor_name_allowed(p->name) || p->dup || !p->nblk)
 		return "partition not allowed";
+	uint64_t size = stor_part_bytes(s, p);
 	if ((off | len) & (STOR_BLK - 1))
 		return "unaligned range";
-	if (off > p->nblk * STOR_BLK || len > p->nblk * STOR_BLK - off)
+	if (off > size || len > size - off)
 		return "range outside the partition";
 	return 0;
 }
@@ -201,15 +213,15 @@ static void note_progress(struct stor *s, uint64_t bytes)
 		s->progress(s->ctx, bytes);
 }
 
-/* Read back [lba, +n blocks) into scratch half B and compare with expect (n*4096 bytes). */
+/* Read back [off, off + len) of the partition into scratch half B and compare with expect. */
 static const char *readback(struct stor *s, const struct stor_part *p, uint64_t off, const uint8_t *expect, uint64_t len)
 {
 	uint8_t *b = s->scratch + STOR_HALF;
-	uint64_t done = 0;
+	uint64_t done = 0, blk = stor_blksz(s);
 
 	while (done < len) {
 		uint64_t n = len - done > STOR_HALF ? STOR_HALF : len - done;
-		const char *e = s->bd.read(s->bd.ctx, p->lun, p->first + (off + done) / STOR_BLK, n / STOR_BLK, b);
+		const char *e = s->bd.read(s->bd.ctx, p->lun, p->first + (off + done) / blk, n / blk, b);
 		if (e)
 			return e;
 		if (!same(expect + done, b, n)) {
@@ -228,13 +240,13 @@ static const char *readback(struct stor *s, const struct stor_part *p, uint64_t 
 const char *stor_write(struct stor *s, const struct stor_part *p, uint64_t off, const uint8_t *src, uint64_t len)
 {
 	const char *e = check_range(s, p, off, len);
-	uint64_t done = 0;
+	uint64_t done = 0, blk = stor_blksz(s);
 
 	if (e)
 		return e;
 	while (done < len) {
 		uint64_t n = len - done > WRITE_CHUNK ? WRITE_CHUNK : len - done;
-		e = s->bd.write(s->bd.ctx, p->lun, p->first + (off + done) / STOR_BLK, n / STOR_BLK, src + done);
+		e = s->bd.write(s->bd.ctx, p->lun, p->first + (off + done) / blk, n / blk, src + done);
 		if (e)
 			return e;
 		if (s->verify && (e = readback(s, p, off + done, src + done, n)))
@@ -249,7 +261,7 @@ const char *stor_fill(struct stor *s, const struct stor_part *p, uint64_t off, u
 {
 	const char *e = check_range(s, p, off, len);
 	uint8_t *a = s->scratch;
-	uint64_t done = 0;
+	uint64_t done = 0, blk = stor_blksz(s);
 
 	if (e)
 		return e;
@@ -263,7 +275,7 @@ const char *stor_fill(struct stor *s, const struct stor_part *p, uint64_t off, u
 			s->fill_pat = pattern;
 			s->fill_len = n;
 		}
-		e = s->bd.write(s->bd.ctx, p->lun, p->first + (off + done) / STOR_BLK, n / STOR_BLK, a);
+		e = s->bd.write(s->bd.ctx, p->lun, p->first + (off + done) / blk, n / blk, a);
 		if (e)
 			return e;
 		if (s->verify && (e = readback(s, p, off + done, a, n)))
@@ -283,16 +295,19 @@ const char *stor_erase(struct stor *s, const struct stor_part *p)
 	e = s->bd.unmap(s->bd.ctx, p->lun, p->first, p->nblk);
 	if (!e)
 		return 0;
-	if (p->nblk * STOR_BLK > (1ull << 30))
+	uint64_t size = stor_part_bytes(s, p);
+	if (size > (1ull << 30))
 		return "erase failed: the device refused UNMAP and the partition is too big to zero";
-	return stor_fill(s, p, 0, p->nblk * STOR_BLK, 0);
+	if (size & (STOR_BLK - 1))
+		return "erase failed: the device refused UNMAP and the partition is not a multiple of 4 KiB";
+	return stor_fill(s, p, 0, size, 0);
 }
 
 const char *stor_hash(struct stor *s, const struct stor_part *p, uint64_t off, uint64_t len, uint32_t bs, uint8_t *out)
 {
 	const char *e = check_range(s, p, off, len);
 	uint8_t *buf[2];
-	uint64_t nchunks, k;
+	uint64_t nchunks, k, blk = stor_blksz(s);
 
 	if (e)
 		return e;
@@ -305,13 +320,13 @@ const char *stor_hash(struct stor *s, const struct stor_part *p, uint64_t off, u
 	if (s->cached)
 		s->cached(s->ctx, 1, 0, 0);
 	uint64_t n0 = len > STOR_HALF ? STOR_HALF : len;
-	e = s->bd.read(s->bd.ctx, p->lun, p->first + off / STOR_BLK, n0 / STOR_BLK, buf[0]);
+	e = s->bd.read(s->bd.ctx, p->lun, p->first + off / blk, n0 / blk, buf[0]);
 	for (k = 0; !e && k < nchunks; k++) {
 		uint64_t pos = k * STOR_HALF, n = len - pos > STOR_HALF ? STOR_HALF : len - pos;
 		int next = k + 1 < nchunks;
 		if (next) {
 			uint64_t np = pos + STOR_HALF, nn = len - np > STOR_HALF ? STOR_HALF : len - np;
-			e = s->bd.read_start(s->bd.ctx, p->lun, p->first + (off + np) / STOR_BLK, nn / STOR_BLK, buf[(k + 1) & 1]);
+			e = s->bd.read_start(s->bd.ctx, p->lun, p->first + (off + np) / blk, nn / blk, buf[(k + 1) & 1]);
 			if (e)
 				break;
 		}
@@ -332,7 +347,7 @@ const char *stor_selftest(struct stor *s, const struct stor_part *p)
 {
 	const char *e = check_range(s, p, 0, 0);
 	uint8_t *a = s->scratch, *b = s->scratch + STOR_HALF;
-	uint64_t span = STOR_HALF / STOR_BLK, nblk = p ? p->nblk : 0;
+	uint64_t span = STOR_HALF / stor_blksz(s), nblk = p ? p->nblk : 0;
 
 	if (e)
 		return e;

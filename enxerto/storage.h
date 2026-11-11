@@ -7,7 +7,9 @@
  * hashed. stor_find() refuses every other name, and the partition table only ever holds allowlisted
  * entries, so nothing else is reachable even if a caller passes a bad name. The GPT itself is never
  * written: a partition must lie inside [first_usable_lba, last_usable_lba] of its LUN's header.
- * Blocks are 4096 bytes (UFS on this phone); all offsets and lengths are multiples of that.
+ * Device blocks (and GPT LBAs) are blkdev.blksz bytes: 4096 on UFS (the Poco F1), 512 on eMMC (the Moto
+ * G6 Plus). Offsets and lengths handed to stor_* are always multiples of STOR_BLK (4096) whatever the
+ * device block size.
  */
 #include <stdint.h>
 
@@ -19,6 +21,7 @@
 
 struct blkdev {
 	void *ctx;
+	uint32_t blksz;		/* bytes per block / GPT LBA: 4096 (UFS) or 512 (eMMC); 0 = 4096 */
 	/* block count of a LUN, error string if there is no such LUN */
 	const char *(*cap)(void *ctx, unsigned lun, uint64_t *nblk);
 	const char *(*read)(void *ctx, unsigned lun, uint64_t lba, uint64_t nblk, void *dst);
@@ -33,7 +36,7 @@ struct blkdev {
 struct stor_part {
 	char name[16];
 	uint8_t lun;
-	uint64_t first, nblk;	/* LBA of the first block, size in blocks */
+	uint64_t first, nblk;	/* LBA of the first block, size in device blocks (blkdev.blksz) */
 	uint8_t dup;		/* the name occurs more than once (refused) */
 };
 
@@ -70,6 +73,10 @@ int stor_name_allowed(const char *name);
 const char *stor_scan(struct stor *s);
 /* Allowlisted partition by exact name (scans first if needed); NULL + *why if unknown/not allowed/ambiguous. */
 const struct stor_part *stor_find(struct stor *s, const char *name, const char **why);
+/* Device block size in bytes (blkdev.blksz, 4096 when unset). */
+uint32_t stor_blksz(const struct stor *s);
+/* Size of a partition in bytes. */
+uint64_t stor_part_bytes(const struct stor *s, const struct stor_part *p);
 
 /* off/len multiples of STOR_BLK, inside the partition. */
 const char *stor_write(struct stor *s, const struct stor_part *p, uint64_t off, const uint8_t *src, uint64_t len);

@@ -2,6 +2,10 @@
 # Build Enxerto (the bootloader) and wrap it in an Android boot.img that ABL accepts.
 #   BOARD=sweet (default)  boot.img v2 mirroring the stock PixelOS header, DTB in the header
 #   BOARD=beryllium        boot.img v1, Image.gz + appended DTB like the Poco F1 ROM (SDM845 ABL)
+#   BOARD=evert            Moto G6 Plus (SDM630): boot.img v0, Image.gz + appended DTB (msm-4.4 era ABL),
+#                          4K MMU granule, eMMC (EMMC_WRITE=1 enables writes), SPMI arbiter v3, USB not
+#                          ported yet, CHARGER=0 by default. Without its DTB only the Image and the host
+#                          tests are built.
 # Usage: [BOARD=..] [DTB=..] ./build.sh [payload.bin]
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,15 +27,32 @@ CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align
 [ "${BOOTLOG:-0}" = 0 ] || CFLAGS="$CFLAGS -DBOOTUI_LOG=1"
 # CHARGER=0 compiles the early fast charging out (charger.c, README); default on. Runtime: boot.img cmdline
 # bergamota.charger=0 (off) / =keep (leave the programmed ICL/FCC in place at the kernel hand-off).
-[ "${CHARGER:-1}" != 0 ] || CFLAGS="$CFLAGS -DENXERTO_CHARGER=0"
+# evert: the PM660 charger registers have not been checked on the phone yet, so off unless CHARGER=1.
+CHARGER_DEFAULT=1
+[ "$BOARD" != evert ] || CHARGER_DEFAULT=0
+[ "${CHARGER:-$CHARGER_DEFAULT}" != 0 ] || CFLAGS="$CFLAGS -DENXERTO_CHARGER=0"
 # BOOTPAUSE=<ms>: wait that long before jumping to xnu (debug photos of the log).
 [ -z "${BOOTPAUSE:-}" ] || CFLAGS="$CFLAGS -DBOOT_PAUSE_MS=${BOOTPAUSE}"
+BOARDDEF=""
+STORAGE_SRC=ufs.c
 case $BOARD in
 sweet)		DTB=${DTB:-../dtb/boot_unpacked/dtb} ;;
-beryllium)	DTB=${DTB:-../dtb/beryllium/dtb}; CFLAGS="$CFLAGS -DBOARD_BERYLLIUM" ;;
+beryllium)	DTB=${DTB:-../dtb/beryllium/dtb}; BOARDDEF=-DBOARD_BERYLLIUM ;;
+evert)		DTB=${DTB:-../dtb/evert/dtb}; BOARDDEF=-DBOARD_EVERT; STORAGE_SRC=emmc.c
+		# EMMC_WRITE=1: the eMMC write path (emmc.h); off until the read path is checked on the phone
+		[ "${EMMC_WRITE:-0}" = 0 ] || CFLAGS="$CFLAGS -DEMMC_WRITE=1" ;;
 *)		echo "error: unknown BOARD=$BOARD" >&2; exit 1 ;;
 esac
-[ -f "$DTB" ] || { echo "error: $DTB missing (stock DTB of the phone, see README)" >&2; exit 1; }
+CFLAGS="$CFLAGS $BOARDDEF"
+NOIMG=0
+if [ ! -f "$DTB" ]; then
+	if [ "$BOARD" = evert ]; then
+		echo "warning: $DTB missing: building the Image and host tests only (tools/extract-dtb.py on a boot_a dump)" >&2
+		NOIMG=1
+	else
+		echo "error: $DTB missing (stock DTB of the phone, see README)" >&2; exit 1
+	fi
+fi
 mkdir -p out
 # Bergamota fastboot (docs/BERGAMOTA_FASTBOOT.md): runs by itself when there is no payload; BERGAMOTA=1
 # forces it even with a payload in the ramdisk (boot.img cmdline flag), BERGAMOTA=0 keeps the old
@@ -41,7 +62,7 @@ case ${BERGAMOTA:-} in
 1) CMDLINE="$CMDLINE bergamota.fastboot=1" ;;
 0) CMDLINE="$CMDLINE bergamota.fastboot=0" ;;
 esac
-SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c"
+SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c $STORAGE_SRC inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c"
 OBJS=""
 for f in $SRCS; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
@@ -57,6 +78,21 @@ $OBJCOPY -O binary out/enxerto.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 size=$($NM out/enxerto.elf | awk '$3=="_end"{print $1}')
 python3 -c "import sys; open(sys.argv[1],'r+b').truncate(int(sys.argv[2],16))" out/Image "$size"
+# Host tests of the board-dependent drivers: MMU tables (granule), SPMI arbiter layout, eMMC + 512-byte GPT.
+for t in "mmu_test:-DMMU_HOST_TEST mmu.c mmu_test.c" "pmic_test:-DPMIC_HOST_TEST pmic.c pmic_test.c"; do
+	cc -O1 -Wall -Wextra $BOARDDEF ${t#*:} -o out/${t%%:*} && ./out/${t%%:*}
+done
+if [ "$STORAGE_SRC" = emmc.c ]; then
+	for w in 0 1; do
+		cc -O1 -Wall -Wextra $BOARDDEF -DEMMC_HOST_TEST -DEMMC_WRITE=$w emmc.c storage.c blake2b.c emmc_test.c -o out/emmc_test$w && ./out/emmc_test$w
+	done
+fi
+if [ "$NOIMG" = 1 ]; then
+	cc -O1 -Wall $BOARDDEF -o out/host_test console.c artdraw.c bootui.c fbui.c charge.c host_test.c && ./out/host_test
+	cc -O1 -Wall -Wextra -o out/fastboot_test fastboot.c sparse.c storage.c blake2b.c fastboot_test.c && ./out/fastboot_test
+	ls -l out/Image
+	exit 0
+fi
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
 if [ -n "${1:-}" ]; then
@@ -64,11 +100,14 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-if [ "$BOARD" = beryllium ]; then
-	# Same layout as the ROM's boot.img: header v1, Image.gz with the DTB
+# beryllium: header v1; evert: header v0 (msm-4.4 boot.img of an Android 8 launch device)
+HDRV=1
+[ "$BOARD" != evert ] || HDRV=0
+if [ "$BOARD" = beryllium ] || [ "$BOARD" = evert ]; then
+	# Same layout as the ROM's boot.img: Image.gz with the DTB
 	# appended (ABL gunzips the kernel and finds the DTB behind the stream).
 	gzip -9 -n -c out/Image | cat - "$DTB" > out/Image.gz-dtb
-	mkbootimg --header_version 1 --kernel out/Image.gz-dtb --ramdisk out/ramdisk.bin \
+	mkbootimg --header_version $HDRV --kernel out/Image.gz-dtb --ramdisk out/ramdisk.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
 		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
 		--cmdline "$CMDLINE" -o out/enxerto-boot.img
@@ -82,20 +121,20 @@ fi
 # Charging-screen test image (docs/BERGAMOTA_CHARGE.md): no payload, cmdline forces charging mode, so
 # `fastboot boot out/charge-test.img` shows the off-mode charging screen on a phone that is just on.
 (cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk-empty.bin)
-if [ "$BOARD" = beryllium ]; then
-	mkbootimg --header_version 1 --kernel out/Image.gz-dtb --ramdisk out/ramdisk-empty.bin \
+if [ "$BOARD" = beryllium ] || [ "$BOARD" = evert ]; then
+	mkbootimg --header_version $HDRV --kernel out/Image.gz-dtb --ramdisk out/ramdisk-empty.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
 		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
 		--cmdline "console=null bergamota.charge=1" -o out/charge-test.img
 fi
 # Host render of the console layout and the boot screen (out/host.ppm, out/preview/*.ppm).
 mkdir -p out/preview
-cc -O1 -Wall $([ "$BOARD" = beryllium ] && echo -DBOARD_BERYLLIUM) $([ "${BOOTLOG:-0}" = 0 ] || echo -DBOOTUI_LOG=1) -o out/host_test console.c artdraw.c bootui.c fbui.c charge.c host_test.c && ./out/host_test
+cc -O1 -Wall $BOARDDEF $([ "${BOOTLOG:-0}" = 0 ] || echo -DBOOTUI_LOG=1) -o out/host_test console.c artdraw.c bootui.c fbui.c charge.c host_test.c && ./out/host_test
 # Host tests of the fastboot protocol, the sparse parser, GPT/allowlist storage and BLAKE2b (fake storage).
 cc -O1 -Wall -Wextra -o out/fastboot_test fastboot.c sparse.c storage.c blake2b.c fastboot_test.c && ./out/fastboot_test
 # The image Bergamota (the Mac app) boots from ABL with `fastboot boot`: fastboot forced on, empty ramdisk.
-if [ "$BOARD" = beryllium ]; then
-	mkbootimg --header_version 1 --kernel out/Image.gz-dtb --ramdisk out/ramdisk-empty.bin \
+if [ "$BOARD" = beryllium ] || [ "$BOARD" = evert ]; then
+	mkbootimg --header_version $HDRV --kernel out/Image.gz-dtb --ramdisk out/ramdisk-empty.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
 		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
 		--cmdline "console=null bergamota.fastboot=1" -o out/bergamota-fastboot.img

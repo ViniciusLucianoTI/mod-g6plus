@@ -28,6 +28,26 @@ sh_() { adb shell "$1" 2>/dev/null | tr -d '\r'; }
 # root shell: the command goes to su on stdin, so no quoting layers
 rsh() { if [ "$ROOT" = su ]; then printf '%s\n' "$1" | adb shell su 2>/dev/null | tr -d '\r'; else sh_ "$1"; fi; }
 grab() { echo "### $1"; rsh "$2"; echo; }
+# Root copy of a phone file or block device to the Mac, through a temp file that adb pull reads, then
+# size + SHA-256 compared on both ends. (`adb exec-out "su -c 'cat ...'"` silently TRUNCATED the live
+# DT on 2026-11-10: 232960 of its 317131 bytes; the old --backup used the same pipe.)
+TMPD=/data/local/tmp/evert-collect
+rpull() {
+    name=$(basename "$2")
+    rsh "mkdir -p $TMPD && cat '$1' > $TMPD/$name && chmod 644 $TMPD/$name" >/dev/null
+    if ! adb pull "$TMPD/$name" "$2" >/dev/null 2>&1; then
+        rsh "rm -f $TMPD/$name" >/dev/null; echo "  pull failed: $1" >&2; return 1
+    fi
+    rsum=$(rsh "sha256sum $TMPD/$name" | awk '{print $1}')
+    rsize=$(rsh "stat -c %s $TMPD/$name")
+    want=$(rsh "[ -b '$1' ] && blockdev --getsize64 '$1' || stat -c %s '$1'")
+    rsh "rm -f $TMPD/$name" >/dev/null
+    lsum=$(shasum -a 256 "$2" | awk '{print $1}')
+    lsize=$(wc -c < "$2" | tr -d ' ')
+    if [ "$rsum" != "$lsum" ] || [ "$rsize" != "$lsize" ] || { [ -n "$want" ] && [ "$want" != 0 ] && [ "$want" != "$lsize" ]; }; then
+        echo "  MISMATCH $1: source $want, phone copy $rsize $rsum, mac $lsize $lsum" >&2; return 1
+    fi
+}
 
 {
 grab "getprop" "getprop"
@@ -56,8 +76,13 @@ grab "dmesg" "dmesg"
 grab "bootloader vars" "getprop | grep -E 'ro.boot|bootloader|baseband'"
 } > "$OUT/raw.txt"
 
-adb exec-out "su -c 'cat /sys/firmware/fdt'" > dtb/evert/live.dtb 2>/dev/null
-[ -s dtb/evert/live.dtb ] || adb pull /sys/firmware/fdt dtb/evert/live.dtb >/dev/null 2>&1 || true
+# also compare with the FDT header's totalsize (catches a short read on the phone side too)
+rpull /sys/firmware/fdt dtb/evert/live.dtb 2>/dev/null || true
+if [ -s dtb/evert/live.dtb ]; then
+    tot=$(python3 -c "import struct,sys; print(struct.unpack('>I', open(sys.argv[1],'rb').read()[4:8])[0])" dtb/evert/live.dtb)
+    got=$(wc -c < dtb/evert/live.dtb | tr -d ' ')
+    [ "$tot" = "$got" ] && echo "live DT: $got bytes, complete" || echo "warning: live DT is $got bytes, header says $tot: TRUNCATED" >&2
+fi
 [ -s dtb/evert/live.dtb ] && command -v dtc >/dev/null && dtc -I dtb -O dts -o "$OUT/live.dts" dtb/evert/live.dtb 2>/dev/null || true
 
 # redacted summary: drop serials, IMEI-like numbers, MACs
@@ -73,8 +98,9 @@ if [ "${1:-}" = --backup ]; then
     for p in $(rsh 'ls /dev/block/by-name/ 2>/dev/null || ls /dev/block/bootdevice/by-name/'); do
         case "$p" in userdata|system*|vendor*|product*|super|oem*|cache) echo "skip $p"; continue;; esac
         echo "dd $p"
-        adb exec-out "su -c 'cat /dev/block/by-name/$p'" > "$OUT/parts/$p.img" || echo "  failed: $p"
+        rpull "/dev/block/by-name/$p" "$OUT/parts/$p.img" || { echo "  FAILED: $p"; FAILED="${FAILED:-} $p"; }
     done
     (cd "$OUT/parts" && shasum -a 256 *.img > SHA256SUMS)
+    [ -z "${FAILED:-}" ] || { echo "partitions NOT backed up correctly:$FAILED" >&2; exit 1; }
     echo "partition backups: $OUT/parts (keep a copy off this Mac too)"
 fi

@@ -1,23 +1,49 @@
 /*
- * Polled SPMI (PMIC arbiter v5) reads for the charging screen. See pmic.h.
+ * Polled SPMI reads for the charging screen. See pmic.h.
+ * Arbiter layouts (Linux/msm-4.x drivers/spmi/spmi-pmic-arb.c), apps EE 0:
+ *   v5 (SDM845):       APID map core+0x900+4n, count core+4; observer +0x80*apid; channel +0x10000*apid
+ *   v2/v3 (SDM630, SPMI_ARB_V3): APID map core+0x800+4n, 512 entries up to the end of the 4K core
+ *                      region (no count register; qcom,reserved-chan 511 skipped); observer and channel
+ *                      both +0x8000*apid (pmic_arb_offset_v2: 0x1000*ee + 0x8000*apid)
+ * Both: ownership cnfg+0x700+4n [2:0], command (opc << 27) | (addr[7:0] << 4) | (bc - 1), STATUS +8
+ * (bit0 done, [3:1] denied/failure/dropped), WDATA0 +0x10, RDATA0 +0x18.
  * Register provenance: xnu/patches/0062 (arbiter + observer), 0092/0095 (PMI8998 FG gen3 + SMB2,
  * Linux qpnp-fg-gen3.c / smb-reg.h), 0126/0137 (WLED sink + write channel, qcom-wled.c WLED4),
  * 0060/0082 (PON RT status: bit0 KPDPWR, bit1 RESIN).
  *
  * No static pointer tables (build.sh rejects ABS64); MMU off, so all MMIO is Device memory.
  */
+#include "board.h"
 #include "pmic.h"
 
-#define SP_CORE	0x0c440000UL	/* arbiter core: +0 version, +4 APID count, +0x900 + 4*apid ppid map */
-#define SP_CFG	0x0c40a000UL	/* +0x700 + 4*apid: owner EE */
-#define SP_OBS	0x0e600000UL	/* observer, 0x80 per APID: CMD +0, STATUS +8, RDATA +0x18 */
-#define SP_CHNL	0x0c600000UL	/* read/write channels, 0x10000 per APID: CMD +0, STATUS +8, WDATA +0x10 */
+#define SP_CORE	SPMI_CORE
+#define SP_CFG	SPMI_CNFG
+#define SP_OBS	SPMI_OBSRVR
+#define SP_CHNL	SPMI_CHNLS
+#if defined(SPMI_ARB_V3)
+#define SP_MAP		0x800u		/* channel (APID -> PPID) map in core */
+#define SP_MAX_APID	512u		/* (core size 0x1000 - 0x800) / 4 */
+#define SP_RESERVED	511u		/* qcom,reserved-chan */
+#define SP_OBS_STRIDE	0x8000UL
+#define SP_CHNL_STRIDE	0x8000UL
+#define SP_VER_MIN	0x20010000u	/* v2 and v3 share the layout used here */
+#define SP_VER_END	0x50000000u
+#else
+#define SP_MAP		0x900u
+#define SP_MAX_APID	512u		/* also bounded by the count register */
+#define SP_RESERVED	0xffffu
+#define SP_OBS_STRIDE	0x80UL
+#define SP_CHNL_STRIDE	0x10000UL
+#define SP_VER_MIN	0x50000000u
+#define SP_VER_END	0x70000000u
+#endif
 #define SP_NO_APID	0xffffU
 #define SP_CACHE	12
 
-#define SID_PM8998	0
-#define SID_PMI8998	2
-#define SID_WLED	3	/* PMI8998 WLED lives on the second PMI8998 SID */
+/* board.h: SDM845 PM8998 SID 0 / PMI8998 SID 2 + 3; SDM630 PM660 SID 0 (PON + charger + FG) / PM660L SID 3 */
+#define SID_PM8998	PMIC_SID_PON
+#define SID_PMI8998	PMIC_SID_CHG
+#define SID_WLED	PMIC_SID_WLED
 
 /* PMI8998 SMB2 charger / FG gen3 registers (SID 2) */
 #define CHGR_STATUS_1	0x1006	/* BATTERY_CHARGER_STATUS_1: [2:0] state */
@@ -43,6 +69,14 @@ static uint8_t sp_poisoned[512];	/* a timed-out command may still complete: neve
 static struct { uint16_t ppid, apid; } sp_cache[SP_CACHE];
 static unsigned sp_ncache;
 
+#ifdef PMIC_HOST_TEST
+/* pmic_test.c: a simulated arbiter behind the physical addresses */
+uint32_t pmic_test_rd(uintptr_t a);
+void pmic_test_wr(uintptr_t a, uint32_t v);
+static inline uint32_t rd(uintptr_t a) { return pmic_test_rd(a); }
+static inline void wr(uintptr_t a, uint32_t v) { pmic_test_wr(a, v); }
+static void udelay(unsigned us) { (void)us; }
+#else
 static inline uint32_t rd(uintptr_t a)
 {
 	uint32_t v = *(volatile uint32_t *)a;
@@ -67,8 +101,9 @@ static void udelay(unsigned us)
 		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
 	while (t < end);
 }
+#endif
 
-/* The v5 arbiter can map one PPID more than once: prefer the apps-owned (EE 0) entry. */
+/* The v5 arbiter can map one PPID more than once: prefer the apps-owned (EE 0) entry (v3 maps it once). */
 static uint16_t find_apid(unsigned ppid)
 {
 	uint16_t found = SP_NO_APID;
@@ -77,7 +112,9 @@ static uint16_t find_apid(unsigned ppid)
 		if (sp_cache[i].ppid == ppid)
 			return sp_cache[i].apid;
 	for (unsigned i = 0; i < sp_count; i++) {
-		uint32_t map = rd(SP_CORE + 0x900 + 4 * i);
+		if (i == SP_RESERVED)
+			continue;
+		uint32_t map = rd(SP_CORE + SP_MAP + 4 * i);
 		if (!map || ((map >> 8) & 0xfff) != ppid)
 			continue;
 		unsigned owner = rd(SP_CFG + 0x700 + 4 * i) & 7;
@@ -96,13 +133,23 @@ int pmic_init(void)
 {
 	uint32_t ver = rd(SP_CORE);
 
+#if defined(SPMI_ARB_V3)
+	sp_count = SP_MAX_APID;
+#else
 	sp_count = rd(SP_CORE + 4) & 0x7ff;
-	if (ver < 0x50000000u || ver >= 0x70000000u || !sp_count || sp_count > 512) {
+#endif
+	if (ver < SP_VER_MIN || ver >= SP_VER_END || !sp_count || sp_count > SP_MAX_APID) {
 		sp_ready = 0;
 		return -1;
 	}
+	sp_ncache = 0;
 	sp_ready = 1;
 	return 0;
+}
+
+unsigned pmic_arb_version(void)
+{
+	return rd(SP_CORE);
 }
 
 /* Read allow-list: only the blocks this screen needs (same as the kernel's whitelist plus PON). */
@@ -110,12 +157,13 @@ static int read_allowed(unsigned sid, unsigned addr)
 {
 	unsigned p = addr >> 8;
 
-	if (sid == SID_PMI8998)
-		return p == 0x10 || p == 0x13 || p == 0x16 || p == 0x40 || p == 0x41;
-	if (sid == SID_PM8998)
-		return p == 0x08;
-	if (sid == SID_WLED)
-		return p == 0xd8 || p == 0xd9;
+	/* not an if/else chain: on SDM630 PON and the charger share SID 0 */
+	if (sid == SID_PMI8998 && (p == 0x10 || p == 0x13 || p == 0x16 || p == 0x40 || p == 0x41))
+		return 1;
+	if (sid == SID_PM8998 && p == 0x08)
+		return 1;
+	if (sid == SID_WLED && (p == 0xd8 || p == 0xd9))
+		return 1;
 	return 0;
 }
 
@@ -126,7 +174,7 @@ static int spmi_read(unsigned sid, unsigned addr, uint8_t *out)
 	uint16_t apid = find_apid((sid << 8) | (addr >> 8));
 	if (apid == SP_NO_APID || sp_poisoned[apid])
 		return -1;
-	uintptr_t off = 0x80UL * apid;
+	uintptr_t off = SP_OBS_STRIDE * apid;
 	wr(SP_OBS + off, (1u << 27) | ((addr & 0xff) << 4));	/* EXT_READL, 1 byte */
 	for (unsigned i = 0; i < 2000; i++) {
 		uint32_t st = rd(SP_OBS + off + 0x08);
@@ -271,7 +319,7 @@ static int spmi_write_sid(unsigned sid, unsigned addr, uint32_t data, unsigned l
 	uint16_t apid = find_apid((sid << 8) | (addr >> 8));
 	if (apid == SP_NO_APID || sp_poisoned[apid] || (rd(SP_CFG + 0x700 + 4 * apid) & 7) != 0)
 		return -1;
-	uintptr_t ch = SP_CHNL + 0x10000UL * apid;
+	uintptr_t ch = SP_CHNL + SP_CHNL_STRIDE * apid;
 	wr(ch + 0x10, data);
 	wr(ch + 0x00, ((addr & 0xff) << 4) | ((len - 1) & 7));	/* opcode 0 = EXT_WRITEL */
 	for (unsigned i = 0; i < 2000; i++) {

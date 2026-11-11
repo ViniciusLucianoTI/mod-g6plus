@@ -36,8 +36,10 @@
 #define PORTRAIT_X	((FB_W - PORTRAIT_W) / 2)
 #define BAR_TRACK	0xffbccb7aU	/* ink at 14 % over the lime */
 
-#ifdef BOARD_BERYLLIUM
+#if defined(BOARD_BERYLLIUM)
 #define DEVICE_NAME	"POCO F1"
+#elif defined(BOARD_EVERT)
+#define DEVICE_NAME	"MOTO G6 PLUS"
 #else
 #define DEVICE_NAME	"REDMI NOTE 10 PRO"
 #endif

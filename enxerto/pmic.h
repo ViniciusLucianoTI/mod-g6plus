@@ -4,7 +4,12 @@
 /*
  * Minimal polled SPMI access for the off-mode charging screen (docs/BERGAMOTA_CHARGE.md).
  * Port of the read paths of xnu/patches 0062/0092/0095/0126/0137 (bsd/dev/sweet_spmi.c):
- * PMIC arbiter v5, apps EE observer reads, MMU-off safe, aligned 32-bit MMIO, no interrupts.
+ * PMIC arbiter v5 (SDM845) or v2/v3 (SDM630, board.h SPMI_ARB_V3), apps EE observer reads, MMU-off
+ * safe, aligned 32-bit MMIO, no interrupts.
+ *
+ * Slave IDs come from board.h. "PM8998"/"PMI8998" below name the roles on the Poco F1; on the Moto G6
+ * Plus the PON, SMB2 charger and FG gen3 are all on PM660 (SID 0) and the WLED on PM660L (SID 3), with
+ * the same peripheral register maps (msm-pm660.dtsi: qcom,qpnp-smb2, qcom,fg-gen3, qpnp-power-on).
  *
  * Everything is READ ONLY (battery fuel gauge + SCHG status on PMI8998 = SID 2, PM8998 PON =
  * SID 0) except (a) the PMI8998 WLED backlight brightness (SID 3, peripheral 0xd9), which
@@ -35,6 +40,8 @@ struct pmic_batt {
 
 /* Look at the arbiter. 0 = ready, <0 = unsupported/unmapped (everything else then fails). */
 int pmic_init(void);
+/* Raw arbiter version register (core + 0): 0x5xxxxxxx = v5 (SDM845), 0x3xxxxxxx = v3 (SDM630). */
+unsigned pmic_arb_version(void);
 /* Poll the battery/charger. valid=0 when the FG could not be read; usb_present may still be set. */
 void pmic_read_batt(struct pmic_batt *b);
 

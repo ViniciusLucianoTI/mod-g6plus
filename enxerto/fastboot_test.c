@@ -413,7 +413,7 @@ static const char *tp_part_info(void *ctx, const char *name, uint64_t *size)
 	const struct stor_part *p = stor_find(&g_stor, name, &why);
 	if (!p)
 		return why;
-	*size = p->nblk * STOR_BLK;
+	*size = stor_part_bytes(&g_stor, p);
 	return 0;
 }
 static const char *tp_flash_begin(void *ctx, const char *name, const uint8_t *img, uint64_t len, uint64_t total)
