@@ -1,0 +1,18 @@
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -832,6 +832,15 @@
+ #if XNU_TARGET_OS_OSX
+ 
+ 	if (vm_compression_limit == 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * patch 1032: SWEET uses the small (iOS) kernel address space since patch 1023, where the macOS
++		 * 16x RAM compressor map does not fit (kmem hole panic on the Moto G6 Plus). Size it like iOS.
++		 */
++		compressor_pool_size = max_mem;
++	}
++	if (0) {
++#endif
+ 		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
+ 			compressor_pool_size = 16ULL * max_mem;
+ 		} else if (max_mem <= (8ULL * 1024ULL * 1024ULL * 1024ULL)) {

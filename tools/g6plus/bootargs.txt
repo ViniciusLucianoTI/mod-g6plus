@@ -1,0 +1,1 @@
+debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=md0 sweetearlyfb=2 sweetkeys=0 sweettouch=0 sweetusb=0 sweetcpufreq=0 sweetinputboost=0 sweetcharger=0 sweetfb_blfade=0 sweetbtprobe=0 sweetbtfw=0 sweetlog=0
