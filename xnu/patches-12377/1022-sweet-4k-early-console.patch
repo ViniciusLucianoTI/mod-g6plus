@@ -1,0 +1,248 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 52f5a7d..d9a401a 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1844,6 +1844,45 @@ sweet_early_map_final(void)
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
++#elif defined(SWEET)
++/*
++ * 4K granule (patch 1022): the same idea with SWEET_EARLY_FB_BLOCKS 2MB blocks right above the
++ * low-globals block. Every condition is checked instead of asserted: a failed placement only turns
++ * the early console back into a log (sweet_early_fb_mapped = 0) instead of an invisible panic.
++ */
++#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++
++static void
++sweet_early_map_final(void)
++{
++	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++	const unsigned int n = SWEET_EARLY_FB_BLOCKS;
++
++	if (!sweet_early_fb_mapped) {
++		return;
++	}
++	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	unsigned int idx = (unsigned int)((va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
++	if (va + n * ARM_TT_L2_SIZE > gVirtBase || idx + n > TTE_PGENTRIES ||
++	    (l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) != (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
++		sweet_early_fb_mapped = 0;
++		return;
++	}
++	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++	for (unsigned int i = 0; i < n; i++) {
++		if (l2[idx + i] != ARM_TTE_EMPTY) {
++			sweet_early_fb_mapped = 0;
++			return;
++		}
++	}
++	for (unsigned int i = 0; i < n; i++) {
++		l2[idx + i] = ((uint64_t)SWEET_EARLY_FB_PA + i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
++	__asm__ volatile("dsb ishst" ::: "memory");
++}
+ #endif
+ 
+ void
+@@ -2200,7 +2239,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	kasan_init();
+ #endif /* KASAN */
+ 
+-#if defined(SWEET) && __ARM_16K_PG__
++#if defined(SWEET)
+ 	/* phystokv() must still refer to the bootstrap aperture here. */
+ 	sweet_early_map_final();
+ #endif
+@@ -2209,9 +2248,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	ml_enable_monitor();
+ 
+-#if defined(SWEET) && __ARM_16K_PG__
+-	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+-	sweet_early_relocate(SWEET_EARLY_FB_VA);
++#if defined(SWEET)
++	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias (4K: only if placed). */
++	if (sweet_early_fb_mapped) {
++		sweet_early_relocate(SWEET_EARLY_FB_VA);
++	}
+ #endif
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 3225e83..2fdcfa8 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -35,6 +35,9 @@
+ #include <machine/asm.h>
+ #include <arm64/tunables/tunables.s>
+ #include <arm64/exception_asm.h>
++#if defined(SWEET)
++#include <arm64/sweet_early.h>
++#endif
+ 
+ #if __ARM_KERNEL_PROTECT__
+ #include <arm/pmap.h>
+@@ -707,6 +710,49 @@ Lkernelcache_base_found:
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++#endif
++#if defined(SWEET) && !__ARM_16K_PG__
++	/*
++	 * 4K granule (patch 1022): the splash window SWEET_EARLY_FB_PA as SWEET_EARLY_FB_BLOCKS 2MB
++	 * Normal-NC blocks in the V=P L2 table that create_bootstrap_mapping made for the RAM of the
++	 * same 1GB (0x80000000-0xbfffffff on SDM630 and SDM845), found through the V=P L1 table (x25).
++	 * Nothing is written if that L1 entry is not a table or a slot is already used; then
++	 * sweet_early_fb_mapped stays 0 and the early console only logs.
++	 */
++	MOV64	x10, SWEET_EARLY_FB_PA
++	lsr		x12, x10, #(ARM_TT_L1_SHIFT)
++	and		x12, x12, #(TTE_PGENTRIES - 1)
++	ldr		x13, [x25, x12, lsl #TTE_SHIFT]
++	and		x11, x13, #3
++	cmp		x11, #3								// valid table descriptor
++	b.ne	Lsweet_fb4k_done
++	and		x13, x13, #(ARM_TTE_TABLE_MASK)
++	lsr		x12, x10, #(ARM_TT_L2_SHIFT)
++	and		x12, x12, #(TTE_PGENTRIES - 1)
++	cmp		x12, #(TTE_PGENTRIES - SWEET_EARLY_FB_BLOCKS)
++	b.hi	Lsweet_fb4k_done					// the window must not cross the L2 table
++	add		x13, x13, x12, lsl #TTE_SHIFT		// &l2[first]
++	mov		x16, #0
++Lsweet_fb4k_check:
++	ldr		x17, [x13, x16, lsl #TTE_SHIFT]
++	cbnz	x17, Lsweet_fb4k_done
++	add		x16, x16, #1
++	cmp		x16, #(SWEET_EARLY_FB_BLOCKS)
++	b.lo	Lsweet_fb4k_check
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	mov		x16, #0
++Lsweet_fb4k_set:
++	str		x11, [x13, x16, lsl #TTE_SHIFT]
++	add		x11, x11, #(ARM_TT_L2_SIZE)
++	add		x16, x16, #1
++	cmp		x16, #(SWEET_EARLY_FB_BLOCKS)
++	b.lo	Lsweet_fb4k_set
++	adrp	x16, EXT(sweet_early_fb_mapped)@page	// MMU off: PC-relative = physical
++	add		x16, x16, EXT(sweet_early_fb_mapped)@pageoff
++	mov		w17, #1
++	str		w17, [x16]
++Lsweet_fb4k_done:
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index a514358..5128a46 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -14,24 +14,24 @@
+ #include <pexpert/arm64/board_config.h>      /* SWEET.h: __ARM_16K_PG__ */
+ 
+ /*
+- * start.s and arm_vm_init map one 32MB block at 0x9c000000. It holds the
+- * splash framebuffer of both boards (sweet 0x9c000000 1080x2400, Poco F1
+- * 0x9d400000 1080x2246); sweet_early_set_video picks it from boot_args.
+- */
+-#define EARLY_BLOCK_PA 0x9c000000ull
+-#define EARLY_BLOCK_SIZE 0x2000000ull
+-/*
+- * The block is a 16K-granule L2 block mapped by start.s/arm_vm_init. The 4K-granule build
+- * (SDM630, patch 1021) maps none, so there the console only records into the ring for
+- * kprintf and never draws, not even on a panic.
++ * start.s and arm_vm_init map the window SWEET_EARLY_FB_PA (sweet_early.h): with 16K pages one 32MB
++ * block at 0x9c000000 (sweet 0x9c000000 1080x2400, Poco F1 0x9d400000 1080x2246); with 4K pages
++ * (patch 1022) six 2MB blocks at 0x9d400000 (Moto G6 Plus 1080x2160, Poco F1). sweet_early_set_video
++ * picks the framebuffer inside it from boot_args. Nothing is drawn while sweet_early_fb_mapped is 0
++ * (4K: start.s found no V=P L2 table for the window, or arm_vm_init could not place the alias).
+  */
++#define EARLY_BLOCK_PA ((uint64_t)SWEET_EARLY_FB_PA)
+ #if __ARM_16K_PG__
+-#define EARLY_FB_MAPPED 1u
++#define EARLY_BLOCK_SIZE 0x2000000ull
++volatile uint32_t sweet_early_fb_mapped = 1;
++static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
+ #else
+-#define EARLY_FB_MAPPED 0u
++#define EARLY_BLOCK_SIZE (SWEET_EARLY_FB_BLOCKS * 0x200000ull)
++volatile uint32_t sweet_early_fb_mapped = 0;     /* start.s stores 1 (physical address, MMU off) */
++static unsigned int early_width = 1080u, early_height = 2160u, early_stride = 4320u / 4;
+ #endif
++#define EARLY_FB_MAPPED sweet_early_fb_mapped
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
+-static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
+ static uint64_t early_off;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH early_width
+@@ -72,6 +72,9 @@ sweet_early_clear_row(void)
+ static void
+ sweet_early_draw(char c)
+ {
++	if (!EARLY_FB_MAPPED) {
++		return;
++	}
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		sweet_early_clear_row();
+@@ -133,7 +136,7 @@ sweet_early_mark(unsigned int stage, const char *label)
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+-	if (early_screen) {
++	if (early_screen && EARLY_FB_MAPPED) {
+ 		uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+ 		for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+ 			for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+@@ -186,7 +189,7 @@ sweet_early_set_cmdline(const char *cmdline)
+ 			k++;
+ 		}
+ 		if (key[k] == '\0' && (i == 0 || cmdline[i - 1] == ' ')) {
+-			early_screen = EARLY_FB_MAPPED;
++			early_screen = 1;       /* drawing still needs EARLY_FB_MAPPED */
+ 			return;
+ 		}
+ 	}
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 3ba05e4..9161b2e 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -3,10 +3,28 @@
+ #define _ARM64_SWEET_EARLY_H_
+ 
+ #include <pexpert/arm64/board_config.h>
++
++/*
++ * Where the bootstrap console draws (start.s, arm_vm_init.c, sweet_early.c):
++ *   16K granule: one 32MB L2 block at 0x9c000000 (sweet 0x9c000000 and Poco F1 0x9d400000 splashes)
++ *   4K granule (patch 1021/1022, SDM630 Moto G6 Plus, also the Poco F1): six 2MB L2 blocks from
++ *   0x9d400000, the splash of both (G6 1080x2160, Poco 1080x2246, < 9.7 MB)
++ */
++#if __ARM_16K_PG__
++#define SWEET_EARLY_FB_PA       0x9c000000
++#define SWEET_EARLY_FB_BLOCKS   1
++#else
++#define SWEET_EARLY_FB_PA       0x9d400000
++#define SWEET_EARLY_FB_BLOCKS   6
++#endif
++
++#ifndef __ASSEMBLER__
+ #include <stdarg.h>
+ #include <stdint.h>
+ 
+ #if defined(SWEET)
++/* 1 while the framebuffer window is mapped (16K: always; 4K: set by start.s, cleared on failure) */
++extern volatile uint32_t sweet_early_fb_mapped;
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+@@ -32,5 +50,6 @@ static inline void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t h
+ 	(void)rowbytes;
+ }
+ #endif
++#endif /* !__ASSEMBLER__ */
+ 
+ #endif
