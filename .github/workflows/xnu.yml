@@ -106,15 +106,20 @@ jobs:
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           # ...and its arm64 slice must be ARMv8.0 like the kernel (xnu 1021, SDM630 Cortex-A53): Apple clang
           # otherwise compiles it for apple-m1 (LSE, LDAPR). Only the plain arm64 slice, which only SWEET links.
-          python3 - <<'PY'
+          # xcodebuild does not take [arch=...] conditions on the command line (CI 42968045076: it split
+          # the argument and gave clang 'arm64]=-mkernel' on every arch), so they go in an -xcconfig file.
+          printf 'OTHER_CFLAGS[arch=arm64] = $(inherited) -mcpu=cortex-a53\n' > "$GITHUB_WORKSPACE/dxb/sweet-firehose.xcconfig"
+          cat "$GITHUB_WORKSPACE/dxb/sweet-firehose.xcconfig"
+          SWEET_XCCONFIG="$GITHUB_WORKSPACE/dxb/sweet-firehose.xcconfig" python3 - <<'PY'
+          import os
           p = 'dxb/build.sh'
           s = open(p).read()
           old = 'VALID_ARCHS="x86_64 arm64e arm64"'
           assert s.count(old) == 1, 'libfirehose_kernel xcodebuild line changed'
-          s = s.replace(old, old + " 'OTHER_CFLAGS[arch=arm64]=$(inherited) -mcpu=cortex-a53'")
+          s = s.replace(old, old + ' -xcconfig "%s"' % os.environ['SWEET_XCCONFIG'])
           open(p, 'w').write(s)
           PY
-          grep -c "OTHER_CFLAGS\[arch=arm64\]" dxb/build.sh
+          grep -n "sweet-firehose.xcconfig" dxb/build.sh
           # dxb only warns and carries on when a patch does not apply; for ours that would silently
           # produce a kernel without it, so make it fatal.
           python3 - <<'PY'
