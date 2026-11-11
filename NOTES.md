@@ -2,8 +2,10 @@
 
 ## Agent handoff (2026-11-10)
 * Fork created locally from Bergamota develop 37a7a7a (branch `mod-g6plus`, repo `~/Documents/mod-g6plus`). Not published to GitHub yet.
-* Nothing ported yet. Everything below is the inherited Poco F1 (SDM845) log, kept for reference.
-* Next: gather G6 Plus facts (bootloader unlock state, stock boot.img header/DTB layout, storage eMMC vs UFS, panel, touch, PMIC), partition backups, then adapt Enxerto and the ADT generator.
+* **Hardware survey (desk research, no device yet): `docs/G6PLUS_HARDWARE.md`.** Observed in source: SDM630 = 8x Cortex-A53 (ARMv8.0), eMMC (sdhci 0x0c0c4000), A/B, boot.img v0 Image.gz-dtb, msm-id 318, board-id 0x46/0x47:0xC100, MDP5/DPU 3.3 1080x2160, PM660+PM660L, Adreno 508, WCN3990. Plus an inventory of every Poco F1 constant in Enxerto/xnu/tools.
+* **Blocker found (not yet measured on device):** iOS 18/26 userland uses LSE atomics (~426k sites) and LDAPR (~94k), which ARMv8.0 lacks; Renegade cannot rewrite LSE 1:1. A strategy (trap emulation, out-of-line shared-cache rewrite, or another userland) must be chosen before driver work.
+* `tools/g6plus/collect.sh`: read-only adb collector (raw to `backup/evert/`, redacted `summary.txt`, live DT to `dtb/evert/live.dtb`, `--backup` dd's partitions except OS/user). Syntax and redaction tested on the Mac; **never run against a phone** (adb/fastboot were not installed on 2026-11-10).
+* Next: user installs platform-tools, connects the G6 Plus; check unlock state (`fastboot getvar all`), run collect.sh, confirm ID registers (LSE absent), then decide the LSE strategy.
 
 ---
 
