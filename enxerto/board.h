@@ -65,8 +65,11 @@
 #define PMIC_SID_PON		0
 #define PMIC_SID_CHG		0
 #define PMIC_SID_WLED		3
-/* MPIDR of CPU n for PSCI CPU_ON: two clusters of four (Aff1 = cluster, Aff0 = core) */
-#define CPU_MPIDR(n)		((((uint64_t)(n) >> 2) << 8) | ((uint64_t)(n) & 3))
+/*
+ * MPIDR of CPU n for PSCI CPU_ON, in the live DT's order (measured 2026-11-11): cpu0-3 = 0x100-0x103
+ * (the boot cluster, 2.2 GHz), cpu4-7 = 0x000-0x003. The boot CPU is 0x100, not 0.
+ */
+#define CPU_MPIDR(n)		((n) < 4 ? 0x100u | (uint64_t)(n) : (uint64_t)(n) - 4)
 #else
 /* Same on SM7150 and SDM845 */
 #define PSHOLD			0x0c264000UL

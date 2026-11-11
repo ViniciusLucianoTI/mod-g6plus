@@ -28,25 +28,13 @@ sh_() { adb shell "$1" 2>/dev/null | tr -d '\r'; }
 # root shell: the command goes to su on stdin, so no quoting layers
 rsh() { if [ "$ROOT" = su ]; then printf '%s\n' "$1" | adb shell su 2>/dev/null | tr -d '\r'; else sh_ "$1"; fi; }
 grab() { echo "### $1"; rsh "$2"; echo; }
-# Root copy of a phone file or block device to the Mac, through a temp file that adb pull reads, then
-# size + SHA-256 compared on both ends. (`adb exec-out "su -c 'cat ...'"` silently TRUNCATED the live
-# DT on 2026-11-10: 232960 of its 317131 bytes; the old --backup used the same pipe.)
-TMPD=/data/local/tmp/evert-collect
+# Root copy of a phone file or block device to the Mac: tools/g6plus/chunkpull.py (small dd chunks as base64
+# over `adb shell`, each SHA-256 checked against the phone, retried across USB drops; whole-file size + hash
+# must match at the end). `adb exec-out "su -c 'cat ...'"` silently TRUNCATED the live DT on 2026-11-10
+# (232960 of 317131 bytes) and plain `adb pull` stalls on this phone's flaky USB link.
 rpull() {
-    name=$(basename "$2")
-    rsh "mkdir -p $TMPD && cat '$1' > $TMPD/$name && chmod 644 $TMPD/$name" >/dev/null
-    if ! adb pull "$TMPD/$name" "$2" >/dev/null 2>&1; then
-        rsh "rm -f $TMPD/$name" >/dev/null; echo "  pull failed: $1" >&2; return 1
-    fi
-    rsum=$(rsh "sha256sum $TMPD/$name" | awk '{print $1}')
-    rsize=$(rsh "stat -c %s $TMPD/$name")
-    want=$(rsh "[ -b '$1' ] && blockdev --getsize64 '$1' || stat -c %s '$1'")
-    rsh "rm -f $TMPD/$name" >/dev/null
-    lsum=$(shasum -a 256 "$2" | awk '{print $1}')
-    lsize=$(wc -c < "$2" | tr -d ' ')
-    if [ "$rsum" != "$lsum" ] || [ "$rsize" != "$lsize" ] || { [ -n "$want" ] && [ "$want" != 0 ] && [ "$want" != "$lsize" ]; }; then
-        echo "  MISMATCH $1: source $want, phone copy $rsize $rsum, mac $lsize $lsum" >&2; return 1
-    fi
+    if [ "$ROOT" = su ]; then python3 tools/g6plus/chunkpull.py --su "$1" "$2" --chunk 512
+    else python3 tools/g6plus/chunkpull.py "$1" "$2" --chunk 512; fi
 }
 
 {
@@ -96,7 +84,7 @@ echo "summary: $OUT/summary.txt   live DT: dtb/evert/live.dtb"
 if [ "${1:-}" = --backup ]; then
     mkdir -p "$OUT/parts"
     for p in $(rsh 'ls /dev/block/by-name/ 2>/dev/null || ls /dev/block/bootdevice/by-name/'); do
-        case "$p" in userdata|system*|vendor*|product*|super|oem*|cache) echo "skip $p"; continue;; esac
+        case "$p" in userdata|system*|vendor*|product*|super|oem*|cache|mmcblk*) echo "skip $p"; continue;; esac
         echo "dd $p"
         rpull "/dev/block/by-name/$p" "$OUT/parts/$p.img" || { echo "  FAILED: $p"; FAILED="${FAILED:-} $p"; }
     done

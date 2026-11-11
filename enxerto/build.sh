@@ -54,6 +54,11 @@ if [ ! -f "$DTB" ]; then
 	fi
 fi
 mkdir -p out
+# AOSP mkbootimg if installed, else tools/mkbootimg.py (same options; repacks the G6 Plus stock boot_a byte-identically)
+command -v mkbootimg >/dev/null || mkbootimg() { python3 ../tools/mkbootimg.py "$@"; }
+# os_version / patch level of the boot.img: the Poco F1 ROM's, or for evert the stock LineageOS boot_a's (2026-11-11)
+OSV="--os_version 16.0.0 --os_patch_level 2025-06"
+[ "$BOARD" != evert ] || OSV="--os_version 15.0.0 --os_patch_level 2025-04"
 # Bergamota fastboot (docs/BERGAMOTA_FASTBOOT.md): runs by itself when there is no payload; BERGAMOTA=1
 # forces it even with a payload in the ramdisk (boot.img cmdline flag), BERGAMOTA=0 keeps the old
 # diagnostics/loader path.
@@ -109,7 +114,7 @@ if [ "$BOARD" = beryllium ] || [ "$BOARD" = evert ]; then
 	gzip -9 -n -c out/Image | cat - "$DTB" > out/Image.gz-dtb
 	mkbootimg --header_version $HDRV --kernel out/Image.gz-dtb --ramdisk out/ramdisk.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
+		--tags_offset 0x100 --pagesize 4096 $OSV \
 		--cmdline "$CMDLINE" -o out/enxerto-boot.img
 else
 	mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
@@ -124,7 +129,7 @@ fi
 if [ "$BOARD" = beryllium ] || [ "$BOARD" = evert ]; then
 	mkbootimg --header_version $HDRV --kernel out/Image.gz-dtb --ramdisk out/ramdisk-empty.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
+		--tags_offset 0x100 --pagesize 4096 $OSV \
 		--cmdline "console=null bergamota.charge=1" -o out/charge-test.img
 fi
 # Host render of the console layout and the boot screen (out/host.ppm, out/preview/*.ppm).
@@ -136,7 +141,7 @@ cc -O1 -Wall -Wextra -o out/fastboot_test fastboot.c sparse.c storage.c blake2b.
 if [ "$BOARD" = beryllium ] || [ "$BOARD" = evert ]; then
 	mkbootimg --header_version $HDRV --kernel out/Image.gz-dtb --ramdisk out/ramdisk-empty.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
+		--tags_offset 0x100 --pagesize 4096 $OSV \
 		--cmdline "console=null bergamota.fastboot=1" -o out/bergamota-fastboot.img
 	# same image under the name the Mac app looks for first (the flash-capable build)
 	cp out/bergamota-fastboot.img out/bergamota-fastboot-flash.img
