@@ -1,0 +1,18 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 9958c5d..19f7c32 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -11506,6 +11506,13 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	do {
+ 		int text_leaf_index = random() % num_ptes;
++		/*
++		 * SWEET (patch 1024): with a 4K kernel and 16K VM pages (PAGE_RATIO 4, SDM630) pmap_enter maps one
++		 * VM page as PAGE_SIZE / leaf-size consecutive PTEs and asserts that the first is aligned
++		 * (write_pte_fast "PTE write is unaligned", QEMU cortex-a53): keep the slid text commpage on a VM page
++		 * boundary. A no-op when the leaf size is PAGE_SIZE.
++		 */
++		text_leaf_index &= ~(int)((PAGE_SIZE >> pt_attr_leaf_shift(pt_attr)) - 1);
+ 
+ 		// Generate a VA for the commpage text within the same nesting block as
+ 		// the data comm page, with a new leaf index we've just generated.
