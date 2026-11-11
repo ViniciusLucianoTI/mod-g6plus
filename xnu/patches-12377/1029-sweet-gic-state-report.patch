@@ -1,0 +1,78 @@
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,6 +222,31 @@
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++#if defined(SWEET)
++/*
++ * patch 1029: SDM630 hang diagnostics. One line of GIC + virtual timer state for this CPU, printed with
++ * kprintf (shown on the panel with sweetearlyfb=2). Offsets: GICv3 architecture (GICR SGI frame +0x10000).
++ */
++extern void kprintf(const char *fmt, ...);
++void sweet_gic_report(const char *tag);
++void
++sweet_gic_report(const char *tag)
++{
++	if (!gicd_base || !gicr_base) {
++		kprintf("SWEET GIC[%s]: not mapped\n", tag);
++		return;
++	}
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	kprintf("SWEET GIC[%s]: D_CTLR=0x%x R=%#lx WAKER=0x%x GRP=0x%x EN=0x%x PEND=0x%x ACT=0x%x\n", tag,
++	    gicd_read32(GICD_CTLR), (unsigned long)(gicr_pe_base - gicr_base), gicr_read32(GICR_WAKER),
++	    gicr_read32(0x10080), gicr_read32(0x10100), gicr_read32(0x10200), gicr_read32(0x10300));
++	kprintf("SWEET GIC[%s]: IGRPEN1=0x%llx CTLR=0x%llx HPPIR1=0x%llx CNTV_CTL=0x%llx CVAL=0x%llx VCT=0x%llx\n", tag,
++	    __builtin_arm_rsr64("S3_0_C12_C12_7"), __builtin_arm_rsr64("S3_0_C12_C12_4"),
++	    __builtin_arm_rsr64("S3_0_C12_C12_2"), __builtin_arm_rsr64("CNTV_CTL_EL0"),
++	    __builtin_arm_rsr64("CNTV_CVAL_EL0"), __builtin_arm_rsr64("CNTVCT_EL0"));
++}
++#endif /* SWEET */
++
+ #else
+ void
+ pe_init_fiq()
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,6 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++extern "C" void sweet_gic_report(const char *tag);     /* pexpert/arm/pe_fiq.c, patch 1029 */
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -206,13 +207,19 @@
+ 			{
+ 				/* patch 1028: SDM630 hang diagnostics (shown with sweetearlyfb=2) */
+ 				static uint32_t sweet_wait_iter;
+-				if ((sweet_wait_iter++ % 250) == 0) {
++				if (sweet_wait_iter < 4) {
++					sweet_gic_report("wait");
++				}
++				if (sweet_wait_iter < 4 || (sweet_wait_iter % 250) == 0) {
++					sweet_wait_iter++;
+ 					kprintf("SWEET CPU: wait cpu=%u it=%u init=%u sig=%u HPPIR1=0x%llx RPR=0x%llx PMR=0x%llx "
+ 					    "DAIF=0x%llx t=%llu\n", i, sweet_wait_iter,
+ 					    (unsigned)__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 					    (unsigned)sweet_cpu_signal_is_enabled(i),
+ 					    __builtin_arm_rsr64("S3_0_C12_C12_2"), __builtin_arm_rsr64("S3_0_C12_C11_3"),
+ 					    __builtin_arm_rsr64("S3_0_C4_C6_0"), __builtin_arm_rsr64("DAIF"), mach_absolute_time());
++				} else {
++					sweet_wait_iter++;
+ 				}
+ 			}
+ 			IOSleep(1);
+@@ -287,6 +294,12 @@
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	__builtin_arm_isb(ISB_SY);
+ 	kprintf("SWEET CPU: SGI1 written\n");
++	{
++		static int sweet_sgi_reports;
++		if (sweet_sgi_reports++ < 2) {
++			sweet_gic_report("after SGI");
++		}
++	}
+ }
+ 
+ kern_return_t
