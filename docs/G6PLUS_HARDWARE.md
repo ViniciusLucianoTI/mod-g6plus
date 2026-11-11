@@ -55,7 +55,7 @@ The A53 is ARMv8.0 and lacks instructions Apple compiles in unconditionally:
 Kernel side (fixable): `0004-sweet-machine-config.patch` builds XNU with `-march=armv8.2-a+crypto`
 (LSE can be emitted) -> `armv8-a+crypto`; `__ARM_PAN_AVAILABLE__ 1` must go (no PAN on A53);
 SMP code panics unless Aff0 == 0 (`0065`, `0078`; A53 MPIDRs are 0x000-0x003 / 0x100-0x103);
-16K granule: A53 supports TGran16 per the TRM (inf), confirm ID_AA64MMFR0 (dev).
+16K granule: sources conflict; the A53 TRM's ID_AA64MMFR0 reset value 0x1122 means TGran16 = 0, i.e. **no 16K granule** (inf), so XNU would need 4K hardware pages under 16K VM pages, as the SDM429 fork did (`docs/FORKS_SURVEY.md`, `0101-t290-a53-4k-gicv2`); Enxerto's MMU (`enxerto/mmu.c`) is 16K too. Confirm ID_AA64MMFR0 (dev).
 
 ## 3. Where Bergamota hardcodes the Poco F1
 
