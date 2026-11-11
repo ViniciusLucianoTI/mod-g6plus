@@ -1,3 +1,12 @@
+# mod-g6plus: Bergamota fork for the Moto G6 Plus (evert, SDM630)
+
+## Agent handoff (2026-11-10)
+* Fork created locally from Bergamota develop 37a7a7a (branch `mod-g6plus`, repo `~/Documents/mod-g6plus`). Not published to GitHub yet.
+* Nothing ported yet. Everything below is the inherited Poco F1 (SDM845) log, kept for reference.
+* Next: gather G6 Plus facts (bootloader unlock state, stock boot.img header/DTB layout, storage eMMC vs UFS, panel, touch, PMIC), partition backups, then adapt Enxerto and the ADT generator.
+
+---
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## Agent handoff / active work (2026-10-15, latest)

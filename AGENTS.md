@@ -1,4 +1,11 @@
-# Working on ios-beryllium (fork of ios-sweet)
+# Working on mod-g6plus (fork of Bergamota / ios-beryllium)
+
+- Target: Motorola Moto G6 Plus (`evert`), Snapdragon 630 (SDM630, Adreno 508).
+  Bergamota's hardware facts (SDM845, UFS, Adreno 630, WCN3990, NT36672A) do NOT
+  apply here unless re-verified on the G6 Plus. Upstream: ry-diffusion/Bergamota
+  (remote `upstream`); the local Bergamota checkout is remote `bergamota-local`.
+
+# Inherited rules (ios-beryllium, fork of ios-sweet)
 
 - Do NOT add a `Co-Authored-By: dipa-studio` (or any other co-author) trailer to commits in this fork; that rule in NOTES.md is upstream ios-sweet's. Credit upstream in README.md only.
 
