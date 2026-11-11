@@ -1,0 +1,48 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -202,6 +202,18 @@
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++			}
++			{
++				/* patch 1028: SDM630 hang diagnostics (shown with sweetearlyfb=2) */
++				static uint32_t sweet_wait_iter;
++				if ((sweet_wait_iter++ % 250) == 0) {
++					kprintf("SWEET CPU: wait cpu=%u it=%u init=%u sig=%u HPPIR1=0x%llx RPR=0x%llx PMR=0x%llx "
++					    "DAIF=0x%llx t=%llu\n", i, sweet_wait_iter,
++					    (unsigned)__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++					    (unsigned)sweet_cpu_signal_is_enabled(i),
++					    __builtin_arm_rsr64("S3_0_C12_C12_2"), __builtin_arm_rsr64("S3_0_C12_C11_3"),
++					    __builtin_arm_rsr64("S3_0_C4_C6_0"), __builtin_arm_rsr64("DAIF"), mach_absolute_time());
++				}
+ 			}
+ 			IOSleep(1);
+ 		}
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3317,12 +3317,24 @@
+ 		ml_interrupt_masked_debug_end();
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else if (intid < 16) {
++		{
++			static uint32_t sweet_sgi_seen;     /* patch 1028: SDM630 hang diagnostics */
++			if (sweet_sgi_seen++ < 4) {
++				kprintf("SWEET IRQ: SGI intid=%u iar=0x%llx\n", intid, iar);
++			}
++		}
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
++		{
++			static uint32_t sweet_other_seen;   /* patch 1028 */
++			if (sweet_other_seen++ < 8) {
++				kprintf("SWEET IRQ: other intid=%u iar=0x%llx\n", intid, iar);
++			}
++		}
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
