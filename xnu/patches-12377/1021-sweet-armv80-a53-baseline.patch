@@ -1,0 +1,241 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index bed0aa3..de1fc96 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -79,8 +79,13 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/*
++	 * MPIDR layouts: DynamIQ (SM7150/SDM845) has the core in Aff1 and Aff0 = 0
++	 * (0x000-0x700); SDM630's two A53-class clusters have the cluster in Aff1 and
++	 * the core in Aff0 (0x000-0x003, 0x100-0x103). Both fit Aff1:Aff0, and the
++	 * GICv3 SGI target list needs Aff0 < 16 (signalCPU).
++	 */
++	if (cpu->phys_id > 0xffff || (cpu->phys_id & 0xff) >= 16 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -179,9 +184,12 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		IOSleep(1);
+ 	}
+-	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+-	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+-		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
++	/*
++	 * The supplied ADT lists the boot CPU first (logical CPU 0). Its MPIDR depends on
++	 * the SoC: 0 on SM7150/SDM845, a core of the 0x100 cluster on SDM630.
++	 */
++	if (topology->boot_cpu->cpu_id != 0) {
++		panic("SWEET CPU: expected the boot CPU as logical CPU 0 (mpidr=0x%x)", topology->boot_cpu->phys_id);
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+@@ -269,7 +277,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	if (start_paddr != 0 || arg_paddr != 0 || cpu == ml_get_topology_info()->boot_cpu ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 3fd8a91..9984086 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -93,7 +93,9 @@ MACHINE_FLAGS_ARM64_T8132 = -DARM64_BOARD_CONFIG_T8132			-mcpu=apple-m4
+ MACHINE_FLAGS_ARM64_T8142 = -DARM64_BOARD_CONFIG_T8142 			-mcpu=apple-m4+memtag+predres2
+ 
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a+sme2
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# SWEET: ARMv8.0 + crypto, the common subset of SM7150/SDM845 (v8.2) and SDM630 (Cortex-A53 class, v8.0):
++# no LSE, RDM, FP16 or DotProd may be emitted in the kernel (patch 1021).
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto
+ 
+ 
+ #
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 9e8f61d..52f5a7d 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1820,7 +1820,7 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
+ #endif
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && __ARM_16K_PG__
+ /*
+  * The reserved low-globals/kernel region is excluded from VM allocation.
+  * Use the otherwise empty 32MB block above low globals and below gVirtBase
+@@ -2200,7 +2200,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	kasan_init();
+ #endif /* KASAN */
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && __ARM_16K_PG__
+ 	/* phystokv() must still refer to the bootstrap aperture here. */
+ 	sweet_early_map_final();
+ #endif
+@@ -2209,7 +2209,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	ml_enable_monitor();
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && __ARM_16K_PG__
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+ 	sweet_early_relocate(SWEET_EARLY_FB_VA);
+ #endif
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 2c4a753..a1d69cb 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1300,9 +1300,13 @@ ml_parse_cpu_topology(void)
+ #endif
+ 
+ #if defined(SWEET)
+-		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
++		/*
++		 * One logical cluster: Aff1 is the core on SM7150/SDM845 but the cluster on
++		 * SDM630, so neither MPIDR field is a core index. Use the logical CPU number
++		 * (the ADT lists the cores in order; on SM7150/SDM845 this equals Aff1).
++		 */
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
+-		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
++		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->cpu_id);
+ #else
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", MPIDR_CLUSTER_ID(cpu->phys_id));
+ 		cluster->die_cluster_id = cpu->die_cluster_id;
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 3118993..6aa3fca 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -757,7 +757,16 @@
+ #define SCTLR_TP2_DEFAULT      0
+ #endif
+ 
++#if defined(SWEET)
++/*
++ * Bit 23 is RES1 on ARMv8.0 (SDM630, patch 1021) and SPAN on ARMv8.1+: set it on
++ * every SWEET CPU. SPAN = 1 (PAN left alone on exception entry) is harmless there,
++ * as SWEET does not use PAN.
++ */
++#define SCTLR_OTHER            (1ULL << 23)
++#else
+ #define SCTLR_OTHER            0
++#endif
+ 
+ #define SCTLR_EL1_REQUIRED \
+ 	(SCTLR_RESERVED | SCTLR_UCI_ENABLED | SCTLR_nTWE_WFE_ENABLED | SCTLR_DZE_ENABLED | \
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 2a8e5a0..3225e83 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -524,8 +524,11 @@ LEXT(start_first_cpu)
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 
+-#if defined(SWEET)
+-	/* Stage 0: white 64x32 band, no stack or page tables needed. */
++#if defined(SWEET) && __ARM_16K_PG__
++	/*
++	 * Stage 0: white 64x32 band, no stack or page tables needed. sweet/Poco F1 only: on the
++	 * 4K-granule build (SDM630, patch 1021) 0x9c000000 is ordinary RAM, not the splash.
++	 */
+ 	MOV64	x0, (0x9c000000 + 2368 * 4320)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+@@ -689,7 +692,7 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && __ARM_16K_PG__
+ 	/*
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 7dcca46..a514358 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,6 +11,7 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>      /* SWEET.h: __ARM_16K_PG__ */
+ 
+ /*
+  * start.s and arm_vm_init map one 32MB block at 0x9c000000. It holds the
+@@ -19,6 +20,16 @@
+  */
+ #define EARLY_BLOCK_PA 0x9c000000ull
+ #define EARLY_BLOCK_SIZE 0x2000000ull
++/*
++ * The block is a 16K-granule L2 block mapped by start.s/arm_vm_init. The 4K-granule build
++ * (SDM630, patch 1021) maps none, so there the console only records into the ring for
++ * kprintf and never draws, not even on a panic.
++ */
++#if __ARM_16K_PG__
++#define EARLY_FB_MAPPED 1u
++#else
++#define EARLY_FB_MAPPED 0u
++#endif
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
+ static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
+ static uint64_t early_off;
+@@ -148,7 +159,7 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 		return;
+ 	}
+ 	early_panicking = 1;
+-	if (!early_screen) {
++	if (!early_screen && EARLY_FB_MAPPED) {
+ 		/* a panic always shows: replay what was only logged so far, then the panic text */
+ 		early_screen = 1;
+ 		for (unsigned int i = 0; i < early_ring_len; i++) {
+@@ -175,7 +186,7 @@ sweet_early_set_cmdline(const char *cmdline)
+ 			k++;
+ 		}
+ 		if (key[k] == '\0' && (i == 0 || cmdline[i - 1] == ' ')) {
+-			early_screen = 1;
++			early_screen = EARLY_FB_MAPPED;
+ 			return;
+ 		}
+ 	}
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index a4f5697..5856516 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -1,9 +1,10 @@
+ /*
+  * Board config for the Redmi Note 10 Pro ("sweet", Qualcomm SM7150 /
+  * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
++ * Also used for the Poco F1 (SDM845) and the Moto G6 Plus (SDM630, ARMv8.0).
+  *
+  * Generic ARM like BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's
+- * implementation-defined system registers exist), 16K pages and GICv3 like
++ * implementation-defined system registers exist), 4K pages and GICv3 like
+  * VMAPPLE. Unlike VMAPPLE the GIC has two security states (GICD_TYPER
+  * SecurityExtn=1): Group 0 belongs to TrustZone, so every interrupt,
+  * including the timer, is a Group 1 IRQ taken through sleh_irq().
+@@ -33,8 +34,16 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-#define __ARM_PAN_AVAILABLE__     1
+-#define __ARM_16K_PG__            1
++/*
++ * ARMv8.0 baseline (patch 1021) so one kernel runs on SDM630 (Moto G6 Plus,
++ * Kryo 260 Silver = Cortex-A53 class) as well as on the v8.2 Kryo 385/470:
++ *  - no __ARM_PAN_AVAILABLE__: PAN is ARMv8.1 (MSR PAN is UNDEFINED on the A53);
++ *  - no __ARM_16K_PG__: the A53 has no 16K translation granule
++ *    (ID_AA64MMFR0_EL1.TGran16 = 0). The hardware pages are 4K; with more
++ *    than 1 GB of RAM arm_init() still selects 16K VM pages (PAGE_SHIFT_CONST
++ *    = 14, PAGE_RATIO 4), the H6/H7 (A7/A8) arrangement, so userland keeps
++ *    seeing 16K pages.
++ */
+ 
+ #define HAS_GIC_V3                1
+ 
