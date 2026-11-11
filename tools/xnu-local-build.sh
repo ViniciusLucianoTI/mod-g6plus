@@ -60,6 +60,16 @@ git checkout -q -- . && rm -f patches/$PSUB/sweet-*
 rm -rf xnu        # dxb clones a pristine xnu and patches it
 for f in "$SERIES"/*.patch "$SERIES"/*.sh; do cp "$f" "patches/$PSUB/sweet-$(basename "$f")"; done
 sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' build.sh
+# ...and its arm64 slice must be ARMv8.0 like the kernel (xnu 1021, SDM630 Cortex-A53), the same -xcconfig as CI
+# (.github/workflows/xnu.yml): Apple clang otherwise compiles it for apple-m1 (LSE, LDAPR).
+printf 'OTHER_CFLAGS[arch=arm64] = $(inherited) -mcpu=cortex-a53\n' > "$W/dxb/sweet-firehose.xcconfig"
+SWEET_XCCONFIG="$W/dxb/sweet-firehose.xcconfig" python3 - <<'PY'
+import os
+s = open('build.sh').read()
+old = 'VALID_ARCHS="x86_64 arm64e arm64"'
+assert s.count(old) == 1, 'libfirehose_kernel xcodebuild line changed'
+open('build.sh', 'w').write(s.replace(old, old + ' -xcconfig "%s"' % os.environ['SWEET_XCCONFIG']))
+PY
 python3 - <<'PY'
 s = open('build.sh').read()
 needle = '                warning "Skipping patch ${PATCH} (already upstream, previously applied, or malformed): ${APPLY_CHECK}"\n'
