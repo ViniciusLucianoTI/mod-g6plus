@@ -1,0 +1,96 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 5128a46..ba85385 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -57,6 +57,13 @@ static unsigned int early_started, early_disabled, early_panicking;
+ #define EARLY_RING 1536u
+ static char early_ring[EARLY_RING];
+ static unsigned int early_ring_len, early_screen, early_flushed;
++/*
++ * sweetearlyfb=2 (patch 1025): also MIRROR every console_write() byte onto the panel, synchronously, for
++ * the whole session (the -v boot log renderer only paints from a 33 ms thread_call, so whatever was
++ * printed just before a hard hang never reaches the screen). Survives sweet_early_disable().
++ */
++static unsigned int early_mirror;
++static volatile unsigned int early_mirror_busy;
+ 
+ static void
+ sweet_early_clear_row(void)
+@@ -192,6 +199,11 @@ sweet_early_set_cmdline(const char *cmdline)
+ 			early_screen = 1;       /* drawing still needs EARLY_FB_MAPPED */
+ 			return;
+ 		}
++		if (k == sizeof(key) - 2 && cmdline[i + k] == '2' && (i == 0 || cmdline[i - 1] == ' ')) {
++			early_screen = 1;       /* "sweetearlyfb=2": draw and mirror the console */
++			early_mirror = 1;
++			return;
++		}
+ 	}
+ }
+ 
+@@ -234,6 +246,23 @@ sweet_early_relocate(uint64_t base)
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+ 
++/* console_write() hook (serial_console.c): see early_mirror. Drops bytes rather than nesting. */
++void
++sweet_early_mirror(const char *s, int n)
++{
++	if (!early_mirror || !EARLY_FB_MAPPED || early_panicking || s == NULL) {
++		return;
++	}
++	if (__atomic_exchange_n(&early_mirror_busy, 1u, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	for (int i = 0; i < n; i++) {
++		sweet_early_draw(s[i]);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	__atomic_store_n(&early_mirror_busy, 0u, __ATOMIC_RELEASE);
++}
++
+ void
+ sweet_early_disable(void)
+ {
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 9161b2e..90f2d70 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -33,6 +33,7 @@ void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_
+ void sweet_early_disable(void);
+ void sweet_early_set_cmdline(const char *cmdline);
+ void sweet_early_flush_log(void);
++void sweet_early_mirror(const char *s, int n);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+@@ -42,6 +43,7 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ static inline void sweet_early_disable(void) {}
+ static inline void sweet_early_set_cmdline(const char *cmdline) { (void)cmdline; }
+ static inline void sweet_early_flush_log(void) {}
++static inline void sweet_early_mirror(const char *s, int n) { (void)s; (void)n; }
+ static inline void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+ 	(void)pa;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 892c26c..8cae0e1 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -277,6 +277,7 @@ _cnputc(char c, bool poll)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++extern void sweet_early_mirror(const char *s, int n);   /* osfmk/arm64/sweet_early.c (patch 1025) */
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -547,6 +548,9 @@ console_resume()
+ void
+ console_write(char *str, int size)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_early_mirror(str, size);  /* sweetearlyfb=2 (patch 1025): synchronous on-screen trail */
++#endif
+ 	if (disableConsoleOutput) {
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 		/*
