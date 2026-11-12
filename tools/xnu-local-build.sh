@@ -9,6 +9,8 @@
 # Compiler cache: sccache only (xnu's makedefs prefix KCC/KC++ with $(CCACHE)). BOUND_CHECKS=0: the
 # bounds-safety checks are off, as in the CI build. Output: $XNU_LOCAL_DIR/dxb/fakeroot/System/Library/Kernels/.
 # Needs about 8 GB free; run it in the background (it takes a while).
+# 13.5 = xnu-8796 with xnu/patches (the iOS 16 line): USE_KDK=1 for --remake, KDK_13.5_22G74 installed; use a separate
+# XNU_LOCAL_DIR (e.g. research/xnu-local-13). The kernel is $XNU_LOCAL_DIR/dxb/build/xnu.obj/kernel.development.sweet.
 # Toolchain: Xcode 26.x (DEVELOPER_DIR=...). The Xcode 27 SDK no longer ships Kernel.framework's private headers
 # (TrustCache/API.h, ...), so with Xcode 27 the build only gets as far as pmap_cs.h unless USE_KDK=1.
 set -euo pipefail
@@ -18,6 +20,11 @@ REMAKE=0 JOBS=-j8
 [[ "${1:-}" == -j* ]] && { JOBS=$1; shift; }
 MACOS_VERSION=${1:-26.5}
 W=${XNU_LOCAL_DIR:-$ROOT/research/xnu-local}
+# xnu-8796's lldbmacros install step calls `python`, which current macOS no longer has: the kernel links without it,
+# but make then ends with an error. Give it python3 under that name.
+if [[ "$MACOS_VERSION" == 13.* ]] && ! command -v python >/dev/null 2>&1; then
+    mkdir -p "$W/bin" && ln -sf "$(command -v python3)" "$W/bin/python" && export PATH="$W/bin:$PATH"
+fi
 
 if [ "$REMAKE" = 1 ]; then
     # the same make invocation as dxb's build.sh (build_xnu), on the tree it left behind
@@ -25,6 +32,7 @@ if [ "$REMAKE" = 1 ]; then
     [ -d "$D/build/xnu.obj" ] || { echo "no previous build in $D" >&2; exit 1; }
     case "$MACOS_VERSION" in 26.5) KDK=/Library/Developer/KDKs/KDK_26.5_25F71.kdk/ RCV=25.5.0 ;;
                              15.3) KDK=/Library/Developer/KDKs/KDK_15.3_24D60.kdk RCV=24.3.0 ;;
+                             13.5) KDK=/Library/Developer/KDKs/KDK_13.5_22G74.kdk RCV=22.6.0 ;;
                              *) echo "add the KDK path for $MACOS_VERSION" >&2; exit 1 ;; esac
     [ "${USE_KDK:-0}" = 1 ] || KDK=$W/no-kdk
     cd "$D/xnu"
@@ -45,6 +53,8 @@ DXB_SHA=$(sed -n 's/^  DXB_SHA: //p' "$ROOT/.github/workflows/xnu.yml")
 case "$MACOS_VERSION" in
     26.*) SERIES=$ROOT/xnu/patches-12377; PSUB=26.0 ;;
     15.*) SERIES=$ROOT/xnu/patches-11215; PSUB=15.0 ;;
+    # xnu-8796 (iOS 16 era): dxb keeps the 12.5-14.3 patches at the top level and CI copies ours there unprefixed
+    13.*) SERIES=$ROOT/xnu/patches; PSUB=. ;;
     *) echo "unsupported MACOS_VERSION $MACOS_VERSION" >&2; exit 1 ;;
 esac
 
@@ -56,9 +66,10 @@ if [ ! -d "$W/dxb/.git" ]; then
 fi
 cd "$W/dxb"
 # fresh copy of dxb's own files each run, then ours with the sweet- prefix (same order as CI)
-git checkout -q -- . && rm -f patches/$PSUB/sweet-*
+git checkout -q -- . && rm -f patches/$PSUB/sweet-* && git clean -fdq patches
 rm -rf xnu        # dxb clones a pristine xnu and patches it
-for f in "$SERIES"/*.patch "$SERIES"/*.sh; do cp "$f" "patches/$PSUB/sweet-$(basename "$f")"; done
+if [ "$PSUB" = . ]; then cp "$SERIES"/*.patch "$SERIES"/*.sh patches/
+else for f in "$SERIES"/*.patch "$SERIES"/*.sh; do cp "$f" "patches/$PSUB/sweet-$(basename "$f")"; done; fi
 sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' build.sh
 # ...and its arm64 slice must be ARMv8.0 like the kernel (xnu 1021, SDM630 Cortex-A53), the same -xcconfig as CI
 # (.github/workflows/xnu.yml): Apple clang otherwise compiles it for apple-m1 (LSE, LDAPR).

@@ -1,0 +1,43 @@
+diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
+index 3ded78c59..f2e4f886c 100644
+--- a/iokit/DriverKit/IORPC.h
++++ b/iokit/DriverKit/IORPC.h
+@@ -224,6 +224,10 @@ struct IORPC {
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/* backport (xnu-10002+): the iig of current Xcodes passes the message content here */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
+diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+index 3ded78c59..f2e4f886c 100644
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,10 @@ struct IORPC {
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/* backport (xnu-10002+): the iig of current Xcodes passes the message content here */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
+diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+index 5d1d92267..1db5ca45b 100644
+--- a/iokit/Kernel/IOUserServer.cpp
++++ b/iokit/Kernel/IOUserServer.cpp
+@@ -3209,7 +3209,7 @@ IOUserServer::server(ipc_kmsg_t requestkmsg, ipc_kmsg_t * pReply)
+ 		msgout = (typeof(msgout))ikm_header(replykmsg);
+ 	}
+ 
+-	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc };
++	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc, .kernelContent = message };
+ 
+ 	if (object) {
+ 		kern_allocation_name_t prior;
