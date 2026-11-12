@@ -1,0 +1,814 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9f9..dd077e085 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,8 +73,13 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/*
++	 * MPIDR layouts: DynamIQ (SM7150/SDM845) has the core in Aff1 and Aff0 = 0
++	 * (0x000-0x700); SDM630's two A53-class clusters have the cluster in Aff1 and
++	 * the core in Aff0 (0x000-0x003, 0x100-0x103). Both fit Aff1:Aff0, and the
++	 * GICv3 SGI target list needs Aff0 < 16 (signalCPU).
++	 */
++	if (cpu->phys_id > 0xffff || (cpu->phys_id & 0xff) >= 16 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -144,9 +149,12 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		IOSleep(1);
+ 	}
+-	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+-	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+-		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
++	/*
++	 * The supplied ADT lists the boot CPU first (logical CPU 0). Its MPIDR depends on
++	 * the SoC: 0 on SM7150/SDM845, a core of the 0x100 cluster on SDM630.
++	 */
++	if (topology->boot_cpu->cpu_id != 0) {
++		panic("SWEET CPU: expected the boot CPU as logical CPU 0 (mpidr=0x%x)", topology->boot_cpu->phys_id);
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+@@ -234,7 +242,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	if (start_paddr != 0 || arg_paddr != 0 || cpu == ml_get_topology_info()->boot_cpu ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 69b13f930..65d0d1691 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -61,7 +61,10 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# SWEET: ARMv8.0 + crypto, the common subset of SM7150/SDM845 (v8.2) and SDM630 (Cortex-A53 class, v8.0):
++# no LSE, RCpc, RDM, FP16 or DotProd may be emitted in the kernel (patch 1021). It must be -mcpu, not -march:
++# for arm64-apple-macos Apple clang keeps its default CPU for code generation whatever -march says.
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53
+ 
+ 
+ #
+@@ -337,6 +340,16 @@ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+ endif
+ 
++# SWEET (patch 1023): the kernel uses the 4K translation granule since patch 1021 (SDM630 Cortex-A53 has no
++# 16K granule). ARM_LARGE_MEMORY puts the kernel at -2TB (0xfffffe0007004000), which a 4K TTBR1 only covers
++# with a level-0 root, but the 4K bootstrap (start.s create_bootstrap_mapping) builds an L1 root. Use the
++# small-memory layout of the 4K iOS kernels instead: link 0xfffffff007004000, sub-page L1 roots.
++ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
++ARM64_PLKSEG_ADDR  =0xfffffff004004000
++ARM64_LINK_ADDR    =0xfffffff007004000
++endif
++
+ 
+ CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+ 			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+@@ -458,7 +471,6 @@ CFLAGS_KASAN_INSTRUMENTATION_TBI = -DKASAN_TBI=1 -DKASAN_SCALE=$(KASAN_SCALE_TBI
+ 	-mllvm -hwasan-use-short-granules=0 \
+ 	-mllvm -hwasan-memory-access-callback-prefix="__asan_"
+ 
+-
+ KASAN_SCALE_CLASSIC=3
+ CFLAGS_KASAN_INSTRUMENTATION_CLASSIC = -DKASAN_CLASSIC=1 -DKASAN_SCALE=$(KASAN_SCALE_CLASSIC) \
+ 	-fsanitize=address \
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index ccf3636ba..2118a2d80 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,7 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	sweet_early_set_cmdline(args->CommandLine);
+ 	sweet_early_set_video(args->Video.v_baseAddr, args->Video.v_width,
+ 	    args->Video.v_height, args->Video.v_rowBytes);
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+@@ -544,6 +545,7 @@ arm_init(
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
+ 	sweet_early_mark(20, "kprintf startup complete");
++	sweet_early_flush_log();
+ 	if (serial_exists) {
+ 		sweet_early_disable();
+ 	}
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+index da0bbba9b..10aae02ed 100644
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -273,7 +273,24 @@ _pfz_trylock_and_enqueue:
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+ 	// Try to grab the lock
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
++#else
++	/*
++	 * SWEET (patch 1021, ARMv8.0 / Cortex-A53: no LSE): the same one-shot trylock
++	 * with LDAXR/STXR. w10 = old value (0 = we got it); only a spurious STXR
++	 * failure retries. Caller-save registers only (w12 scratch).
++	 */
++Lsweet_enq_ldaxr:
++	ldaxr	w10, [x3]
++	cbnz	w10, Lsweet_enq_busy
++	stxr	w12, w11, [x3]
++	cbnz	w12, Lsweet_enq_ldaxr
++	b	Lsweet_enq_done
++Lsweet_enq_busy:
++	clrex
++Lsweet_enq_done:
++#endif
+ 	cbz		w10, Ltrylock_enqueue_success
+ 
+ 	mov		x0, #-1			// Failed
+@@ -323,7 +340,24 @@ _pfz_trylock_and_dequeue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
++#else
++	/*
++	 * SWEET (patch 1021, ARMv8.0 / Cortex-A53: no LSE): the same one-shot trylock
++	 * with LDAXR/STXR. w10 = old value (0 = we got it); only a spurious STXR
++	 * failure retries. Caller-save registers only (w12 scratch).
++	 */
++Lsweet_deq_ldaxr:
++	ldaxr	w10, [x2]
++	cbnz	w10, Lsweet_deq_busy
++	stxr	w12, w11, [x2]
++	cbnz	w12, Lsweet_deq_ldaxr
++	b	Lsweet_deq_done
++Lsweet_deq_busy:
++	clrex
++Lsweet_deq_done:
++#endif
+ 	cbz		w10, Ltrylock_dequeue_success
+ 
+ 	mov		x0, #-1			// Failed
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 42b778696..2857ff9ea 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10894,6 +10894,13 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	do {
+ 		int text_leaf_index = random() % num_ptes;
++		/*
++		 * SWEET (patch 1024): with a 4K kernel and 16K VM pages (PAGE_RATIO 4, SDM630) pmap_enter maps one
++		 * VM page as PAGE_SIZE / leaf-size consecutive PTEs and asserts that the first is aligned
++		 * (write_pte_fast "PTE write is unaligned", QEMU cortex-a53): keep the slid text commpage on a VM page
++		 * boundary. A no-op when the leaf size is PAGE_SIZE.
++		 */
++		text_leaf_index &= ~(int)((PAGE_SIZE >> pt_attr_leaf_shift(pt_attr)) - 1);
+ 
+ 		// Generate a VA for the commpage text with the same root and twig index as data
+ 		// comm page, but with new leaf index we've just generated.
+@@ -10983,11 +10990,24 @@ static_assert((_COMM_PAGE32_BASE_ADDRESS & ~ARM_TT_L2_OFFMASK) >= VM_MAX_ADDRESS
+  */
+ 
+ #elif (ARM_PGSHIFT == 12)
++#if defined(SWEET)
++/**
++ * SWEET 4K granule (SDM630, patch 1021) with the extended user VA
++ * (MACH_VM_MAX_ADDRESS 0x7FFFFE000000): like the 16K macOS case above, the
++ * commpage lies inside the user VA range. With 4K pages it is nested at L1, so
++ * what must hold is that the 1GB L1 entry holding it is exactly the commpage
++ * nesting region every user map reserves (vm_reserved_regions[], "commpage
++ * nesting"), so no user mapping can land in the shared table.
++ */
++static_assert((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) == _COMM_PAGE64_NESTING_START);
++static_assert(_COMM_PAGE64_NESTING_SIZE == ARM_TT_L1_SIZE);
++#else
+ /**
+  * Ensure that 64-bit devices using 4K pages can nest the commpage completely
+  * above the maximum userspace VA.
+  */
+ static_assert((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) >= MACH_VM_MAX_ADDRESS);
++#endif /* SWEET */
+ #else
+ #error Nested shared page mapping is unsupported on this config
+ #endif
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db01a..d9e52bc9a 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -111,6 +111,13 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * patch 1035: start.s maps all of boot_args.memSize twice (V=P and KVA) with one 4K L2 table per 1 GB.
++ * Apple's 8 pages cover a 2 GB device; the 3.2 GB range of the Moto G6 Plus (0xb0000000-0x17e400000,
++ * four or five L1 entries per side) overran them into the kernel's data. 2 L1 + 2 * 7 L2 tables.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb5684a..b3887dae0 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1825,7 +1825,7 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
+ #endif
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && __ARM_16K_PG__
+ /*
+  * The reserved low-globals/kernel region is excluded from VM allocation.
+  * Use the otherwise empty 32MB block above low globals and below gVirtBase
+@@ -1849,6 +1849,49 @@ sweet_early_map_final(void)
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
++#elif defined(SWEET)
++/*
++ * 4K granule (patch 1022): the same idea with SWEET_EARLY_FB_BLOCKS 2MB blocks right above the
++ * low-globals block. With the small-memory layout (patch 1023) VM_MIN_KERNEL_ADDRESS has no tables
++ * yet, but LOW_GLOBAL_BASE_ADDRESS (0xfffffff000000000) shares its 1GB L1 entry with the kernel
++ * (0xfffffff007004000), and L2 slots 1-6 of that table lie between the low globals and the kernel.
++ * Every condition is checked instead of asserted: a failed placement only turns the early console
++ * back into a log (sweet_early_fb_mapped = 0) instead of an invisible panic.
++ */
++#define SWEET_EARLY_FB_VA (LOW_GLOBAL_BASE_ADDRESS + ARM_TT_L2_SIZE)
++
++static void
++sweet_early_map_final(void)
++{
++	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++	const unsigned int n = SWEET_EARLY_FB_BLOCKS;
++
++	if (!sweet_early_fb_mapped) {
++		return;
++	}
++	/* the 4K kernel root is a sub-page L1 (T1SZ_BOOT 26): index it like arm_vm_init does */
++	tt_entry_t l1 = cpu_tte[L1_TABLE_INDEX(va)];      /* xnu-8796: sub-page L1 root, as arm_vm_map() indexes it */
++	unsigned int idx = (unsigned int)((va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
++	if (va + n * ARM_TT_L2_SIZE > gVirtBase || idx + n > TTE_PGENTRIES ||
++	    (l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) != (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
++		sweet_early_fb_mapped = 0;
++		return;
++	}
++	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++	for (unsigned int i = 0; i < n; i++) {
++		if (l2[idx + i] != ARM_TTE_EMPTY) {
++			sweet_early_fb_mapped = 0;
++			return;
++		}
++	}
++	for (unsigned int i = 0; i < n; i++) {
++		l2[idx + i] = ((uint64_t)SWEET_EARLY_FB_PA + i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
++	__asm__ volatile("dsb ishst" ::: "memory");
++}
+ #endif
+ 
+ void
+@@ -2189,8 +2232,10 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	ml_enable_monitor();
+ 
+ #if defined(SWEET)
+-	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+-	sweet_early_relocate(SWEET_EARLY_FB_VA);
++	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias (4K: only if placed). */
++	if (sweet_early_fb_mapped) {
++		sweet_early_relocate(SWEET_EARLY_FB_VA);
++	}
+ #endif
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index e4c15f2bd..c303ed78a 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1088,9 +1088,13 @@ ml_parse_cpu_topology(void)
+ #endif
+ 
+ #if defined(SWEET)
+-		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
++		/*
++		 * One logical cluster: Aff1 is the core on SM7150/SDM845 but the cluster on
++		 * SDM630, so neither MPIDR field is a core index. Use the logical CPU number
++		 * (the ADT lists the cores in order; on SM7150/SDM845 this equals Aff1).
++		 */
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
+-		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
++		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->cpu_id);
+ #else
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", MPIDR_CLUSTER_ID(cpu->phys_id));
+ 		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", MPIDR_CPU_ID(cpu->phys_id));
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index e01c12496..0057b1d2a 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -541,7 +541,12 @@
+ 
+ #define SCTLR_DSSBS               (1ULL << 44)
+ 
++#if defined(SWEET)
++/* Bit 23 is RES1 on ARMv8.0 (SDM630, patch 1021) and SPAN on ARMv8.1+ (harmless: SWEET does not use PAN). */
++#define SCTLR_RESERVED     ((3ULL << 28) | (1ULL << 23) | (1ULL << 20))
++#else
+ #define SCTLR_RESERVED     ((3ULL << 28) | (1ULL << 20))
++#endif
+ #if defined(HAS_APPLE_PAC)
+ 
+ // 31    PACIA_ENABLED AddPACIA and AuthIA functions enabled
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f83..0da87c051 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -35,6 +35,9 @@
+ #include "assym.s"
+ #include <arm64/tunables/tunables.s>
+ #include <arm64/exception_asm.h>
++#if defined(SWEET)
++#include <arm64/sweet_early.h>
++#endif
+ 
+ #if __ARM_KERNEL_PROTECT__
+ #include <arm/pmap.h>
+@@ -513,8 +516,11 @@ LEXT(start_first_cpu)
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 
+-#if defined(SWEET)
+-	/* Stage 0: white 64x32 band, no stack or page tables needed. */
++#if defined(SWEET) && __ARM_16K_PG__
++	/*
++	 * Stage 0: white 64x32 band, no stack or page tables needed. sweet/Poco F1 only: on the
++	 * 4K-granule build (SDM630, patch 1021) 0x9c000000 is ordinary RAM, not the splash.
++	 */
+ 	MOV64	x0, (0x9c000000 + 2368 * 4320)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+@@ -678,7 +684,7 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && __ARM_16K_PG__
+ 	/*
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+@@ -693,6 +699,49 @@ Lkernelcache_base_found:
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++#endif
++#if defined(SWEET) && !__ARM_16K_PG__
++	/*
++	 * 4K granule (patch 1022): the splash window SWEET_EARLY_FB_PA as SWEET_EARLY_FB_BLOCKS 2MB
++	 * Normal-NC blocks in the V=P L2 table that create_bootstrap_mapping made for the RAM of the
++	 * same 1GB (0x80000000-0xbfffffff on SDM630 and SDM845), found through the V=P L1 table (x25).
++	 * Nothing is written if that L1 entry is not a table or a slot is already used; then
++	 * sweet_early_fb_mapped stays 0 and the early console only logs.
++	 */
++	MOV64	x10, SWEET_EARLY_FB_PA
++	lsr		x12, x10, #(ARM_TT_L1_SHIFT)
++	and		x12, x12, #(TTE_PGENTRIES - 1)
++	ldr		x13, [x25, x12, lsl #TTE_SHIFT]
++	and		x11, x13, #3
++	cmp		x11, #3								// valid table descriptor
++	b.ne	Lsweet_fb4k_done
++	and		x13, x13, #(ARM_TTE_TABLE_MASK)
++	lsr		x12, x10, #(ARM_TT_L2_SHIFT)
++	and		x12, x12, #(TTE_PGENTRIES - 1)
++	cmp		x12, #(TTE_PGENTRIES - SWEET_EARLY_FB_BLOCKS)
++	b.hi	Lsweet_fb4k_done					// the window must not cross the L2 table
++	add		x13, x13, x12, lsl #TTE_SHIFT		// &l2[first]
++	mov		x16, #0
++Lsweet_fb4k_check:
++	ldr		x17, [x13, x16, lsl #TTE_SHIFT]
++	cbnz	x17, Lsweet_fb4k_done
++	add		x16, x16, #1
++	cmp		x16, #(SWEET_EARLY_FB_BLOCKS)
++	b.lo	Lsweet_fb4k_check
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	mov		x16, #0
++Lsweet_fb4k_set:
++	str		x11, [x13, x16, lsl #TTE_SHIFT]
++	add		x11, x11, #(ARM_TT_L2_SIZE)
++	add		x16, x16, #1
++	cmp		x16, #(SWEET_EARLY_FB_BLOCKS)
++	b.lo	Lsweet_fb4k_set
++	adrp	x16, EXT(sweet_early_fb_mapped)@page	// MMU off: PC-relative = physical
++	add		x16, x16, EXT(sweet_early_fb_mapped)@pageoff
++	mov		w17, #1
++	str		w17, [x16]
++Lsweet_fb4k_done:
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index ec4affddc..8828e8d64 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -10,16 +10,28 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>      /* SWEET.h: __ARM_16K_PG__ */
+ 
+ /*
+- * start.s and arm_vm_init map one 32MB block at 0x9c000000. It holds the
+- * splash framebuffer of both boards (sweet 0x9c000000 1080x2400, Poco F1
+- * 0x9d400000 1080x2246); sweet_early_set_video picks it from boot_args.
++ * start.s and arm_vm_init map the window SWEET_EARLY_FB_PA (sweet_early.h): with 16K pages one 32MB
++ * block at 0x9c000000 (sweet 0x9c000000 1080x2400, Poco F1 0x9d400000 1080x2246); with 4K pages
++ * (patch 1022) six 2MB blocks at 0x9d400000 (Moto G6 Plus 1080x2160, Poco F1). sweet_early_set_video
++ * picks the framebuffer inside it from boot_args. Nothing is drawn while sweet_early_fb_mapped is 0
++ * (4K: start.s found no V=P L2 table for the window, or arm_vm_init could not place the alias).
+  */
+-#define EARLY_BLOCK_PA 0x9c000000ull
++#define EARLY_BLOCK_PA ((uint64_t)SWEET_EARLY_FB_PA)
++#if __ARM_16K_PG__
+ #define EARLY_BLOCK_SIZE 0x2000000ull
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
++volatile uint32_t sweet_early_fb_mapped = 1;
+ static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
++#else
++#define EARLY_BLOCK_SIZE (SWEET_EARLY_FB_BLOCKS * 0x200000ull)
++volatile uint32_t sweet_early_fb_mapped = 0;     /* start.s stores 1 (physical address, MMU off) */
++static unsigned int early_width = 1080u, early_height = 2160u, early_stride = 4320u / 4;
++#endif
++#define EARLY_FB_MAPPED sweet_early_fb_mapped
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
+ static uint64_t early_off;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH early_width
+@@ -37,6 +49,22 @@ extern unsigned char iso_font[256 * 16];
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+ 
++/*
++ * The early console is log-only by default: lines go into a small ring that sweet_early_flush_log()
++ * hands to kprintf (serial + persistent log) once that works. They are drawn on the panel only with
++ * boot-arg sweetearlyfb=1 (found by sweet_early_set_cmdline, before any other mark) or on a panic.
++ */
++#define EARLY_RING 1536u
++static char early_ring[EARLY_RING];
++static unsigned int early_ring_len, early_screen, early_flushed;
++/*
++ * sweetearlyfb=2 (patch 1025): also MIRROR every console_write() byte onto the panel, synchronously, for
++ * the whole session (the -v boot log renderer only paints from a 33 ms thread_call, so whatever was
++ * printed just before a hard hang never reaches the screen). Survives sweet_early_disable().
++ */
++static unsigned int early_mirror;
++static volatile unsigned int early_mirror_busy;
++
+ static void
+ sweet_early_clear_row(void)
+ {
+@@ -48,10 +76,10 @@ sweet_early_clear_row(void)
+ 	}
+ }
+ 
+-void
+-sweet_early_putc(char c)
++static void
++sweet_early_draw(char c)
+ {
+-	if (early_disabled) {
++	if (!EARLY_FB_MAPPED) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+@@ -87,6 +115,20 @@ sweet_early_putc(char c)
+ 	early_col++;
+ }
+ 
++void
++sweet_early_putc(char c)
++{
++	if (early_disabled && !early_mirror) {     /* patch 1027: the mirror keeps panics visible */
++		return;
++	}
++	if (!early_flushed && early_ring_len < EARLY_RING) {
++		early_ring[early_ring_len++] = c;
++	}
++	if (early_screen) {
++		sweet_early_draw(c);
++	}
++}
++
+ static void
+ sweet_early_string(const char *s)
+ {
+@@ -101,13 +143,15 @@ sweet_early_mark(unsigned int stage, const char *label)
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+-	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
++	if (early_screen && EARLY_FB_MAPPED) {
++		uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
++		for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
++			for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
++				EARLY_FB[y * EARLY_STRIDE + x] = color;
++			}
+ 		}
++		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
+-	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_string("SWEET EARLY ");
+ 	if (stage >= 10) {
+ 		sweet_early_putc((char)('0' + stage / 10));
+@@ -121,10 +165,17 @@ sweet_early_mark(unsigned int stage, const char *label)
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	if ((early_disabled && !early_mirror) || early_panicking) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
++	if (!early_screen && EARLY_FB_MAPPED) {
++		/* a panic always shows: replay what was only logged so far, then the panic text */
++		early_screen = 1;
++		for (unsigned int i = 0; i < early_ring_len; i++) {
++			sweet_early_draw(early_ring[i]);
++		}
++	}
+ 	sweet_early_string("\nSWEET EARLY PANIC: ");
+ 	va_list copy;
+ 	va_copy(copy, *args);
+@@ -134,6 +185,44 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++void
++sweet_early_set_cmdline(const char *cmdline)
++{
++	static const char key[] = "sweetearlyfb=1";
++
++	for (unsigned int i = 0; cmdline[i] != '\0' && i < 256; i++) {
++		unsigned int k = 0;
++		while (key[k] != '\0' && cmdline[i + k] == key[k]) {
++			k++;
++		}
++		if (key[k] == '\0' && (i == 0 || cmdline[i - 1] == ' ')) {
++			early_screen = 1;       /* drawing still needs EARLY_FB_MAPPED */
++			return;
++		}
++		if (k == sizeof(key) - 2 && cmdline[i + k] == '2' && (i == 0 || cmdline[i - 1] == ' ')) {
++			early_screen = 1;       /* "sweetearlyfb=2": draw and mirror the console */
++			early_mirror = 1;
++			return;
++		}
++	}
++}
++
++/* kprintf (serial and the persistent log) is up: pass the recorded lines on, once. */
++void
++sweet_early_flush_log(void)
++{
++	if (early_flushed) {
++		return;
++	}
++	early_flushed = 1;
++	if (early_ring_len < EARLY_RING) {
++		early_ring[early_ring_len] = '\0';
++	} else {
++		early_ring[EARLY_RING - 1] = '\0';
++	}
++	kprintf("%s", early_ring);
++}
++
+ void
+ sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+@@ -157,6 +246,30 @@ sweet_early_relocate(uint64_t base)
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+ 
++/* kprintf() asks first (patch 1026), so the formatting is skipped while the mirror is off. */
++int
++sweet_early_mirror_enabled(void)
++{
++	return early_mirror && EARLY_FB_MAPPED && !early_panicking;
++}
++
++/* console_write() hook (serial_console.c): see early_mirror. Drops bytes rather than nesting. */
++void
++sweet_early_mirror(const char *s, int n)
++{
++	if (!early_mirror || !EARLY_FB_MAPPED || early_panicking || s == NULL) {
++		return;
++	}
++	if (__atomic_exchange_n(&early_mirror_busy, 1u, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	for (int i = 0; i < n; i++) {
++		sweet_early_draw(s[i]);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	__atomic_store_n(&early_mirror_busy, 0u, __ATOMIC_RELEASE);
++}
++
+ void
+ sweet_early_disable(void)
+ {
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 01dac4e4f..2bf9b28fb 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -3,16 +3,38 @@
+ #define _ARM64_SWEET_EARLY_H_
+ 
+ #include <pexpert/arm64/board_config.h>
++
++/*
++ * Where the bootstrap console draws (start.s, arm_vm_init.c, sweet_early.c):
++ *   16K granule: one 32MB L2 block at 0x9c000000 (sweet 0x9c000000 and Poco F1 0x9d400000 splashes)
++ *   4K granule (patch 1021/1022, SDM630 Moto G6 Plus, also the Poco F1): six 2MB L2 blocks from
++ *   0x9d400000, the splash of both (G6 1080x2160, Poco 1080x2246, < 9.7 MB)
++ */
++#if __ARM_16K_PG__
++#define SWEET_EARLY_FB_PA       0x9c000000
++#define SWEET_EARLY_FB_BLOCKS   1
++#else
++#define SWEET_EARLY_FB_PA       0x9d400000
++#define SWEET_EARLY_FB_BLOCKS   6
++#endif
++
++#ifndef __ASSEMBLER__
+ #include <stdarg.h>
+ #include <stdint.h>
+ 
+ #if defined(SWEET)
++/* 1 while the framebuffer window is mapped (16K: always; 4K: set by start.s, cleared on failure) */
++extern volatile uint32_t sweet_early_fb_mapped;
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes);
+ void sweet_early_disable(void);
++void sweet_early_set_cmdline(const char *cmdline);
++void sweet_early_flush_log(void);
++void sweet_early_mirror(const char *s, int n);
++int sweet_early_mirror_enabled(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+@@ -20,6 +42,10 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ 	(void)label;
+ }
+ static inline void sweet_early_disable(void) {}
++static inline void sweet_early_set_cmdline(const char *cmdline) { (void)cmdline; }
++static inline void sweet_early_flush_log(void) {}
++static inline void sweet_early_mirror(const char *s, int n) { (void)s; (void)n; }
++static inline int sweet_early_mirror_enabled(void) { return 0; }
+ static inline void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+ 	(void)pa;
+@@ -28,5 +54,6 @@ static inline void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t h
+ 	(void)rowbytes;
+ }
+ #endif
++#endif /* !__ASSEMBLER__ */
+ 
+ #endif
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 271dc3e87..562263d45 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -537,6 +537,12 @@ void
+ console_write(char *str, int size)
+ {
+ 	assert(str != NULL);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		extern void sweet_early_mirror(const char *s, int n);   /* osfmk/arm64/sweet_early.c (patch 1025) */
++		sweet_early_mirror(str, size);  /* sweetearlyfb=2: synchronous on-screen trail */
++	}
++#endif
+ 
+ 	char *write_ptr = NULL;
+ 	int chunk_size = CPU_CONS_BUF_SIZE;
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a2c..f1753c712 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,7 +160,8 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++/* SWEET (patch 1023): the small-memory kernel layout has less kernel VA than macOS's 128 GB zone map: iOS sizes. */
++#if XNU_PLATFORM_MacOSX && !defined(ARM64_BOARD_CONFIG_SWEET)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca0757..c9f5b5845 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -814,6 +814,15 @@ vm_compressor_set_size(void)
+ #if XNU_TARGET_OS_OSX
+ 
+ 	if (vm_compression_limit == 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * patch 1032: SWEET uses the small (iOS) kernel address space since patch 1023, where the macOS
++		 * 16x RAM compressor map does not fit (kmem hole panic on the Moto G6 Plus). Size it like iOS.
++		 */
++		compressor_pool_size = max_mem;
++	}
++	if (0) {
++#endif
+ 		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
+ 			compressor_pool_size = 16ULL * max_mem;
+ 		} else if (max_mem <= (8ULL * 1024ULL * 1024ULL * 1024ULL)) {
+diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
+index 65144c742..a140a3d87 100644
+--- a/pexpert/arm/pe_kprintf.c
++++ b/pexpert/arm/pe_kprintf.c
+@@ -93,10 +93,29 @@ _kprintf(const char *format, ...)
+ 
+ static int      cpu_last_locked = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern int sweet_early_mirror_enabled(void);
++extern void sweet_early_mirror(const char *s, int n);
++static void
++sweet_kprintf_mirror_putc(char c)
++{
++	sweet_early_mirror(&c, 1);
++}
++#endif
++
+ __attribute__((noinline, not_tail_called))
+ void
+ kprintf(const char *fmt, ...)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* sweetearlyfb=2 (patches 1025/1026): kprintf only reaches the serial port, which the phones do not have */
++	if (sweet_early_mirror_enabled()) {
++		va_list mirror;
++		va_start(mirror, fmt);
++		_doprnt_log(fmt, &mirror, sweet_kprintf_mirror_putc, 16);
++		va_end(mirror);
++	}
++#endif
+ 	va_list         listp;
+ 	va_list         listp2;
+ 	boolean_t       state;
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f49a..e5869dcf5 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -1,9 +1,10 @@
+ /*
+  * Board config for the Redmi Note 10 Pro ("sweet", Qualcomm SM7150 /
+  * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
++ * Also used for the Poco F1 (SDM845) and the Moto G6 Plus (SDM630, ARMv8.0).
+  *
+  * Generic ARM like BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's
+- * implementation-defined system registers exist), 16K pages and GICv3 like
++ * implementation-defined system registers exist), 4K pages and GICv3 like
+  * VMAPPLE. Unlike VMAPPLE the GIC has two security states (GICD_TYPER
+  * SecurityExtn=1): Group 0 belongs to TrustZone, so every interrupt,
+  * including the timer, is a Group 1 IRQ taken through sleh_irq().
+@@ -33,8 +34,16 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-#define __ARM_PAN_AVAILABLE__     1
+-#define __ARM_16K_PG__            1
++/*
++ * ARMv8.0 baseline (patch 1021) so one kernel runs on SDM630 (Moto G6 Plus,
++ * Kryo 260 Silver = Cortex-A53 class) as well as on the v8.2 Kryo 385/470:
++ *  - no __ARM_PAN_AVAILABLE__: PAN is ARMv8.1 (MSR PAN is UNDEFINED on the A53);
++ *  - no __ARM_16K_PG__: the A53 has no 16K translation granule
++ *    (ID_AA64MMFR0_EL1.TGran16 = 0). The hardware pages are 4K; with more
++ *    than 1 GB of RAM arm_init() still selects 16K VM pages (PAGE_SHIFT_CONST
++ *    = 14, PAGE_RATIO 4), the H6/H7 (A7/A8) arrangement, so userland keeps
++ *    seeing 16K pages.
++ */
+ 
+ #define HAS_GIC_V3                1
+ 
