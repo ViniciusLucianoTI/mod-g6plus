@@ -1,0 +1,44 @@
+From a69d95889ee2a9deba08e6e7579ce5723c8968e6 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 11:37:20 -0300
+Subject: [PATCH] sweet g6: SWDB reconnects when the first HELLOs get no valid
+ reply
+
+---
+ bsd/dev/sweet_usb.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index e8d6eecac..e6f0ab908 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -374,6 +374,7 @@ static struct {
+ 	bool        hello;          /* the host answered HELLO */
+ 	bool        ready;          /* block device registered */
+ 	bool        writable;
++	uint32_t    hello_failures;
+ 	bool        input;          /* the host has key/touch events for us */
+ 	uint32_t    input_events;
+ 	uint64_t    nblocks;
+@@ -1694,6 +1695,18 @@ swd_request_raw(uint32_t type, uint32_t seq, uint64_t lba, uint32_t nblk, uint32
+ 		/* no server answered yet (IOFindBSDRoot is still polling with HELLO): nothing to report or recover */
+ 		swd_abort(EP_DTX);
+ 		swd_abort(EP_DRX);
++		/*
++		 * Seen twice on evert: the host answers every HELLO but none of its replies arrives (host -> phone
++		 * dead from the first packet on, for the whole boot). Start over on the bus after a few of those.
++		 */
++		if (phase[0] != 't' && ++swd.hello_failures % 6 == 0 && ud.configured) {
++			printf("SWEET USBDISK: %u HELLOs sent, no valid reply (%s; %08x %08x %08x): reconnecting\n",
++			    swd.hello_failures, phase, r[0], r[1], r[2]);
++			swd.want_reconnect = true;
++			for (int t = 0; t < 10000 && (swd.want_reconnect || !ud.configured); t++) {
++				ud_sleep_ms(1);
++			}
++		}
+ 		return error;
+ 	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-- 
+2.56.0
+
