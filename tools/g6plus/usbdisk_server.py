@@ -15,7 +15,7 @@ Message = 512-byte little-endian header [+ data]:
    0 magic 'SWDB'  4 type  8 seq  12 status  16 lba(u64)  24 nblk  28 len  32 nblocks(u64)  40 bsize  44 flags
    64.. inline log text.   Types: 1 HELLO, 2 READ, 3 WRITE, 4 LOG, 5 FLUSH; replies carry type | 0x80.
 """
-import argparse, ctypes, ctypes.util, os, struct, sys, time
+import argparse, ctypes, ctypes.util, os, struct, sys, threading, time
 
 VID, PID, IFACE, EP_IN, EP_OUT = 0x1209, 0x0001, 2, 0x83, 0x03
 MAGIC, HDR = 0x42445753, 512
@@ -64,7 +64,12 @@ class Link:
             self.h = None
 
     def read(self, n, timeout_ms):
-        """Returns bytes, b'' on timeout; raises OSError when the device is gone."""
+        """Returns bytes, b'' on timeout; raises OSError when the device is gone.
+
+        timeout_ms 0 = wait forever, and that is what the message loop uses: when a bulk read times out, libusb
+        (macOS backend) aborts the pipe and clears its halt, which resets the host's data toggle while the phone
+        keeps its own. The next packet is then dropped as a duplicate and the 512-byte framing is lost for good
+        (seen as an endless run of "bad magic" and a root device that stops answering)."""
         buf = ctypes.create_string_buffer(n)
         got = ctypes.c_int(0)
         rc = self.lib.libusb_bulk_transfer(self.h, EP_IN, buf, n, ctypes.byref(got), timeout_ms)
@@ -83,7 +88,7 @@ class Link:
             out += part
         return out
 
-    def write(self, data, timeout_ms=5000):
+    def write(self, data, timeout_ms=0):
         buf = ctypes.create_string_buffer(bytes(data), len(data))
         sent = ctypes.c_int(0)
         rc = self.lib.libusb_bulk_transfer(self.h, EP_OUT, buf, len(data), ctypes.byref(sent), timeout_ms)
@@ -121,8 +126,16 @@ def main():
             print(f'warning: {a.image} is not a multiple of {a.bs} bytes; the tail is not served', file=sys.stderr)
     logf = open(a.log, 'ab') if a.log else None
     link = Link(load_libusb())
-    stats = dict(reads=0, read_bytes=0, writes=0, logs=0)
+    stats = dict(reads=0, read_bytes=0, writes=0, logs=0, bad=0)
     deadline = time.time() + a.secs if a.secs else None
+    if a.secs:      # the reads block without a timeout: --secs is enforced from a timer instead
+        def give_up():
+            print(f'[usbdisk] --secs {a.secs} reached: logs {stats["logs"]}, reads {stats["reads"]} '
+                  f'({stats["read_bytes"] >> 10} KiB), writes {stats["writes"]}, bad {stats["bad"]}', file=sys.stderr, flush=True)
+            os._exit(0)
+        t = threading.Timer(a.secs, give_up)
+        t.daemon = True
+        t.start()
     had_session = False
 
     def note(s):
@@ -139,7 +152,7 @@ def main():
         note('phone connected')
         try:
             while deadline is None or time.time() < deadline:
-                h = link.read(HDR, 500)
+                h = link.read(HDR, 0)
                 if not h:
                     continue
                 if len(h) < 64:
@@ -147,7 +160,9 @@ def main():
                     continue
                 magic, mtype, seq, _status, lba, nblk, length = struct.unpack_from('<IIIIQII', h, 0)
                 if magic != MAGIC:
-                    note(f'bad magic {magic:#x}, ignored')
+                    stats['bad'] += 1
+                    if stats['bad'] <= 5 or stats['bad'] % 1000 == 0:
+                        note(f'bad magic {magic:#x} (#{stats["bad"]}), ignored: the framing is lost')
                     continue
                 if mtype == LOG:
                     text = h[64:64 + min(length, HDR - 64)]
@@ -172,7 +187,7 @@ def main():
                     stats['reads'] += 1
                     stats['read_bytes'] += n
                 elif mtype == WRITE:
-                    data = link.read_exact(length, 5000)
+                    data = link.read_exact(length, 0)
                     ok = fd is not None and a.rw and length == nblk * a.bs
                     if ok:
                         os.pwrite(fd, data, lba * a.bs)
