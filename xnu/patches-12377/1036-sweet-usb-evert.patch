@@ -1,0 +1,319 @@
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -3,6 +3,8 @@
+  * (tools/mkadt.py --board) names the board; everything else is common.
+  *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
+  *   xiaomi,beryllium  Poco F1, SDM845
++ *   motorola,evert    Moto G6 Plus, SDM630 (4K granule build; no UFS, so sweet_ufs_init() and the
++ *                     drivers it starts never run there)
+  */
+ #ifndef _SWEET_BOARD_H_
+ #define _SWEET_BOARD_H_
+@@ -76,4 +78,14 @@
+ 	return cached == 1;
+ }
+ 
++static inline bool
++sweet_board_evert(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("motorola,evert") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
+ #endif /* _SWEET_BOARD_H_ */
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -45,6 +45,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_smmu_map_sid(unsigned sid);
+ void sweet_usb_probe(void);
++void sweet_usb_start_evert(void);
++static void sweet_usb_probe_evert(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* iokit/Kernel/arm/SweetNetwork.cpp */
+@@ -70,9 +72,34 @@
+ 	{ "clkref", 0x8c010 },
+ };
+ 
+-#define DWC3_PA                 0x0a600000
++/*
++ * Moto G6 Plus (SDM630, patch 1036). Live DT: ssusb@a800000 (core 0xa800000 + 0xfc100, so the Qualcomm
++ * wrapper "QSCRATCH" is at 0xa8f8800), qusb@c012000 "qcom,qusb2phy" major-rev 1 (the older register
++ * layout: PLL_STATUS 0x38, PORT_TUNE1 0x80, PORT_POWERDOWN 0xb4). GCC offsets from Linux gcc-sdm660.c.
++ * No IOMMU in front of the controller (no iommus property).
++ */
++static const struct {
++	const char *name;
++	uint32_t    off;
++} usb_cbcr_evert[] = {
++	{ "master", 0x0f008 },
++	{ "sleep", 0x0f00c },
++	{ "utmi", 0x0f010 },
++	{ "cfg-noc-axi", 0x05018 },
++	{ "aggre2-axi", 0x0f03c },
++	{ "ahb2phy", 0x6a004 },
++};
++#define DWC3_PA_EVERT           0x0a800000
++#define QUSB2_PA_EVERT          0x0c012000
++#define QSCRATCH_PA_EVERT       0x0a8f8800
++#define QUSB1_PLL_STATUS        0x38            /* bit 5: PLL locked */
++#define QUSB1_PORT_TUNE1        0x80
++#define QUSB1_PORT_POWERDOWN    0xb4            /* bit 0 POWER_DOWN, bit 1 FREEZIO_N, bit 5 CLAMP_N_EN */
++#define QUSB1_PORT_TEST2        0x9c
++
++#define DWC3_PA                 (sweet_board_evert() ? DWC3_PA_EVERT : 0x0a600000)
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
++#define QUSB2_PA                (sweet_board_evert() ? QUSB2_PA_EVERT : 0x088e2000)
+ #define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+@@ -90,6 +117,11 @@
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
++	if (sweet_board_evert()) {
++		sweet_usb_probe_evert();
++		return;
++	}
++
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+@@ -142,6 +174,73 @@
+ 	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+ 	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+ 	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++}
++
++/*
++ * Moto G6 Plus: same read-only report with the SDM630 offsets. Called from IOFindBSDRoot
++ * (sweet_usb_start_evert) because sweet_ufs_init(), which starts the drivers on the Xiaomi boards,
++ * never runs without a UFS node. Default sweetusb=0 here: nothing is touched unless asked.
++ */
++static void
++sweet_usb_probe_evert(void)
++{
++	int enabled = 0;
++	uint32_t cbcr[sizeof(usb_cbcr_evert) / sizeof(usb_cbcr_evert[0])];
++
++	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		printf("SWEET USB: GCC map failed\n");
++		return;
++	}
++	uint32_t gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	printf("SWEET USB: evert GDSC usb30 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
++	for (unsigned i = 0; i < sizeof(usb_cbcr_evert) / sizeof(usb_cbcr_evert[0]); i++) {
++		cbcr[i] = usb_rd(gcc, usb_cbcr_evert[i].off);
++		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr_evert[i].name, cbcr[i],
++		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
++	}
++	if (!(gdscr & (1u << 31)) || (cbcr[0] & CBCR_CLK_OFF) || (cbcr[3] & CBCR_CLK_OFF)) {
++		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
++		return;
++	}
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (dwc == 0) {
++		printf("SWEET USB: DWC3 map failed\n");
++		return;
++	}
++	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x\n",
++	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200), usb_rd(dwc, 0xc2c0));
++	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x GUCTL1 0x%08x\n",
++	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
++	    usb_rd(dwc, 0xc720), usb_rd(dwc, 0xc11c));
++	if (!(cbcr[5] & CBCR_CLK_OFF)) {
++		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++		if (phy != 0) {
++			printf("SWEET USB: QUSB2(v1) PLL_STATUS 0x%02x POWERDOWN 0x%02x TUNE1 0x%02x TEST2 0x%02x\n",
++			    usb_rd(phy, QUSB1_PLL_STATUS) & 0xff, usb_rd(phy, QUSB1_PORT_POWERDOWN) & 0xff,
++			    usb_rd(phy, QUSB1_PORT_TUNE1) & 0xff, usb_rd(phy, QUSB1_PORT_TEST2) & 0xff);
++		}
++	} else {
++		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
++	}
++	if (enabled >= 2) {
++		sweet_usb_gadget_start(dwc);
++	}
++}
++
++void
++sweet_usb_start_evert(void)
++{
++	static int started;
++	if (!sweet_board_evert() || started) {
++		return;
++	}
++	started = 1;
++	sweet_usb_probe_evert();
+ }
+ 
+ /*
+@@ -177,7 +276,7 @@
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             (sweet_board_evert() ? QSCRATCH_PA_EVERT : 0x0a6f8800)
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+@@ -693,7 +792,7 @@
+ static void
+ ud_net_start(void)
+ {
+-	int net = sweet_board_beryllium() ? 1 : 0;
++	int net = (sweet_board_beryllium() || sweet_board_evert()) ? 1 : 0;
+ 	int route = 0;
+ 
+ 	PE_parse_boot_argn("sweetnet", &net, sizeof(net));
+@@ -1111,8 +1210,15 @@
+ 	 * traffic (2026-10-20, boots 0105u/0108l); QUSB2 PWR_CTRL1.POWER_DOWN
+ 	 * left set by ABL was the cause. sweetusbfix=0 turns it off.
+ 	 */
++	/* evert: mask 1 only (power the PHY up if ABL left it down); the dwc3 quirk writes are SDM845's */
+ 	int fix = sweet_board_beryllium() ? 1 : 0;
++	if (sweet_board_evert()) {
++		fix = 8;        /* bit 3 = "PHY fix only" marker, see below */
++	}
+ 	PE_parse_boot_argn("sweetusbfix", &fix, sizeof(fix));
++	if (fix == 8) {
++		return 1;
++	}
+ 	return fix == 1 ? 7 : (fix & 7);
+ }
+ 
+@@ -1124,6 +1230,24 @@
+ 		printf("SWEET USB FIX: QUSB2 map failed\n");
+ 		return;
+ 	}
++	if (sweet_board_evert()) {
++		/* QUSB2 v1 (Linux phy-qcom-qusb2.c msm8996 layout): enable = clear POWER_DOWN, keep the clamps off */
++		uint32_t pd = usb_rd(phy, QUSB1_PORT_POWERDOWN) & 0xff, st = usb_rd(phy, QUSB1_PLL_STATUS) & 0xff;
++		printf("SWEET USB FIX: QUSB2(v1) POWERDOWN 0x%02x PLL_STATUS 0x%02x before\n", pd, st);
++		if (pd & 0x01u) {
++			*(volatile uint32_t *)(phy + QUSB1_PORT_POWERDOWN) = (pd & ~0x01u) | 0x20u | 0x02u;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			delay(250);
++		}
++		int n;
++		for (n = 0; n < 1000 && !(usb_rd(phy, QUSB1_PLL_STATUS) & 0x20u); n++) {
++			delay(1);
++		}
++		printf("SWEET USB FIX: QUSB2(v1) POWERDOWN 0x%02x PLL_STATUS 0x%02x after (%s, %d us)\n",
++		    usb_rd(phy, QUSB1_PORT_POWERDOWN) & 0xff, usb_rd(phy, QUSB1_PLL_STATUS) & 0xff,
++		    n < 1000 ? "locked" : "NOT locked", n);
++		return;
++	}
+ 	/* The block replicates each 8-bit register across the 32-bit word. */
+ 	uint32_t pwr = usb_rd(phy, QUSB2_PWR_CTRL1) & 0xff, pll = usb_rd(phy, QUSB2_PLL_STATUS) & 0xff;
+ 	printf("SWEET USB FIX: QUSB2 PWR_CTRL1 0x%02x PLL_STATUS 0x%02x before\n", pwr, pll);
+@@ -1170,7 +1294,8 @@
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	/* TRB buffer pointers are written as 32 bits here: keep the DMA area below 4 GB (the G6 has RAM above) */
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, (ppnum_t)atop_64(0xffffffffULL), 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+ 		return;
+@@ -1180,6 +1305,10 @@
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
++	if (ud.dma_pa + UD_SIZE > 0x100000000ULL) {
++		printf("SWEET USB: DMA area at 0x%llx is above 4 GB, not started\n", ud.dma_pa);
++		return;
++	}
+ 	ud_if_create();
+ 	ud_net_start();
+ 
+@@ -1189,7 +1318,16 @@
+ 	 * from the QUSB2 UTMI clock instead, as Linux dwc3_qcom_select_utmi_clk()
+ 	 * does for "qcom,select-utmi-as-pipe-clk" (QSCRATCH_GENERAL_CFG).
+ 	 */
+-	if (sweet_board_beryllium()) {
++	/*
++	 * evert: same situation by the DT (USB3-capable core with a QMP PHY nobody starts, port wired for
++	 * high speed), so it takes the Poco F1 path by default; each step has a boot-arg to turn it off:
++	 * sweetusbutmi=0, sweetusbreset=1, sweetusb20clk=0.
++	 */
++	int hs_only_core = (sweet_board_beryllium() || sweet_board_evert()) ? 1 : 0;
++	int utmi_pipe = hs_only_core, force_20clk = hs_only_core;
++	PE_parse_boot_argn("sweetusbutmi", &utmi_pipe, sizeof(utmi_pipe));
++	PE_parse_boot_argn("sweetusb20clk", &force_20clk, sizeof(force_20clk));
++	if (utmi_pipe) {
+ 		vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 		if (qs != 0) {
+ 			volatile uint32_t *cfg = (volatile uint32_t *)(qs + 0x08);
+@@ -1224,7 +1362,7 @@
+ 	 * Boot-arg sweetusbreset=1 forces the reset, 0 skips it on any board.
+ 	 */
+ 	uint32_t gctl_abl = dwc_rd(GCTL);
+-	int do_reset = sweet_board_beryllium() ? 0 : 1;
++	int do_reset = hs_only_core ? 0 : 1;
+ 	PE_parse_boot_argn("sweetusbreset", &do_reset, sizeof(do_reset));
+ 	if (fix & 2) {
+ 		do_reset = 1;
+@@ -1272,7 +1410,7 @@
+ 		printf("SWEET USB FIX: GUCTL1 0x%08x DCTL 0x%08x GUSB2PHYCFG 0x%08x\n",
+ 		    dwc_rd(0xc11c), dwc_rd(DCTL), dwc_rd(GUSB2PHYCFG_REG));
+ 	}
+-	if (sweet_board_beryllium()) {
++	if (force_20clk) {
+ 		/*
+ 		 * DWC3 >= 2.90a used at high speed only: Linux dwc3_core_init sets
+ 		 * GUCTL1.DEV_FORCE_20_CLK_FOR_30_CLK so the USB3 logic runs from the
+@@ -1283,6 +1421,8 @@
+ 		dwc_wr(0xc11c, guctl1 | (1u << 26));
+ 		printf("SWEET USB: GUCTL1 0x%08x -> 0x%08x (force 2.0 clock for 3.0 logic)\n",
+ 		    guctl1, dwc_rd(0xc11c));
++	}
++	if (sweet_board_beryllium()) {
+ 		/* apps_smmu stream 0x740: the first DMA would fault and reset the SoC */
+ 		int se = sweet_smmu_map_sid(0x740);
+ 		printf("SWEET USB: apps_smmu sid 0x740 -> %d\n", se);
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -802,6 +802,11 @@
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		// Moto G6 Plus (patch 1036): no UFS, so nothing else starts the USB driver (boot-arg sweetusb=N)
++		extern void sweet_usb_start_evert(void);
++		sweet_usb_start_evert();
++	}
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+ //
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -266,7 +266,16 @@
+ 	{
+ 		/* patch 1034, test only: sweetsmptest=N resets the SoC (PSCI SYSTEM_RESET) N seconds after a
+ 		 * complete SMP start, so a host loop can repeat the boot; a failed start stays on screen. */
+-		uint32_t smptest = 0;
++		uint32_t smptest = 0, selfreset = 0;
++		/* patch 1036, test only: sweetselfreset=N resets N seconds after the SMP start whatever happens
++		 * later, so unattended test boots return to Android (and adb) by themselves. */
++		if (PE_parse_boot_argn("sweetselfreset", &selfreset, sizeof(selfreset)) && selfreset) {
++			kprintf("SWEET CPU: sweetselfreset: PSCI SYSTEM_RESET in %u s\n", selfreset);
++			IOSleep(selfreset * 1000);
++			register uint64_t r0 __asm__("x0") = 0x84000009ULL;
++			__asm__ volatile("smc #0" : "+r"(r0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++			    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		}
+ 		if (PE_parse_boot_argn("sweetsmptest", &smptest, sizeof(smptest)) && smptest) {
+ 			kprintf("SWEET CPU: SMP TEST PASS, PSCI SYSTEM_RESET in %u s\n", smptest);
+ 			IOSleep(smptest * 1000);
