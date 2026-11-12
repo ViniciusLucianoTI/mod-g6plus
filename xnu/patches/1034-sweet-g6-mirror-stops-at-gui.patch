@@ -1,0 +1,28 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 8828e8d64..490e559e3 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -250,14 +250,21 @@ sweet_early_relocate(uint64_t base)
+ int
+ sweet_early_mirror_enabled(void)
+ {
+-	return early_mirror && EARLY_FB_MAPPED && !early_panicking;
++	extern int sweet_console_muted;
++	return early_mirror && EARLY_FB_MAPPED && !early_panicking && !sweet_console_muted;
+ }
+ 
+ /* console_write() hook (serial_console.c): see early_mirror. Drops bytes rather than nesting. */
+ void
+ sweet_early_mirror(const char *s, int n)
+ {
+-	if (!early_mirror || !EARLY_FB_MAPPED || early_panicking || s == NULL) {
++	/*
++	 * sweet_console_muted (osfmk/console/serial_console.c) is set by AppleCLCD at its first presented
++	 * frame when booted with sweetfb_noconsole=1: from then on the panel belongs to the GUI and the
++	 * trail stops (the text still reaches the log ring and the USB log). A panic draws again.
++	 */
++	extern int sweet_console_muted;
++	if (!early_mirror || !EARLY_FB_MAPPED || early_panicking || s == NULL || sweet_console_muted) {
+ 		return;
+ 	}
+ 	if (__atomic_exchange_n(&early_mirror_busy, 1u, __ATOMIC_ACQUIRE)) {
