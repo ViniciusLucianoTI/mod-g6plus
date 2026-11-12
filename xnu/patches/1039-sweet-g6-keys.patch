@@ -1,0 +1,174 @@
+From 86b921c602c442e7591a1f6c18c80f5fdf9db65a Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 12:21:28 -0300
+Subject: [PATCH] sweet g6: power and volume keys on evert (PM660 PON, PM660L
+ GPIO7, SPMI arbiter v2/v3 observer reads)
+
+---
+ bsd/dev/sweet_keys.c | 91 +++++++++++++++++++++++++++++++++++++++++---
+ bsd/dev/sweet_usb.c  |  2 +
+ 2 files changed, 87 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 4faeee1b2..8af1f73ac 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -3,6 +3,12 @@
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+  * Poco F1 (beryllium): power/RESIN on PM8998 PON (SID 0, same block),
+  * volume-up on PM8998 GPIO6 (SID 0, 0xc500; mainline gpio-keys).
++ * Moto G6 Plus (evert, SDM630): power and volume-down on the PM660 PON (SID 0, KPDPWR / RESIN, as the
++ * stock DT's qcom,pon_1 / qcom,pon_2), volume-up on PM660L GPIO7 (SID 2, 0xc600, DT gpio_keys vol_up,
++ * active low). The arbiter is at 0x0800f000 (obsrvr 0x09400000, cnfg 0x0800a000) and older than v5: the
++ * channel map is at core 0x800 + 4n and an observer channel is 0x8000 apart (Linux spmi-pmic-arb.c, v2/v3).
++ * sweet_ufs_init() does not run on evert: sweet_usb_start_evert() calls sweet_keys_init_evert()
++ * (boot-arg sweetkeys=1).
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -29,11 +35,16 @@ void sweet_keys_init(void);
+ #define KEYS_GPIO_RT     (KEYS_GPIO_BASE + 0x10u)
+ #define KEYS_NO_APID     0xffffu
+ 
+-static vm_offset_t keys_core, keys_obs, keys_cnfg;
++static vm_offset_t keys_core, keys_obs_all, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+ static uint16_t keys_gpio_base = 0xc100u, keys_gpio_ppid = 0x4c1u;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
++/* arbiter layout: v5 (sweet, beryllium) or v2/v3 (evert) */
++static uint32_t keys_map_reg = 0x900u, keys_obs_stride = 0x80u;
++static bool keys_per_apid;      /* evert: each observer channel mapped on its own (they are 32 KiB apart) */
++static vm_offset_t keys_apid_va[2];
++static uint16_t keys_apid_of[2] = {0xffffu, 0xffffu};
+ static int keys_sleep_chan;
+ 
+ static uint32_t
+@@ -50,7 +61,7 @@ keys_find_apid(uint16_t ppid, uint32_t count)
+ {
+ 	uint16_t found = KEYS_NO_APID;
+ 	for (uint32_t i = 0; i < count; ++i) {
+-		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
++		uint32_t map = keys_rd(keys_core, keys_map_reg + 4u * i);
+ 		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+ 			continue;
+ 		}
+@@ -68,7 +79,16 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	if (apid == KEYS_NO_APID) {
+ 		return false;
+ 	}
+-	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
++	uint32_t off = keys_obs_stride * apid; /* obs + EE(0)*0x10000 (v5) or 0x1000 (v2/v3) */
++	vm_offset_t keys_obs = keys_obs_all;
++	if (keys_per_apid) {
++		int slot = keys_apid_of[0] == apid ? 0 : keys_apid_of[1] == apid ? 1 : -1;
++		if (slot < 0 || !keys_apid_va[slot]) {
++			return false;
++		}
++		keys_obs = keys_apid_va[slot];
++		off = 0;
++	}
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+@@ -107,8 +127,11 @@ keys_thread(void *arg, wait_result_t result)
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		if (keys_gpio_apid == KEYS_NO_APID) {
++			gpio = 1;       /* withheld: reads as released */
++		}
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
++		if (!pok || (!gok && keys_gpio_apid != KEYS_NO_APID)) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+ 				    pok, gok, keys_last_status);
+@@ -148,8 +171,8 @@ sweet_keys_init(void)
+ 	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
++	keys_obs_all = ml_io_map(KEYS_OBS_PA, 0x10000);
++	if (!keys_core || !keys_cnfg || !keys_obs_all) {
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+@@ -189,4 +212,60 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++
++void sweet_keys_init_evert(void);
++void
++sweet_keys_init_evert(void)
++{
++	int enabled = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	if (keys_started || !enabled) {
++		return;
++	}
++	keys_started = true;
++	keys_gpio_base = 0xc600u;
++	keys_gpio_ppid = 0x2c6u;
++	keys_map_reg = 0x800u;
++	keys_obs_stride = 0x8000u;
++	keys_per_apid = true;
++	keys_core = ml_io_map(0x0800f000u, 0x1000);
++	keys_cnfg = ml_io_map(0x0800a000u, 0x3000);
++	if (!keys_core || !keys_cnfg) {
++		printf("SWEET KEYS: MMIO mapping failed\n");
++		return;
++	}
++	keys_version = keys_rd(keys_core, 0);
++	if (keys_version < 0x20010000u || keys_version >= 0x50000000u) {
++		printf("SWEET KEYS: evert: unexpected arbiter version %#x, keys not started\n", keys_version);
++		return;
++	}
++	keys_pon_apid = keys_find_apid(0x008, 512);
++	keys_gpio_apid = keys_find_apid(keys_gpio_ppid, 512);
++	keys_apid_of[0] = keys_pon_apid;
++	keys_apid_of[1] = keys_gpio_apid;
++	for (int i = 0; i < 2; i++) {
++		if (keys_apid_of[i] != KEYS_NO_APID) {
++			/* EE 0: obsrvr + 0x8000 * apid */
++			keys_apid_va[i] = ml_io_map(0x09400000u + 0x8000u * keys_apid_of[i], 0x1000);
++		}
++	}
++	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
++	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++	bool mok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x40u, &mode);
++	bool eok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x46u, &en);
++	bool sok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x05u, &subtype);
++	printf("SWEET KEYS: evert arb=%#x pon-apid=%u gpio-ppid=%#x gpio-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d status=%#x\n",
++	    keys_version, keys_pon_apid, keys_gpio_ppid, keys_gpio_apid,
++	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok, keys_last_status);
++	if (!eok || !(en & 0x80u)) {
++		printf("SWEET KEYS: volume-up GPIO not enabled by the firmware; volume-up withheld, PMIC unchanged\n");
++		keys_gpio_apid = KEYS_NO_APID;
++	}
++	if (kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index e6f0ab908..c9e3c3130 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -262,6 +262,8 @@ sweet_usb_start_evert(void)
+ 	sweet_usb_probe_evert();
+ 	extern void sweet_touch_init_evert(void);
+ 	sweet_touch_init_evert();
++	extern void sweet_keys_init_evert(void);
++	sweet_keys_init_evert();
+ }
+ 
+ /*
+-- 
+2.56.0
+
