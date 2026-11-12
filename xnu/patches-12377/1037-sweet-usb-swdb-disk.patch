@@ -151,7 +151,7 @@
  				if (ud.events++ < 200 || (!routine && ud.events < 5000)) {
  					printf("SWEET USB: event 0x%08x\n", ev);
  				}
-@@ -1286,9 +1336,531 @@
+@@ -1286,9 +1336,568 @@
  	dwc_wr(GCTL, dwc_rd(GCTL) & ~GCTL_CORESOFTRESET);
  	printf("SWEET USB FIX: core+PHY soft reset done: GCTL 0x%08x GUSB3PIPECTL 0x%08x GUSB2PHYCFG 0x%08x\n",
  	    dwc_rd(GCTL), dwc_rd(GUSB3PIPECTL_REG), dwc_rd(GUSB2PHYCFG_REG));
@@ -273,8 +273,8 @@
 +		return EIO;
 +	}
 +	return r[3] ? EIO : 0;
- }
- 
++}
++
 +static int
 +swd_hello(void)
 +{
@@ -299,7 +299,7 @@
 +}
 +
 +/* Console text to the host, 448 bytes per message. Runs from the first configuration on. */
- static void
++static void
 +swd_log_thread(void *arg __unused, wait_result_t wr __unused)
 +{
 +	static char chunk[SWD_LOG_MAX];
@@ -663,9 +663,46 @@
 +	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 +	printf("SWEET USBDISK TEST: %s: %llu bytes, byte sum %llu, %llu ms, %llu KiB/s (error %d)\n",
 +	    error ? "FAILED" : "done", done, sum, ns / 1000000, ns ? (done >> 10) * 1000000000ULL / ns : 0, error);
-+}
-+
-+static void
++	/*
++	 * Write check (server started with --rw and boot-arg usbrootrw=1): 1 MiB of a known pattern right
++	 * after the area read above, then read back and compared. The host can check the file as well:
++	 * byte i of that MiB is (i * 7 + (i >> 12)) & 0xff.
++	 */
++	uint32_t rw = 0;
++	PE_parse_boot_argn("usbrootrw", &rw, sizeof(rw));
++	if (error || !rw || !swd.writable || total + (1u << 20) > swd.nblocks * swd.bsize) {
++		printf("SWEET USBDISK TEST: write check skipped (usbrootrw %u, host writable %d)\n", rw, swd.writable);
++		return;
++	}
++	uint32_t bad = 0;
++	for (int pass = 0; pass < 2 && !error; pass++) {
++		for (uint32_t off = 0; off < (1u << 20) && !error; off += UD_DMAX) {
++			uint32_t nblk = UD_DMAX / swd.bsize;
++			lck_mtx_lock(swd.lock);
++			if (pass == 0) {
++				uint8_t *o = (uint8_t *)(ud.dma + UD_DTXB + SWD_HDR);
++				for (uint32_t i = 0; i < UD_DMAX; i++) {
++					o[i] = (uint8_t)((off + i) * 7 + ((off + i) >> 12));
++				}
++				error = swd_request(SWD_WRITE, (total + off) / swd.bsize, nblk, UD_DMAX, 0, 5000);
++			} else {
++				error = swd_request(SWD_READ, (total + off) / swd.bsize, nblk, 0, UD_DMAX, 5000);
++				const uint8_t *d = (const uint8_t *)(ud.dma + UD_DRXB + SWD_HDR);
++				for (uint32_t i = 0; i < UD_DMAX && !error; i++) {
++					bad += d[i] != (uint8_t)((off + i) * 7 + ((off + i) >> 12));
++				}
++			}
++			lck_mtx_unlock(swd.lock);
++		}
++	}
++	lck_mtx_lock(swd.lock);
++	int ferr = swd_request(SWD_FLUSH, 0, 0, 0, 0, 10000);
++	lck_mtx_unlock(swd.lock);
++	printf("SWEET USBDISK TEST: write check %s: 1 MiB at byte %llu, %u bad bytes on read-back, error %d, flush %d\n",
++	    (!error && !bad && !ferr) ? "OK" : "FAILED", total, bad, error, ferr);
+ }
+ 
+ static void
 +swd_rx_complete(void)
 +{
 +	swd.rx_done = true;
@@ -683,7 +720,7 @@
  sweet_usb_gadget_start(vm_offset_t dwc)
  {
  	thread_t thread;
-@@ -1482,6 +2054,15 @@
+@@ -1482,6 +2091,15 @@
  	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
  		thread_deallocate(thread);
  	}
