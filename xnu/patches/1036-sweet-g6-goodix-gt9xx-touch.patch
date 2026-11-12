@@ -1,0 +1,210 @@
+From cc2f7622fd5fbf3b97e9563fc3a2c24ecfd49cf3 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 11:10:39 -0300
+Subject: [PATCH] sweet g6: Goodix GT9xx touch screen on evert (bit-banged I2C
+ on TLMM 10/11)
+
+---
+ bsd/dev/sweet_touch.c | 172 ++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_usb.c   |   2 +
+ 2 files changed, 174 insertions(+)
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 1ae50ee1b..5770e76e1 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1187,6 +1187,178 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * Moto G6 Plus (evert, SDM630): Goodix GT9xx at 0x5d on BLSP1 QUP3 (Android: i2c-3, "gt9xx-mmi"), SDA/SCL
++ * TLMM 10/11 (function blsp_i2c3), IRQ TLMM 67, reset TLMM 66; all four pins are in the NORTH tile, which on
++ * SDM630/660 is at 0x03100000 (Linux pinctrl-sdm660.c, sdm630.dtsi). No BLSP QUP driver here: the bus is
++ * bit-banged on its pins as GPIOs, like the Poco F1's. Protocol as Linux drivers/input/touchscreen/goodix.c:
++ * product id (ASCII) at 0x8140, config at 0x8047 (x/y resolution LE at +1/+3), status at 0x814e (bit 7 =
++ * report ready, low nibble = contacts), 8-byte contacts from 0x814f [id, x LE, y LE, size LE, 0]; a zero
++ * written to 0x814e acknowledges. The reset sequence holds INT low so the chip answers at 0x5d.
++ * sweet_ufs_init(), which starts the touch thread on the Xiaomi boards, does not run on evert:
++ * sweet_usb_start_evert() calls this. Boot-args: sweettouch=1 to enable (default off on evert),
++ * sweettouchdelay=S, sweettouchms, sweettouchbb, sweettouchlog=1.
++ */
++#define EVERT_TLMM_NORTH 0x03100000u
++#define GT9_ADDR         0x5du
++#define GT9_ID_REG       0x8140u
++#define GT9_CFG_REG      0x8047u
++#define GT9_STATUS_REG   0x814eu
++
++static const struct touch_board touch_evert = {
++	"BLSP1 QUP3 (bit-banged)", 0, 0, 0, 0,
++	10, 11, 0, 67, 66, 1080, 2160, false,
++};
++
++static int
++gt9_write8(uint16_t reg, uint8_t v)
++{
++	const uint8_t msg[3] = {(uint8_t)(reg >> 8), (uint8_t)reg, v};
++	return bb_xfer(GT9_ADDR, msg, sizeof(msg), NULL, 0);
++}
++
++static void
++touch_evert_thread(void *arg __unused, wait_result_t result __unused)
++{
++	unsigned delay_s = 20;
++	uint8_t id[6], cfg[8], buf[1 + 8 * TOUCH_MAX];
++	int err = 0;
++
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET TOUCH: evert GT9xx, starting in %u s\n", delay_s);
++	touch_wait(delay_s * 1000u);
++	st.gpio = ml_io_map(EVERT_TLMM_NORTH, 0x48000);
++	if (!st.gpio) {
++		printf("SWEET TOUCH: TLMM mapping failed\n");
++		goto out;
++	}
++	st.bitbang = true;
++	printf("SWEET TOUCH: TLMM as left by ABL: sda%u=%#x/%#x scl%u=%#x/%#x irq%u=%#x/%#x rst%u=%#x/%#x\n",
++	    tb->sda, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->sda)),
++	    tb->scl, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->scl)),
++	    tb->irq, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
++	    tb->rst, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)));
++	/* bus pins: plain GPIO inputs with the internal pull-up (the board's pull-ups hang off the touch rail) */
++	touch_gpio(tb->sda, 0, 3, 0, false, false);
++	touch_gpio(tb->scl, 0, 3, 0, false, false);
++	/* reset with INT low: address 0x5d (0xba/0xbb) */
++	touch_gpio(tb->irq, 0, 0, 0, true, false);
++	touch_gpio(tb->rst, 0, 0, 0, true, false);
++	touch_wait(20);
++	touch_gpio(tb->rst, 0, 0, 0, true, true);
++	touch_wait(10);
++	touch_wait(50);
++	touch_gpio(tb->irq, 0, 0, 0, false, false);
++	touch_wait(50);
++	printf("SWEET TOUCH: after reset: sda=%d scl=%d irq=%d\n", bb_get(tb->sda), bb_get(tb->scl), bb_get(tb->irq));
++	st.probing = true;
++	for (int tries = 0; tries < 3; tries++) {
++		memset(id, 0, sizeof(id));
++		err = touch_read(GT9_ADDR, GT9_ID_REG, true, id, sizeof(id));
++		if (!err) {
++			break;
++		}
++		touch_wait(100);
++	}
++	if (err) {
++		/* INT high at reset selects 0x14 instead: tell which one answers */
++		uint8_t alt[4] = {0};
++		int e2 = touch_read(0x14, GT9_ID_REG, true, alt, sizeof(alt));
++		st.probing = false;
++		printf("SWEET TOUCH: no GT9xx at 0x5d (error %d; 0x14 -> error %d %02x %02x %02x %02x). "
++		    "Rail off (pm660l_l3) or wrong pins: touch not started\n", err, e2, alt[0], alt[1], alt[2], alt[3]);
++		goto out;
++	}
++	st.probing = false;
++	unsigned cw = tb->w, ch = tb->h;
++	if (!touch_read(GT9_ADDR, GT9_CFG_REG, true, cfg, sizeof(cfg))) {
++		unsigned w = cfg[1] | (cfg[2] << 8), h = cfg[3] | (cfg[4] << 8);
++		printf("SWEET TOUCH: GT9xx config version %#x, %ux%u, %u contacts, trigger %#x\n", cfg[0], w, h, cfg[5] & 0xf, cfg[6]);
++		if (w >= 240 && w <= 4096 && h >= 240 && h <= 4096) {
++			cw = w;
++			ch = h;
++		}
++	}
++	printf("SWEET TOUCH: GT9xx product '%c%c%c%c' fw %#x, reports %ux%u -> panel %ux%u, polled every %u ms\n",
++	    id[0] ? id[0] : '?', id[1] ? id[1] : ' ', id[2] ? id[2] : ' ', id[3] ? id[3] : ' ', id[4] | (id[5] << 8),
++	    cw, ch, tb->w, tb->h, touch_poll_ms);
++	(void)gt9_write8(GT9_STATUS_REG, 0);
++	st.kind = TOUCH_GOODIX;
++	unsigned errors = 0, reports = 0;
++	for (;;) {
++		touch_wait(touch_poll_ms);
++		/* the chip holds INT active while a report waits; the level differs by config, so the status byte decides */
++		err = touch_read(GT9_ADDR, GT9_STATUS_REG, true, buf, 1);
++		if (err) {
++			if (errors++ < 10) {
++				printf("SWEET TOUCH: status read error %d\n", err);
++			}
++			touch_wait(100);
++			continue;
++		}
++		if (!(buf[0] & 0x80u)) {
++			continue;
++		}
++		unsigned n = buf[0] & 0x0fu;
++		uint32_t mask = 0;
++		int x[TOUCH_MAX], y[TOUCH_MAX];
++		if (n > TOUCH_MAX) {
++			n = 0;
++		}
++		if (n && touch_read(GT9_ADDR, GT9_STATUS_REG + 1, true, buf + 1, 8 * n)) {
++			(void)gt9_write8(GT9_STATUS_REG, 0);
++			continue;
++		}
++		for (unsigned i = 0; i < n; i++) {
++			const uint8_t *c = buf + 1 + 8 * i;
++			unsigned fid = c[0] & 0x0fu;
++			if (fid >= TOUCH_MAX) {
++				continue;
++			}
++			mask |= 1u << fid;
++			x[fid] = (int)((unsigned)(c[1] | (c[2] << 8)) * tb->w / cw);
++			y[fid] = (int)((unsigned)(c[3] | (c[4] << 8)) * tb->h / ch);
++		}
++		if (touch_trace || reports < 5) {
++			printf("SWEET TOUCH: report %u: status %#x mask %#x first %d,%d\n", reports, buf[0], mask,
++			    n ? x[buf[1] & 0xf] : -1, n ? y[buf[1] & 0xf] : -1);
++		}
++		reports++;
++		touch_report(mask, x, y);
++		(void)gt9_write8(GT9_STATUS_REG, 0);
++	}
++out:
++	(void)thread_terminate(current_thread());
++}
++
++void sweet_touch_init_evert(void);
++void
++sweet_touch_init_evert(void)
++{
++	int enabled = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	if (st.started || !enabled) {
++		return;
++	}
++	st.started = true;
++	tb = &touch_evert;
++	touch_poll_ms = 8;
++	(void)PE_parse_boot_argn("sweettouchms", &touch_poll_ms, sizeof(touch_poll_ms));
++	if (touch_poll_ms < 1 || touch_poll_ms > 50) {
++		touch_poll_ms = 8;
++	}
++	(void)PE_parse_boot_argn("sweettouchbb", &bb_half_us, sizeof(bb_half_us));
++	if (bb_half_us < 2 || bb_half_us > 10) {
++		bb_half_us = 5;
++	}
++	(void)PE_parse_boot_argn("sweettouchlog", &touch_trace, sizeof(touch_trace));
++	if (kernel_thread_start(touch_evert_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ void
+ sweet_touch_init(void)
+ {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 73197062d..e8d6eecac 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -260,6 +260,8 @@ sweet_usb_start_evert(void)
+ 	}
+ 	started = 1;
+ 	sweet_usb_probe_evert();
++	extern void sweet_touch_init_evert(void);
++	sweet_touch_init_evert();
+ }
+ 
+ /*
+-- 
+2.56.0
+
