@@ -1,0 +1,34 @@
+From 54cb76e9796dd379e50c9a62a2de7a8dc5514812 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 14:55:19 -0300
+Subject: [PATCH] sweet g6: QUSB2 TUNE2 0xf3 by default on evert (phone->host
+ packets no longer lost)
+
+---
+ bsd/dev/sweet_usb.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index cdac914b6..02f09e92a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1443,9 +1443,14 @@ sweet_usb_fix_phy(void)
+ 		 * factory trim from the efuse (0x00780240 bits 28:25) plus a correction of -5 (msm-4.4
+ 		 * phy-msm-qusb.c). ABL's values are what we run with; they are printed here because phone -> host
+ 		 * packets with particular contents are never acknowledged on this board (SWDB "killer packets",
+-		 * an ECM frame stuck forever). sweetusbtune=1 programs Android's values.
++		 * an ECM frame stuck forever). Measured on the device, same kernel and root, first minute of boot:
++		 *   ABL's values (0xa3 0x83 0xc0)      disk 0-6 retries per ~20000 requests, ECM TX stuck after 2-21 frames
++		 *   sweetusbtune=1 (0x70 0x81 0xcf)    66 retries in 827 requests, ECM stuck after 18 frames
++		 *   TUNE2 0xf3, TUNE3/4 as ABL         0 retries in 23525 requests, ECM 363 frames out, queue empty
++		 * sweetusbtune=1 programs my reading of Android's values, =0xNN sets TUNE2 raw, =0 changes nothing.
+ 		 */
+-		uint32_t efuse = 0, tune = 0;
++		/* default 0xf3: TUNE2 raised from ABL's 0xa3; measured 2026-11-12 (see below). sweetusbtune=0 keeps ABL's */
++		uint32_t efuse = 0, tune = 0xf3;
+ 		vm_offset_t ef = ml_io_map(0x00780000u, 0x1000);
+ 		if (ef) {
+ 			efuse = usb_rd(ef, 0x240);
+-- 
+2.56.0
+
