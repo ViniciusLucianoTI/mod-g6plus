@@ -1,0 +1,41 @@
+From 3a3e0d4f6a15c8fe3b6e4bde66abe98420955808 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 17:27:39 -0300
+Subject: [PATCH] sweet g6: no global SMMU TLB invalidate (system froze there),
+ step 8 marker
+
+---
+ bsd/dev/sweet_a508.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index ba93864f4..711aa856c 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -435,9 +435,21 @@ a5_smmu_setup(void)
+ 	a5_wr(sm, SM_sGFSR, g0);
+ 	a5_wr(sm, SM_S2CR(A5_SMR), (3u << 8) | A5_CB);
+ 	a5_wr(sm, SM_SMR(A5_SMR), 1u << 31);
+-	printf("SWEET GPU: SMMU step 7: SMR 0x%08x S2CR 0x%08x; global TLB invalidate\n", a5_rd(sm, SM_SMR(A5_SMR)), a5_rd(sm, SM_S2CR(A5_SMR)));
++	printf("SWEET GPU: SMMU step 7: SMR 0x%08x S2CR 0x%08x\n", a5_rd(sm, SM_SMR(A5_SMR)), a5_rd(sm, SM_S2CR(A5_SMR)));
++	a5_wait(200);
++	/*
++	 * Third try (2026-11-12): steps 1-7 all printed, then the whole system froze (log and userland), at
++	 * or right after the write of the global TLBIALLNSNH (GR0 0x068) that stood here. The context's own
++	 * TLBIALL above is enough for a context bank that was never used, and the stock kernel (qcom,skip-init)
++	 * never does a global invalidate on this SMMU. sweetgpusmmutlbi=1 puts the write back.
++	 */
++	uint32_t gtlbi = 0;
++	PE_parse_boot_argn("sweetgpusmmutlbi", &gtlbi, sizeof(gtlbi));
++	printf("SWEET GPU: SMMU step 8: still here 200 ms after the stream mapping; global TLB invalidate %s\n", gtlbi ? "requested" : "skipped");
+ 	a5_wait(20);
+-	a5_wr(sm, SM_TLBIALLNSNH, 0);
++	if (gtlbi) {
++		a5_wr(sm, SM_TLBIALLNSNH, 0);
++	}
+ 	printf("SWEET GPU: SMMU CB%u SCTLR 0x%08x TCR 0x%08x TTBR0 0x%08x%08x; SMR%u 0x%08x S2CR 0x%08x; sCR0 0x%08x sGFSR 0x%08x -> 0x%08x\n",
+ 	    A5_CB, a5_rd(b, SM_CB_SCTLR), a5_rd(b, SM_CB_TCR), a5_rd(b, SM_CB_TTBR0 + 4), a5_rd(b, SM_CB_TTBR0), A5_SMR,
+ 	    a5_rd(sm, SM_SMR(A5_SMR)), a5_rd(sm, SM_S2CR(A5_SMR)), a5_rd(sm, SM_sCR0), g0, a5_rd(sm, SM_sGFSR));
+-- 
+2.56.0
+
