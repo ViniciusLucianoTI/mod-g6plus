@@ -1,4 +1,4 @@
-From 2c5dfc09639e9f7b740cb317f8290d547a4badfd Mon Sep 17 00:00:00 2001
+From 0df5f356f96dc20cc328bcb6fab6117b0cf26a1b Mon Sep 17 00:00:00 2001
 From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
 Date: Thu, 12 Nov 2026 15:30:45 -0300
 Subject: [PATCH] sweet g6: Adreno 508 phase 1: RPM level votes, GCC/GPUCC
@@ -6,10 +6,10 @@ Subject: [PATCH] sweet g6: Adreno 508 phase 1: RPM level votes, GCC/GPUCC
 
 ---
  bsd/conf/files        |   1 +
- bsd/dev/sweet_a508.c  | 246 ++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_a508.c  | 260 ++++++++++++++++++++++++++++++++++++++++++
  bsd/dev/sweet_touch.c |  47 ++++++++
  bsd/dev/sweet_usb.c   |   2 +
- 4 files changed, 296 insertions(+)
+ 4 files changed, 310 insertions(+)
  create mode 100644 bsd/dev/sweet_a508.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
@@ -26,10 +26,10 @@ index 7cf1af1af..bfe12e29e 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
 new file mode 100644
-index 000000000..fc0bca53e
+index 000000000..c40d5da01
 --- /dev/null
 +++ b/bsd/dev/sweet_a508.c
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,260 @@
 +/*
 + * SWEET: Adreno 508 on the Moto G6 Plus (evert, Snapdragon 630 / SDM630). docs/G6PLUS_GPU_PLAN.md.
 + *
@@ -127,7 +127,7 @@ index 000000000..fc0bca53e
 +a5_branch(vm_offset_t base, uint32_t off, uint32_t bits, bool check, const char *name)
 +{
 +	a5_wr(base, off, a5_rd(base, off) | bits);
-+	for (int i = 0; check && i < 2000; i++) {
++	for (int i = 0; check && i < 20000; i++) {
 +		if (!(a5_rd(base, off) & 0x80000000u)) {
 +			printf("SWEET GPU: clock %s on (0x%08x)\n", name, a5_rd(base, off));
 +			return true;
@@ -220,10 +220,18 @@ index 000000000..fc0bca53e
 +	}
 +	(void)a5_branch(a5.cc, CC_CXO_CBCR, 1u, true, "gpucc_cxo");
 +	if (!a5_rcg(CC_RBBMTIMER_RCGR, 0, 0, "rbbmtimer_clk_src") ||
-+	    !a5_branch(a5.cc, CC_RBBMTIMER_CBCR, 1u, true, "gpucc_rbbmtimer") ||
 +	    !a5_rcg(CC_GFX3D_RCGR, 0, 0, "gfx3d_clk_src")) {
 +		goto out;
 +	}
++	/*
++	 * First try (2026-11-12): with only gpu_cx on, the rbbmtimer branch stayed off (CBCR 0x80000001, its
++	 * RCG ROOT_OFF). The stock kernel powers both GDSCs before any GPU clock, and its gx GDSC node has
++	 * qcom,force-enable-root-clk with core_root_clk = gfx3d_clk_src: the root is forced on (CMD bit 1)
++	 * while the domain comes up. Same order here.
++	 */
++	a5_wr(a5.cc, CC_GFX3D_RCGR, a5_rd(a5.cc, CC_GFX3D_RCGR) | 2u);
++	delay(50);
++	printf("SWEET GPU: gfx3d root forced on (CMD 0x%08x)\n", a5_rd(a5.cc, CC_GFX3D_RCGR));
 +	/* gpu_gx, as Linux gdsc_enable() with SW_RESET | CLAMP_IO | AON_RESET | NO_RET_PERIPH */
 +	a5_wr(a5.cc, CC_GX_BCR, a5_rd(a5.cc, CC_GX_BCR) | 1u);
 +	delay(1);
@@ -237,7 +245,13 @@ index 000000000..fc0bca53e
 +	}
 +	a5_wr(a5.cc, CC_GFX3D_CBCR, a5_rd(a5.cc, CC_GFX3D_CBCR) | (1u << 14));  /* RETAIN_MEM */
 +	delay(1);
-+	if (!a5_branch(a5.cc, CC_GFX3D_CBCR, 1u, true, "gpucc_gfx3d")) {
++	bool core = a5_branch(a5.cc, CC_GFX3D_CBCR, 1u, true, "gpucc_gfx3d");
++	bool tmr = a5_branch(a5.cc, CC_RBBMTIMER_CBCR, 1u, true, "gpucc_rbbmtimer");
++	printf("SWEET GPU: GPUCC now: cx gdsc 0x%08x gx gdsc 0x%08x gfx3d rcg 0x%08x/0x%08x gfx3d cbcr 0x%08x rbbmtimer rcg 0x%08x cbcr 0x%08x clamp 0x%08x\n",
++	    a5_rd(a5.cc, CC_CX_GDSCR), a5_rd(a5.cc, CC_GX_GDSCR), a5_rd(a5.cc, CC_GFX3D_RCGR), a5_rd(a5.cc, CC_GFX3D_RCGR + 4),
++	    a5_rd(a5.cc, CC_GFX3D_CBCR), a5_rd(a5.cc, CC_RBBMTIMER_RCGR), a5_rd(a5.cc, CC_RBBMTIMER_CBCR), a5_rd(a5.cc, CC_GX_CLAMP));
++	if (!core) {
++		printf("SWEET GPU: stopped: no core clock, the GPU registers are not touched (rbbmtimer %d)\n", tmr);
 +		goto out;
 +	}
 +	a5_wait(2);
