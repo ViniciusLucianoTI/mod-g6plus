@@ -1,0 +1,359 @@
+From 2c5dfc09639e9f7b740cb317f8290d547a4badfd Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 15:30:45 -0300
+Subject: [PATCH] sweet g6: Adreno 508 phase 1: RPM level votes, GCC/GPUCC
+ clocks, GDSCs, register read-back (sweetgpu=1)
+
+---
+ bsd/conf/files        |   1 +
+ bsd/dev/sweet_a508.c  | 246 ++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_touch.c |  47 ++++++++
+ bsd/dev/sweet_usb.c   |   2 +
+ 4 files changed, 296 insertions(+)
+ create mode 100644 bsd/dev/sweet_a508.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7cf1af1af..bfe12e29e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_a508.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+new file mode 100644
+index 000000000..fc0bca53e
+--- /dev/null
++++ b/bsd/dev/sweet_a508.c
+@@ -0,0 +1,246 @@
++/*
++ * SWEET: Adreno 508 on the Moto G6 Plus (evert, Snapdragon 630 / SDM630). docs/G6PLUS_GPU_PLAN.md.
++ *
++ * Phase 1 (boot-arg sweetgpu=1): power the GPU up and prove that its registers answer. No firmware, no
++ * command processor, nothing is left running that the rest of the system depends on.
++ *
++ *   1. RPM votes (sweet_evert_rpm_level, the G-Link client in sweet_touch.c): VDD_CX ("rwcx" 0) and
++ *      VDD_MX ("rwmx" 0) levels. On SDM630 the GPU core sits on CX (stock DT: gpucc vdd_gfx-supply and
++ *      the gx GDSC's parent are pm660l_s3_level = CX; there is no separate GFX rail as on SDM660).
++ *   2. GCC 0x00100000: gcc_gpu_cfg_ahb_clk 0x71004, gcc_bimc_gfx_clk 0x7106c, gcc_gpu_bimc_gfx_clk
++ *      0x71010, GPLL0 to the GPU clock controller 0x5200c bits 4 and 3.
++ *   3. GPUCC 0x05065000: gpu_cx GDSC 0x1004, rbbmtimer RCG 0x10b0 + branch 0x10d0, gfx3d RCG 0x1070 from
++ *      XO (19.2 MHz: safe at any CX level; real frequencies come with phase 2), gpu_gx GDSC 0x1094
++ *      (reset 0x1090, clamp/AON reset 0x130, memory retention on branch 0x1098), gfx3d branch 0x1098.
++ *   4. GPU 0x05000000 (register index * 4): RBBM_STATUS 0x4f5, VBIF_VERSION 0x3000, a write/read-back
++ *      of CP_SCRATCH_REG0 0xb78.
++ * Each step checks its status bit and stops with a message before the next block is touched: an access
++ * to an unclocked or unpowered block is an SError on this SoC.
++ * References: Linux drivers/clk/qcom/gpucc-sdm660.c, gcc-sdm660.c, gdsc.c, drivers/pmdomain/qcom/rpmpd.c,
++ * drivers/gpu/drm/msm/adreno/a5xx_gpu.c, a5xx.xml.h (v6.6); stock DT qcom,kgsl-3d0@5000000.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_evert_rpm_level(uint32_t type, uint32_t id, uint32_t level);
++void sweet_a508_init(void);
++
++#define A508_GCC_PA             0x00100000u
++#define A508_GPUCC_PA           0x05065000u
++#define A508_GPU_PA             0x05000000u
++#define RPM_RWCX                0x78637772u
++#define RPM_RWMX                0x786d7772u
++#define RPM_LEVEL_SVS           128u
++#define RPM_LEVEL_NOM           256u
++
++#define GCC_GPU_CFG_AHB         0x71004u
++#define GCC_BIMC_GFX            0x7106cu
++#define GCC_GPU_BIMC_GFX        0x71010u
++#define GCC_GPU_GPLL0           0x5200cu
++
++#define CC_CX_GDSCR             0x1004u
++#define CC_CXO_CBCR             0x1020u
++#define CC_GFX3D_RCGR           0x1070u
++#define CC_GX_BCR               0x1090u
++#define CC_GX_GDSCR             0x1094u
++#define CC_GFX3D_CBCR           0x1098u
++#define CC_RBBMTIMER_RCGR       0x10b0u
++#define CC_RBBMTIMER_CBCR       0x10d0u
++#define CC_GX_CLAMP             0x130u
++
++#define A5_RBBM_CLOCK_CNTL      0x067u
++#define A5_RBBM_STATUS          0x4f5u
++#define A5_CP_SCRATCH0          0xb78u
++#define A5_VBIF_VERSION         0x3000u
++
++static struct {
++	vm_offset_t gcc, cc, gpu;
++	bool started;
++} a5;
++static int a508_chan;
++
++static uint32_t
++a5_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++a5_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++a5_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a508_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Branch clock: set the enable bit(s), wait for CLK_OFF (bit 31) to clear. */
++static bool
++a5_branch(vm_offset_t base, uint32_t off, uint32_t bits, bool check, const char *name)
++{
++	a5_wr(base, off, a5_rd(base, off) | bits);
++	for (int i = 0; check && i < 2000; i++) {
++		if (!(a5_rd(base, off) & 0x80000000u)) {
++			printf("SWEET GPU: clock %s on (0x%08x)\n", name, a5_rd(base, off));
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET GPU: clock %s %s (0x%08x)\n", name, check ? "did NOT turn on" : "requested", a5_rd(base, off));
++	return !check;
++}
++
++/* RCG2: CFG at +4 (source 10:8, divider 4:0 as 2*div-1), UPDATE = CMD bit 0. */
++static bool
++a5_rcg(uint32_t rcgr, uint32_t src, uint32_t div2m1, const char *name)
++{
++	a5_wr(a5.cc, rcgr + 4, (src << 8) | div2m1);
++	a5_wr(a5.cc, rcgr, a5_rd(a5.cc, rcgr) | 1u);
++	for (int i = 0; i < 2000; i++) {
++		if (!(a5_rd(a5.cc, rcgr) & 1u)) {
++			printf("SWEET GPU: %s source %u div field %u (CMD 0x%08x CFG 0x%08x)\n", name, src, div2m1,
++			    a5_rd(a5.cc, rcgr), a5_rd(a5.cc, rcgr + 4));
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET GPU: %s update stuck (CMD 0x%08x)\n", name, a5_rd(a5.cc, rcgr));
++	return false;
++}
++
++/* GDSC on: clear SW_COLLAPSE (bit 0), wait for PWR_ON (bit 31). */
++static bool
++a5_gdsc_on(uint32_t gdscr, const char *name)
++{
++	uint32_t before = a5_rd(a5.cc, gdscr);
++	a5_wr(a5.cc, gdscr, before & ~1u);
++	for (int i = 0; i < 5000; i++) {
++		if (a5_rd(a5.cc, gdscr) & 0x80000000u) {
++			printf("SWEET GPU: power domain %s on (0x%08x -> 0x%08x, %d us)\n", name, before, a5_rd(a5.cc, gdscr), i);
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET GPU: power domain %s did NOT come up (0x%08x -> 0x%08x)\n", name, before, a5_rd(a5.cc, gdscr));
++	return false;
++}
++
++static void
++a508_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	unsigned delay_s = 35, stage = 0;
++
++	(void)PE_parse_boot_argn("sweetgpu", &stage, sizeof(stage));
++	(void)PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
++	printf("SWEET GPU: Adreno 508 stage %u, starting in %u s\n", stage, delay_s);
++	a5_wait(delay_s * 1000u);
++
++	int ecx = sweet_evert_rpm_level(RPM_RWCX, 0, RPM_LEVEL_SVS);
++	int emx = sweet_evert_rpm_level(RPM_RWMX, 0, RPM_LEVEL_NOM);
++	printf("SWEET GPU: RPM votes: CX level %u -> %d, MX level %u -> %d\n", RPM_LEVEL_SVS, ecx, RPM_LEVEL_NOM, emx);
++	if (ecx || emx) {
++		printf("SWEET GPU: stopped: the rails are not voted\n");
++		goto out;
++	}
++	a5_wait(5);
++
++	a5.gcc = ml_io_map(A508_GCC_PA, 0x80000);
++	if (!a5.gcc) {
++		printf("SWEET GPU: GCC mapping failed\n");
++		goto out;
++	}
++	printf("SWEET GPU: GCC as found: cfg_ahb 0x%08x bimc_gfx 0x%08x gpu_bimc_gfx 0x%08x gpll0 gates 0x%08x\n",
++	    a5_rd(a5.gcc, GCC_GPU_CFG_AHB), a5_rd(a5.gcc, GCC_BIMC_GFX), a5_rd(a5.gcc, GCC_GPU_BIMC_GFX), a5_rd(a5.gcc, GCC_GPU_GPLL0));
++	if (!a5_branch(a5.gcc, GCC_GPU_CFG_AHB, 1u, true, "gcc_gpu_cfg_ahb")) {
++		goto out;
++	}
++	(void)a5_branch(a5.gcc, GCC_GPU_GPLL0, (1u << 4) | (1u << 3), false, "gcc_gpu_gpll0 + div");
++	(void)a5_branch(a5.gcc, GCC_BIMC_GFX, 1u, false, "gcc_bimc_gfx");
++	(void)a5_branch(a5.gcc, GCC_GPU_BIMC_GFX, 1u, false, "gcc_gpu_bimc_gfx");
++	a5_wait(1);
++
++	a5.cc = ml_io_map(A508_GPUCC_PA, 0x10000);
++	if (!a5.cc) {
++		printf("SWEET GPU: GPUCC mapping failed\n");
++		goto out;
++	}
++	printf("SWEET GPU: GPUCC as found: cx gdsc 0x%08x gx gdsc 0x%08x cxo 0x%08x gfx3d rcg 0x%08x/0x%08x gfx3d cbcr 0x%08x rbbmtimer cbcr 0x%08x clamp 0x%08x\n",
++	    a5_rd(a5.cc, CC_CX_GDSCR), a5_rd(a5.cc, CC_GX_GDSCR), a5_rd(a5.cc, CC_CXO_CBCR), a5_rd(a5.cc, CC_GFX3D_RCGR),
++	    a5_rd(a5.cc, CC_GFX3D_RCGR + 4), a5_rd(a5.cc, CC_GFX3D_CBCR), a5_rd(a5.cc, CC_RBBMTIMER_CBCR), a5_rd(a5.cc, CC_GX_CLAMP));
++	if (!a5_gdsc_on(CC_CX_GDSCR, "gpu_cx")) {
++		goto out;
++	}
++	(void)a5_branch(a5.cc, CC_CXO_CBCR, 1u, true, "gpucc_cxo");
++	if (!a5_rcg(CC_RBBMTIMER_RCGR, 0, 0, "rbbmtimer_clk_src") ||
++	    !a5_branch(a5.cc, CC_RBBMTIMER_CBCR, 1u, true, "gpucc_rbbmtimer") ||
++	    !a5_rcg(CC_GFX3D_RCGR, 0, 0, "gfx3d_clk_src")) {
++		goto out;
++	}
++	/* gpu_gx, as Linux gdsc_enable() with SW_RESET | CLAMP_IO | AON_RESET | NO_RET_PERIPH */
++	a5_wr(a5.cc, CC_GX_BCR, a5_rd(a5.cc, CC_GX_BCR) | 1u);
++	delay(1);
++	a5_wr(a5.cc, CC_GX_BCR, a5_rd(a5.cc, CC_GX_BCR) & ~1u);
++	a5_wr(a5.cc, CC_GX_CLAMP, a5_rd(a5.cc, CC_GX_CLAMP) | (1u << 4));      /* AON reset pulse */
++	delay(1);
++	a5_wr(a5.cc, CC_GX_CLAMP, a5_rd(a5.cc, CC_GX_CLAMP) & ~(1u << 4));
++	a5_wr(a5.cc, CC_GX_CLAMP, a5_rd(a5.cc, CC_GX_CLAMP) & ~1u);            /* release the I/O clamp */
++	if (!a5_gdsc_on(CC_GX_GDSCR, "gpu_gx")) {
++		goto out;
++	}
++	a5_wr(a5.cc, CC_GFX3D_CBCR, a5_rd(a5.cc, CC_GFX3D_CBCR) | (1u << 14));  /* RETAIN_MEM */
++	delay(1);
++	if (!a5_branch(a5.cc, CC_GFX3D_CBCR, 1u, true, "gpucc_gfx3d")) {
++		goto out;
++	}
++	a5_wait(2);
++
++	a5.gpu = ml_io_map(A508_GPU_PA, 0x40000);
++	if (!a5.gpu) {
++		printf("SWEET GPU: GPU mapping failed\n");
++		goto out;
++	}
++	uint32_t status = a5_rd(a5.gpu, A5_RBBM_STATUS * 4), vbif = a5_rd(a5.gpu, A5_VBIF_VERSION * 4);
++	uint32_t s0 = a5_rd(a5.gpu, A5_CP_SCRATCH0 * 4);
++	a5_wr(a5.gpu, A5_CP_SCRATCH0 * 4, 0x508a5a5au);
++	uint32_t s1 = a5_rd(a5.gpu, A5_CP_SCRATCH0 * 4);
++	a5_wr(a5.gpu, A5_CP_SCRATCH0 * 4, 0x00000000u);
++	uint32_t s2 = a5_rd(a5.gpu, A5_CP_SCRATCH0 * 4);
++	printf("SWEET GPU: ADRENO 508 ANSWERS: RBBM_STATUS 0x%08x VBIF_VERSION 0x%08x RBBM_CLOCK_CNTL 0x%08x; scratch 0x%08x -> wrote 0x508a5a5a read 0x%08x -> wrote 0 read 0x%08x (%s)\n",
++	    status, vbif, a5_rd(a5.gpu, A5_RBBM_CLOCK_CNTL * 4), s0, s1, s2,
++	    (s1 == 0x508a5a5au && s2 == 0) ? "register write/read-back OK" : "read-back MISMATCH");
++out:
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_a508_init(void)
++{
++	unsigned stage = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetgpu", &stage, sizeof(stage));
++	if (a5.started || !stage) {
++		return;
++	}
++	a5.started = true;
++	if (kernel_thread_start(a508_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 427081b6b..91edaa4b8 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -25,6 +25,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
+ #include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -1510,6 +1511,52 @@ erpm_vreg_enable(uint32_t type, uint32_t id, uint32_t uv)
+ 	return 0;
+ }
+ 
++/*
++ * Active-set level vote for an RPM power domain (Linux rpmpd.c: type "rwcx"/"rwmx", key "vlvl"), for
++ * sweet_a508.c. One request at a time: the touch thread's own request runs at its start.
++ */
++int sweet_evert_rpm_level(uint32_t type, uint32_t id, uint32_t level);
++int
++sweet_evert_rpm_level(uint32_t type, uint32_t id, uint32_t level)
++{
++	static volatile uint32_t busy;
++	while (!OSCompareAndSwap(0, 1, &busy)) {
++		touch_wait(2);
++	}
++	int error = ENXIO;
++	if (erpm_connect()) {
++		uint32_t m[14];
++		bzero(m, sizeof(m));
++		uint32_t mid = ++erpm.msg_id;
++		m[0] = GL_TX_DATA | (ERPM_LCID << 16);
++		m[2] = 40;                      /* chunk: 8 + 20 + 12 */
++		m[4] = 0x00716572u;             /* "req" */
++		m[5] = 20 + 12;
++		m[6] = mid;
++		m[7] = 0;                       /* active set */
++		m[8] = type;
++		m[9] = id;
++		m[10] = 12;
++		m[11] = 0x6c766c76u;            /* "vlvl" */
++		m[12] = 4;
++		m[13] = level;
++		erpm.err = 0;
++		erpm.errtext[0] = 0;
++		error = EAGAIN;
++		if (erpm_tx(m, 56)) {
++			for (int t = 0; t < 2000 && erpm.acked_id != mid && !erpm.err; t++) {
++				erpm_pump(NULL, 1);
++			}
++			error = erpm.err ? EIO : (erpm.acked_id == mid ? 0 : ETIMEDOUT);
++			if (error) {
++				printf("SWEET RPM: level request %u (type %#x id %u level %u) failed: %d '%s'\n", mid, type, id, level, error, erpm.errtext);
++			}
++		}
++	}
++	busy = 0;
++	return error;
++}
++
+ static int
+ gt9_write8(uint16_t reg, uint8_t v)
+ {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 02f09e92a..cf3c9d99a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -264,6 +264,8 @@ sweet_usb_start_evert(void)
+ 	sweet_touch_init_evert();
+ 	extern void sweet_keys_init_evert(void);
+ 	sweet_keys_init_evert();
++	extern void sweet_a508_init(void);
++	sweet_a508_init();
+ }
+ 
+ /*
+-- 
+2.56.0
+
