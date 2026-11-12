@@ -76,6 +76,10 @@ Each phase ends in something observable in the USB log or on the panel. Kernel w
   forced on and both GDSCs must be up before any GPUCC branch turns on.
 * 2026-11-12: phase 2a done (`xnu/patches/1045`, `sweetgpu=2`): TrustZone authenticates `a508_zap` (PAS id 13,
   relocatable image in a kernel-allocated region below 4 GiB). Risk 1 below did not materialise.
+* 2026-11-12: phase 2b done (`xnu/patches/1046`, `1048`, `sweetgpu=3`): kgsl SMMU context bank 0 with our tables,
+  a5xx hw init, PM4/PFP, CP_ME_INIT, CP_SET_SECURE_MODE 0, and a register write executed by the command
+  processor. Risk 2 below did not materialise either, with one rule learnt the hard way: on this phone a write
+  to the SMMU's global TLBIALLNSNH (and a read of context bank 2) never returns and takes a CPU with it.
 
 ## Risks, in the order they can stop the work
 
