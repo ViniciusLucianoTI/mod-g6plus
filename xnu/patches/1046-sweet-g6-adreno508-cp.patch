@@ -1,0 +1,516 @@
+From 3b749219da926fde27034128170e19c7bf38d908 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 16:46:43 -0300
+Subject: [PATCH] sweet g6: Adreno 508 phase 2b: SMMU context, a5xx hw init,
+ PM4/PFP, CP_ME_INIT, secure mode off, CP register write (sweetgpu=3)
+
+---
+ bsd/dev/sweet_a508.c | 467 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 463 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index c615c4865..4e3f410db 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -28,7 +28,16 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/kalloc.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include "sweet_board.h"
+ 
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++extern bool sweet_a630_fw_get(const char *adt_prop, const char *file, void **buf, size_t *len);
++extern void sweet_a630_fw_put(void *buf, size_t len);
++extern bool sweet_a630_zap_load(void);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_evert_rpm_level(uint32_t type, uint32_t id, uint32_t level);
+@@ -57,10 +66,7 @@ void sweet_a508_init(void);
+ #define CC_RBBMTIMER_CBCR       0x10d0u
+ #define CC_GX_CLAMP             0x130u
+ 
+-#define A5_RBBM_CLOCK_CNTL      0x067u
+-#define A5_RBBM_STATUS          0x4f5u
+ #define A5_CP_SCRATCH0          0xb78u
+-#define A5_VBIF_VERSION         0x3000u
+ 
+ static struct {
+ 	vm_offset_t gcc, cc, gpu;
+@@ -141,6 +147,456 @@ a5_gdsc_on(uint32_t gdscr, const char *name)
+ 	return false;
+ }
+ 
++
++/* ------------------------------------------------------------------------------------------------ */
++/* Phase 2b (sweetgpu=3): GPU SMMU context, a5xx_hw_init for the 508, PM4/PFP, CP_ME_INIT, a NOP.     */
++/* Linux a5xx_gpu.c a5xx_hw_init()/a5xx_me_init(), adreno_gpu.h packet encodings, arm-smmu (v2) as   */
++/* sweet_a630.c does it for the same SMMU block at 0x05040000 (stock DT: qcom,smmu-v2, same           */
++/* attach-impl-defs as SDM845; the GPU's stream ID is 0).                                             */
++/* ------------------------------------------------------------------------------------------------ */
++#define A5_VBIF_ROUND_ROBIN_QOS_ARB             0x00003049u
++#define A5_RBBM_PERFCTR_GPU_BUSY_MASKED         0x0000046fu
++#define A5_RBBM_AHB_CNTL0                       0x00000093u
++#define A5_RBBM_AHB_CNTL1                       0x00000094u
++#define A5_RBBM_AHB_CNTL2                       0x00000095u
++#define A5_RBBM_INTERFACE_HANG_INT_CNTL         0x0000002fu
++#define A5_RBBM_PERFCTR_CNTL                    0x00000464u
++#define A5_CP_PERFCTR_CP_SEL_0                  0x00000bb0u
++#define A5_RBBM_PERFCTR_RBBM_SEL_0              0x0000046bu
++#define A5_UCHE_CACHE_WAYS                      0x00000e96u
++#define A5_UCHE_TRAP_BASE_LO                    0x00000e89u
++#define A5_UCHE_TRAP_BASE_HI                    0x00000e8au
++#define A5_UCHE_WRITE_THRU_BASE_LO              0x00000e87u
++#define A5_UCHE_WRITE_THRU_BASE_HI              0x00000e88u
++#define A5_UCHE_GMEM_RANGE_MIN_LO               0x00000e8bu
++#define A5_UCHE_GMEM_RANGE_MIN_HI               0x00000e8cu
++#define A5_UCHE_GMEM_RANGE_MAX_LO               0x00000e8du
++#define A5_UCHE_GMEM_RANGE_MAX_HI               0x00000e8eu
++#define A5_CP_MEQ_THRESHOLDS                    0x00000825u
++#define A5_CP_MERCIU_SIZE                       0x00000826u
++#define A5_CP_ROQ_THRESHOLDS_2                  0x00000820u
++#define A5_CP_ROQ_THRESHOLDS_1                  0x0000081fu
++#define A5_PC_DBG_ECO_CNTL                      0x00000d00u
++#define A5_RB_DBG_ECO_CNTL                      0x00000cc4u
++#define A5_UCHE_MODE_CNTL                       0x00000e81u
++#define A5_CP_CHICKEN_DBG                       0x00000833u
++#define A5_TPL1_MODE_CNTL                       0x00000f02u
++#define A5_RB_MODE_CNTL                         0x00000cc6u
++#define A5_VPC_DBG_ECO_CNTL                     0x00000e60u
++#define A5_HLSQ_DBG_ECO_CNTL                    0x00000e04u
++#define A5_CP_PROTECT_CNTL                      0x000008a0u
++#define A5_RBBM_SECVID_TSB_CNTL                 0x0000f803u
++#define A5_RBBM_SECVID_TSB_TRUSTED_BASE_LO      0x0000f800u
++#define A5_RBBM_SECVID_TSB_TRUSTED_BASE_HI      0x0000f801u
++#define A5_RBBM_SECVID_TSB_TRUSTED_SIZE         0x0000f802u
++#define A5_RBBM_SECVID_TRUST_CNTL               0x0000f400u
++#define A5_CP_ADDR_MODE_CNTL                    0x00000860u
++#define A5_VSC_ADDR_MODE_CNTL                   0x00000bc1u
++#define A5_GRAS_ADDR_MODE_CNTL                  0x00000c81u
++#define A5_RB_ADDR_MODE_CNTL                    0x00000cc5u
++#define A5_PC_ADDR_MODE_CNTL                    0x00000d01u
++#define A5_HLSQ_ADDR_MODE_CNTL                  0x00000e05u
++#define A5_VFD_ADDR_MODE_CNTL                   0x00000e41u
++#define A5_VPC_ADDR_MODE_CNTL                   0x00000e61u
++#define A5_UCHE_ADDR_MODE_CNTL                  0x00000e80u
++#define A5_SP_ADDR_MODE_CNTL                    0x00000ec1u
++#define A5_TPL1_ADDR_MODE_CNTL                  0x00000f01u
++#define A5_RBBM_SECVID_TSB_ADDR_MODE_CNTL       0x0000f810u
++#define A5_CP_ME_INSTR_BASE_LO                  0x00000838u
++#define A5_CP_ME_INSTR_BASE_HI                  0x00000839u
++#define A5_CP_PFP_INSTR_BASE_LO                 0x00000835u
++#define A5_CP_PFP_INSTR_BASE_HI                 0x00000836u
++#define A5_CP_RB_BASE                           0x00000800u
++#define A5_CP_RB_BASE_HI                        0x00000801u
++#define A5_CP_RB_CNTL                           0x00000802u
++#define A5_CP_RB_RPTR                           0x00000806u
++#define A5_CP_RB_WPTR                           0x00000807u
++#define A5_RBBM_INT_0_MASK                      0x00000038u
++#define A5_RBBM_INT_0_STATUS                    0x000004e1u
++#define A5_RBBM_INT_CLEAR_CMD                   0x00000037u
++#define A5_CP_PFP_ME_CNTL                       0x00000832u
++#define A5_CP_HW_FAULT                          0x00000b1au
++#define A5_CP_PROTECT_STATUS                    0x00000b1cu
++#define A5_RBBM_STATUS                          0x000004f5u
++#define A5_RBBM_SW_RESET_CMD                    0x00000043u
++#define A5_RBBM_CLOCK_CNTL                      0x00000067u
++#define A5_CP_ME_STAT_ADDR                      0x0000081au
++#define A5_CP_ME_STAT_DATA                      0x00000b14u
++#define A5_CP_PFP_STAT_ADDR                     0x00000808u
++#define A5_CP_PFP_STAT_DATA                     0x00000809u
++#define A5_VBIF_VERSION                         0x00003000u
++#define A5_VBIF_XIN_HALT_CTRL0                  0x00003080u
++#define A5_VBIF_XIN_HALT_CTRL1                  0x00003081u
++#define A5_RBBM_BLOCK_SW_RESET_CMD              0x00000045u
++#define A5_CP_PROTECT(i) (0x00000880u + (i))
++#define A5_CP_SCRATCH_REG(i) (0x00000b78u + (i))
++
++#define A5_SMMU_PA              0x05040000u
++#define SM_sCR0                 0x000u
++#define SM_IDR0                 0x020u
++#define SM_IDR1                 0x024u
++#define SM_sGFSR                0x048u
++#define SM_sGFSYNR0             0x050u
++#define SM_TLBIALLNSNH          0x068u
++#define SM_SMR(n)               (0x800u + 4u * (n))
++#define SM_S2CR(n)              (0xc00u + 4u * (n))
++#define SM_CBAR(n)              (0x1000u + 4u * (n))
++#define SM_CBA2R(n)             (0x1800u + 4u * (n))
++#define SM_CB(n)                (0x8000u + 0x1000u * (n))
++#define SM_MICRO_MMU_CTRL       0x6000u
++#define SM_CB_SCTLR             0x000u
++#define SM_CB_ACTLR             0x004u
++#define SM_CB_TTBCR2            0x010u
++#define SM_CB_TTBR0             0x020u
++#define SM_CB_TCR               0x030u
++#define SM_CB_MAIR0             0x038u
++#define SM_CB_MAIR1             0x03cu
++#define SM_CB_FSR               0x058u
++#define SM_CB_FAR               0x060u
++#define SM_CB_FSYNR0            0x068u
++#define SM_CB_TLBIALL           0x618u
++#define SM_CB_TLBSYNC           0x7f0u
++#define SM_CB_TLBSTATUS         0x7f4u
++#define A5_CB                   0u
++#define A5_ASID                 1u
++#define A5_SMR                  0u
++
++/* One contiguous block: page tables, then what the GPU sees at A5_VA. 4 KiB GPU pages. */
++#define A5_MEM_SIZE             0x40000u
++#define A5_L1                   0x0000u
++#define A5_L2                   0x1000u
++#define A5_L3                   0x2000u
++#define A5_MAPPED               0x4000u         /* block offset of GPU VA A5_VA */
++#define A5_VA                   0x01000000u
++#define A5_VA_PM4               (A5_VA + 0x00000u)
++#define A5_VA_PFP               (A5_VA + 0x05000u)
++#define A5_VA_RB                (A5_VA + 0x0a000u)
++#define A5_RB_BYTES             0x8000u
++#define A5_GMEM_BYTES           (0x20000u + 0x2000u)    /* adreno_device.c: A508 gmem 128K + 8K */
++
++static vm_offset_t a5mem, a5smmu;
++static uint64_t a5mem_pa;
++static uint32_t a5_wptr;
++
++static uint32_t gr(uint32_t reg) { return a5_rd(a5.gpu, reg * 4); }
++static void gw(uint32_t reg, uint32_t v) { a5_wr(a5.gpu, reg * 4, v); }
++static void *a5_cpu(uint32_t gpu_va) { return (void *)(a5mem + A5_MAPPED + (gpu_va - A5_VA)); }
++
++static uint32_t
++a5_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++#define A5_PKT7(op, cnt)        (0x70000000u | (cnt) | (a5_parity(cnt) << 15) | (((op) & 0x7fu) << 16) | (a5_parity(op) << 23))
++#define A5_PKT4(reg, cnt)       (0x40000000u | (cnt) | (a5_parity(cnt) << 7) | (((reg) & 0x3ffffu) << 8) | (a5_parity(reg) << 27))
++#define A5_PROTECT_RW(reg, len_log2) ((1u << 30) | (1u << 29) | (((len_log2) & 0x1fu) << 24) | (((reg) << 2) & 0xfffffu))
++#define CP_NOP                  16u
++#define CP_ME_INIT              72u
++#define CP_SET_SECURE_MODE      102u
++
++static void
++a5_ring(uint32_t v)
++{
++	*(volatile uint32_t *)((vm_offset_t)a5_cpu(A5_VA_RB) + a5_wptr * 4) = v;
++	a5_wptr = (a5_wptr + 1) % (A5_RB_BYTES / 4);
++}
++
++static void
++a5_report(const char *what)
++{
++	printf("SWEET GPU: %s: RBBM_STATUS 0x%08x INT_0_STATUS 0x%08x rptr %u wptr %u (sw %u) CP_HW_FAULT 0x%08x PROTECT_STATUS 0x%08x; "
++	    "SMMU sGFSR 0x%08x CB FSR 0x%08x FAR 0x%08x FSYNR0 0x%08x\n", what, gr(A5_RBBM_STATUS), gr(A5_RBBM_INT_0_STATUS),
++	    gr(A5_CP_RB_RPTR), gr(A5_CP_RB_WPTR), a5_wptr, gr(A5_CP_HW_FAULT), gr(A5_CP_PROTECT_STATUS),
++	    a5_rd(a5smmu, SM_sGFSR), a5_rd(a5smmu, SM_CB(A5_CB) + SM_CB_FSR), a5_rd(a5smmu, SM_CB(A5_CB) + SM_CB_FAR),
++	    a5_rd(a5smmu, SM_CB(A5_CB) + SM_CB_FSYNR0));
++}
++
++/* Kick the ring and wait until the CP has read it all and the GPU is idle (Linux a5xx_flush + a5xx_idle). */
++static bool
++a5_submit(const char *what)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gw(A5_CP_RB_WPTR, a5_wptr);
++	for (int i = 0; i < 2000; i++) {
++		if (gr(A5_CP_RB_RPTR) == a5_wptr && !(gr(A5_RBBM_STATUS) & ~1u)) {
++			printf("SWEET GPU: %s executed (%d ms, rptr %u, RBBM_STATUS 0x%08x)\n", what, i, gr(A5_CP_RB_RPTR), gr(A5_RBBM_STATUS));
++			return true;
++		}
++		a5_wait(1);
++	}
++	a5_report(what);
++	printf("SWEET GPU: %s did NOT complete\n", what);
++	return false;
++}
++
++static bool
++a5_smmu_setup(void)
++{
++	static const uint32_t impl[][2] = {     /* stock DT attach-impl-defs */
++		{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x08 }, { 0x6794, 0x28 },
++		{ 0x6800, 0x06 }, { 0x6900, 0x3ff }, { 0x6924, 0x204 }, { 0x6928, 0x11000 },
++		{ 0x6930, 0x800 }, { 0x6960, 0xffffffff }, { 0x6b64, 0x1a5551 }, { 0x6b68, 0x9a82a382 },
++	};
++	vm_offset_t sm = a5smmu, b = sm + SM_CB(A5_CB);
++	uint32_t id0 = a5_rd(sm, SM_IDR0), id1 = a5_rd(sm, SM_IDR1);
++
++	printf("SWEET GPU: SMMU sCR0 0x%08x IDR0 0x%08x IDR1 0x%08x (%u SMRs, %u CBs) sGFSR 0x%08x MICRO_MMU_CTRL 0x%08x\n",
++	    a5_rd(sm, SM_sCR0), id0, id1, id0 & 0xff, id1 & 0xff, a5_rd(sm, SM_sGFSR), a5_rd(sm, SM_MICRO_MMU_CTRL));
++	for (unsigned i = 0; i < MIN(id0 & 0xffu, 8u); i++) {
++		printf("SWEET GPU: SMMU SMR%u 0x%08x S2CR 0x%08x\n", i, a5_rd(sm, SM_SMR(i)), a5_rd(sm, SM_S2CR(i)));
++	}
++	for (unsigned i = 0; i < MIN(id1 & 0xffu, 6u); i++) {
++		printf("SWEET GPU: SMMU CB%u CBAR 0x%08x SCTLR 0x%08x TCR 0x%08x TTBR0 0x%08x%08x FSR 0x%08x\n", i, a5_rd(sm, SM_CBAR(i)),
++		    a5_rd(sm, SM_CB(i) + SM_CB_SCTLR), a5_rd(sm, SM_CB(i) + SM_CB_TCR), a5_rd(sm, SM_CB(i) + SM_CB_TTBR0 + 4),
++		    a5_rd(sm, SM_CB(i) + SM_CB_TTBR0), a5_rd(sm, SM_CB(i) + SM_CB_FSR));
++	}
++	if (a5_rd(b, SM_CB_SCTLR) != 0 || a5_rd(b, SM_CB_TTBR0) != 0) {
++		printf("SWEET GPU: SMMU CB%u already in use; not touched\n", A5_CB);
++		return false;
++	}
++	/* qsmmuv2 reset: implementation-defined registers while the micro-MMU is halted */
++	a5_wr(sm, SM_MICRO_MMU_CTRL, a5_rd(sm, SM_MICRO_MMU_CTRL) | (1u << 2));
++	int i;
++	for (i = 0; i < 30000 && !(a5_rd(sm, SM_MICRO_MMU_CTRL) & (1u << 3)); i++) {
++		delay(1);
++	}
++	if (i == 30000) {
++		printf("SWEET GPU: SMMU did not halt (0x%08x)\n", a5_rd(sm, SM_MICRO_MMU_CTRL));
++		a5_wr(sm, SM_MICRO_MMU_CTRL, a5_rd(sm, SM_MICRO_MMU_CTRL) & ~(1u << 2));
++		return false;
++	}
++	for (unsigned k = 0; k < sizeof(impl) / sizeof(impl[0]); k++) {
++		a5_wr(sm, impl[k][0], impl[k][1]);
++	}
++	a5_wr(sm, SM_MICRO_MMU_CTRL, a5_rd(sm, SM_MICRO_MMU_CTRL) & ~(1u << 2));
++
++	/* context bank: stage 1, AArch64 long descriptors, 4 KiB granule, 32-bit input (T0SZ 32) */
++	uint64_t ttbr = (a5mem_pa + A5_L1) | ((uint64_t)A5_ASID << 48);
++	a5_wr(sm, SM_CBA2R(A5_CB), 1u);
++	a5_wr(sm, SM_CBAR(A5_CB), (1u << 16) | (3u << 8) | (0xfu << 12));
++	a5_wr(b, SM_CB_TTBCR2, 1u | (7u << 15) | (1u << 4));
++	a5_wr(b, SM_CB_TCR, (2u << 12) | (1u << 23) | 32u);
++	*(volatile uint64_t *)(b + SM_CB_TTBR0) = ttbr;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a5_wr(b, SM_CB_MAIR0, 0x0004ff44u);
++	a5_wr(b, SM_CB_MAIR1, 0);
++	a5_wr(b, SM_CB_ACTLR, (1u << 28) | (1u << 29) | (1u << 30));
++	a5_wr(b, SM_CB_FSR, a5_rd(b, SM_CB_FSR));
++	a5_wr(b, SM_CB_TLBIALL, 0);
++	a5_wr(b, SM_CB_TLBSYNC, 0);
++	for (i = 0; i < 10000 && (a5_rd(b, SM_CB_TLBSTATUS) & 1u); i++) {
++		delay(1);
++	}
++	const uint32_t sctlr = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 6) | (1u << 12) | (3u << 22);
++	a5_wr(b, SM_CB_SCTLR, sctlr);
++	/*
++	 * Translation on: Linux arm_smmu_device_reset() clears sCR0.CLIENTPD (bit 0; set = every stream bypasses
++	 * the SMMU, and the GPU would read physical 0x01000000). The stock kernel has qcom,skip-init, so the
++	 * value ABL leaves is what it runs with; it is only changed here when the bypass bit is set.
++	 */
++	if (a5_rd(sm, SM_sCR0) & 1u) {
++		a5_wr(sm, SM_sCR0, a5_rd(sm, SM_sCR0) & ~1u);
++		printf("SWEET GPU: SMMU sCR0 CLIENTPD cleared -> 0x%08x\n", a5_rd(sm, SM_sCR0));
++	}
++	/* route stream 0 (the GPU) to the context bank */
++	uint32_t g0 = a5_rd(sm, SM_sGFSR);
++	a5_wr(sm, SM_sGFSR, g0);
++	a5_wr(sm, SM_S2CR(A5_SMR), (3u << 8) | A5_CB);
++	a5_wr(sm, SM_SMR(A5_SMR), 1u << 31);
++	a5_wr(sm, SM_TLBIALLNSNH, 0);
++	printf("SWEET GPU: SMMU CB%u SCTLR 0x%08x TCR 0x%08x TTBR0 0x%08x%08x; SMR%u 0x%08x S2CR 0x%08x; sCR0 0x%08x sGFSR 0x%08x -> 0x%08x\n",
++	    A5_CB, a5_rd(b, SM_CB_SCTLR), a5_rd(b, SM_CB_TCR), a5_rd(b, SM_CB_TTBR0 + 4), a5_rd(b, SM_CB_TTBR0), A5_SMR,
++	    a5_rd(sm, SM_SMR(A5_SMR)), a5_rd(sm, SM_S2CR(A5_SMR)), a5_rd(sm, SM_sCR0), g0, a5_rd(sm, SM_sGFSR));
++	return a5_rd(b, SM_CB_SCTLR) == sctlr && a5_rd(sm, SM_SMR(A5_SMR)) == (1u << 31) &&
++	       a5_rd(sm, SM_S2CR(A5_SMR)) == ((3u << 8) | A5_CB);
++}
++
++static bool
++a5_load_ucode(const char *prop, const char *file, uint32_t gpu_va, uint32_t max)
++{
++	void *fw = NULL;
++	size_t len = 0;
++	if (!sweet_a630_fw_get(prop, file, &fw, &len) || len < 8 || len - 4 > max) {
++		printf("SWEET GPU: %s missing or too large (%lu bytes)\n", file, (unsigned long)len);
++		return false;
++	}
++	/* Linux adreno_fw_create_bo(): the first word is a header, the rest is what the CP executes */
++	const uint8_t *src = (const uint8_t *)fw + 4;
++	volatile uint32_t *dst = a5_cpu(gpu_va);
++	for (size_t o = 0; o + 4 <= len - 4; o += 4) {
++		dst[o / 4] = (uint32_t)src[o] | ((uint32_t)src[o + 1] << 8) | ((uint32_t)src[o + 2] << 16) | ((uint32_t)src[o + 3] << 24);
++	}
++	printf("SWEET GPU: %s: %lu bytes at GPU VA 0x%08x (first words 0x%08x 0x%08x, header 0x%02x%02x%02x%02x)\n", file,
++	    (unsigned long)(len - 4), gpu_va, dst[0], dst[1], ((uint8_t *)fw)[3], ((uint8_t *)fw)[2], ((uint8_t *)fw)[1], ((uint8_t *)fw)[0]);
++	sweet_a630_fw_put(fw, len);
++	return true;
++}
++
++static void
++a5_hw_init_regs(void)
++{
++	gw(A5_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003);
++	gw(A5_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++	gw(A5_RBBM_AHB_CNTL0, 0x00000001);
++	gw(A5_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0xffff);
++	gw(A5_RBBM_PERFCTR_CNTL, 0x01);
++	gw(A5_CP_PERFCTR_CP_SEL_0, 0);
++	gw(A5_RBBM_PERFCTR_RBBM_SEL_0, 6);
++	gw(A5_UCHE_CACHE_WAYS, 0x02);
++	gw(A5_UCHE_TRAP_BASE_LO, 0xffff0000);
++	gw(A5_UCHE_TRAP_BASE_HI, 0x0001ffff);
++	gw(A5_UCHE_WRITE_THRU_BASE_LO, 0xffff0000);
++	gw(A5_UCHE_WRITE_THRU_BASE_HI, 0x0001ffff);
++	gw(A5_UCHE_GMEM_RANGE_MIN_LO, 0x00100000);
++	gw(A5_UCHE_GMEM_RANGE_MIN_HI, 0);
++	gw(A5_UCHE_GMEM_RANGE_MAX_LO, 0x00100000 + A5_GMEM_BYTES - 1);
++	gw(A5_UCHE_GMEM_RANGE_MAX_HI, 0);
++	/* A506/A508 values */
++	gw(A5_CP_MEQ_THRESHOLDS, 0x20);
++	gw(A5_CP_MERCIU_SIZE, 0x400);
++	gw(A5_CP_ROQ_THRESHOLDS_2, 0x40000030);
++	gw(A5_CP_ROQ_THRESHOLDS_1, 0x20100d0a);
++	gw(A5_PC_DBG_ECO_CNTL, (0x100u << 11) | (0x100u << 22));
++	gw(A5_RB_DBG_ECO_CNTL, gr(A5_RB_DBG_ECO_CNTL) | (1u << 9));
++	gw(A5_UCHE_MODE_CNTL, 1u << 29);
++	gw(A5_CP_CHICKEN_DBG, 0x02000000);
++	gw(A5_RBBM_AHB_CNTL1, 0xa6ffffff);
++	/* hardware clock gating (a50x_hwcg) is left off for the bring-up */
++	gw(A5_RBBM_AHB_CNTL2, 0x0000003f);
++	gw(A5_TPL1_MODE_CNTL, 1u << 7);         /* highest bank bit */
++	gw(A5_RB_MODE_CNTL, 1u << 1);
++	gw(A5_VPC_DBG_ECO_CNTL, gr(A5_VPC_DBG_ECO_CNTL) | (1u << 10));
++	gw(A5_CP_PROTECT_CNTL, 0x00000007);
++	gw(A5_CP_PROTECT(0), A5_PROTECT_RW(0x04, 2));
++	gw(A5_CP_PROTECT(1), A5_PROTECT_RW(0x08, 3));
++	gw(A5_CP_PROTECT(2), A5_PROTECT_RW(0x10, 4));
++	gw(A5_CP_PROTECT(3), A5_PROTECT_RW(0x20, 5));
++	gw(A5_CP_PROTECT(4), A5_PROTECT_RW(0x40, 6));
++	gw(A5_CP_PROTECT(5), A5_PROTECT_RW(0x80, 6));
++	gw(A5_CP_PROTECT(6), A5_PROTECT_RW(A5_RBBM_SECVID_TSB_TRUSTED_BASE_LO, 4));
++	gw(A5_CP_PROTECT(7), A5_PROTECT_RW(A5_RBBM_SECVID_TRUST_CNTL, 1));
++	gw(A5_CP_PROTECT(8), A5_PROTECT_RW(0x800, 6));
++	gw(A5_CP_PROTECT(9), A5_PROTECT_RW(0x840, 3));
++	gw(A5_CP_PROTECT(10), A5_PROTECT_RW(0x880, 5));
++	gw(A5_CP_PROTECT(11), A5_PROTECT_RW(0xaa0, 0));
++	gw(A5_CP_PROTECT(12), A5_PROTECT_RW(0xcc0, 0));
++	gw(A5_CP_PROTECT(13), A5_PROTECT_RW(0xcf0, 1));
++	gw(A5_CP_PROTECT(14), A5_PROTECT_RW(0xe68, 3));
++	gw(A5_CP_PROTECT(15), A5_PROTECT_RW(0xe70, 4));
++	gw(A5_CP_PROTECT(16), A5_PROTECT_RW(0xe80, 4));
++	gw(A5_CP_PROTECT(17), A5_PROTECT_RW(0x10000, 15));
++	gw(A5_RBBM_SECVID_TSB_CNTL, 0);
++	gw(A5_RBBM_SECVID_TSB_TRUSTED_BASE_LO, 0);
++	gw(A5_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0);
++	gw(A5_RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++	gw(A5_CP_ADDR_MODE_CNTL, 1);
++	gw(A5_VSC_ADDR_MODE_CNTL, 1);
++	gw(A5_GRAS_ADDR_MODE_CNTL, 1);
++	gw(A5_RB_ADDR_MODE_CNTL, 1);
++	gw(A5_PC_ADDR_MODE_CNTL, 1);
++	gw(A5_HLSQ_ADDR_MODE_CNTL, 1);
++	gw(A5_VFD_ADDR_MODE_CNTL, 1);
++	gw(A5_VPC_ADDR_MODE_CNTL, 1);
++	gw(A5_UCHE_ADDR_MODE_CNTL, 1);
++	gw(A5_SP_ADDR_MODE_CNTL, 1);
++	gw(A5_TPL1_ADDR_MODE_CNTL, 1);
++	gw(A5_RBBM_SECVID_TSB_ADDR_MODE_CNTL, 1);
++	/* ADRENO_QUIRK_LMLOADKILL_DISABLE (A508) */
++	gw(A5_VPC_DBG_ECO_CNTL, gr(A5_VPC_DBG_ECO_CNTL) | (1u << 23));
++	gw(A5_HLSQ_DBG_ECO_CNTL, gr(A5_HLSQ_DBG_ECO_CNTL) & ~(1u << 18));
++}
++
++/* Returns true when the command processor ran CP_ME_INIT, left secure mode and executed a register write. */
++static bool
++a5_stage3(void)
++{
++	vm_offset_t kva = 0;
++	if (kmem_alloc_contig(kernel_map, &kva, A5_MEM_SIZE, PAGE_MASK, (ppnum_t)atop_64(0xffffffffull), 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPU: no contiguous memory for the GPU\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	for (unsigned i = 1; pn && i < A5_MEM_SIZE / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			pn = 0;
++		}
++	}
++	if (!pn) {
++		printf("SWEET GPU: GPU memory not physically contiguous\n");
++		return false;
++	}
++	sweet_dma_sync_va((const void *)kva, A5_MEM_SIZE);
++	for (unsigned i = 0; i < A5_MEM_SIZE / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	sweet_dma_sync_va((const void *)kva, A5_MEM_SIZE);
++	a5mem = kva;
++	a5mem_pa = ptoa_64(pn);
++	/* 32-bit VA: level 1 (VA[31:30]) -> level 2 (VA[29:21]) -> level 3; AF, SH outer, AP EL0 RW, nG, attr 0 */
++	volatile uint64_t *l1 = (volatile uint64_t *)(a5mem + A5_L1), *l2 = (volatile uint64_t *)(a5mem + A5_L2), *l3 = (volatile uint64_t *)(a5mem + A5_L3);
++	l1[A5_VA >> 30] = (a5mem_pa + A5_L2) | 3ull;
++	l2[(A5_VA >> 21) & 0x1ff] = (a5mem_pa + A5_L3) | 3ull;
++	for (uint32_t off = 0; off < A5_MEM_SIZE - A5_MAPPED; off += 0x1000) {
++		l3[((A5_VA + off) >> 12) & 0x1ff] = (a5mem_pa + A5_MAPPED + off) | 3ull | (1ull << 10) | (2ull << 8) | (1ull << 6) | (1ull << 11);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET GPU: GPU memory 0x%x bytes at PA 0x%llx: tables + GPU VA 0x%08x-0x%08x (PM4 0x%08x PFP 0x%08x ring 0x%08x)\n",
++	    A5_MEM_SIZE, a5mem_pa, A5_VA, A5_VA + A5_MEM_SIZE - A5_MAPPED - 1, A5_VA_PM4, A5_VA_PFP, A5_VA_RB);
++
++	a5smmu = ml_io_map(A5_SMMU_PA, 0x10000);
++	if (!a5smmu || !a5_smmu_setup()) {
++		printf("SWEET GPU: stopped: no SMMU context for the GPU\n");
++		return false;
++	}
++	if (!a5_load_ucode("pm4-firmware", "a530_pm4.fw", A5_VA_PM4, 0x5000) ||
++	    !a5_load_ucode("pfp-firmware", "a530_pfp.fw", A5_VA_PFP, 0x5000)) {
++		return false;
++	}
++	a5_hw_init_regs();
++	gw(A5_CP_ME_INSTR_BASE_LO, A5_VA_PM4);
++	gw(A5_CP_ME_INSTR_BASE_HI, 0);
++	gw(A5_CP_PFP_INSTR_BASE_LO, A5_VA_PFP);
++	gw(A5_CP_PFP_INSTR_BASE_HI, 0);
++	gw(A5_CP_RB_BASE, A5_VA_RB);
++	gw(A5_CP_RB_BASE_HI, 0);
++	/* MSM_GPU_RB_CNTL_DEFAULT (32 KiB ring: log2(bytes / 8) = 12, block size log2(32 / 8) = 2) | NO_UPDATE */
++	gw(A5_CP_RB_CNTL, 12u | (2u << 8) | (1u << 27));
++	gw(A5_RBBM_INT_0_MASK, 0);
++	a5_report("before the micro engine starts");
++	gw(A5_CP_PFP_ME_CNTL, 0);
++
++	a5_ring(A5_PKT7(CP_ME_INIT, 8));
++	a5_ring(0x0000002f);
++	a5_ring(0x00000003);    /* multiple hardware contexts */
++	a5_ring(0x20000000);    /* error detection */
++	a5_ring(0);
++	a5_ring(0);
++	a5_ring(0);             /* no microcode workarounds on the 508 */
++	a5_ring(0);
++	a5_ring(0);
++	if (!a5_submit("CP_ME_INIT")) {
++		return false;
++	}
++	/* The zap shader is loaded: the CP may leave secure mode */
++	a5_ring(A5_PKT7(CP_SET_SECURE_MODE, 1));
++	a5_ring(0);
++	if (!a5_submit("CP_SET_SECURE_MODE 0")) {
++		return false;
++	}
++	/* A register write executed by the CP: scratch register 1, then a NOP */
++	gw(A5_CP_SCRATCH_REG(1), 0);
++	a5_ring(A5_PKT4(A5_CP_SCRATCH_REG(1), 1));
++	a5_ring(0x5085ca7c);
++	a5_ring(A5_PKT7(CP_NOP, 1));
++	a5_ring(0);
++	bool ok = a5_submit("register write + NOP");
++	uint32_t got = gr(A5_CP_SCRATCH_REG(1));
++	printf("SWEET GPU: scratch register 1 reads 0x%08x (%s)\n", got, got == 0x5085ca7c ? "written by the command processor" : "NOT written");
++	a5_report("end of stage 3");
++	return ok && got == 0x5085ca7c;
++}
++
+ static void
+ a508_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -243,9 +699,12 @@ a508_thread(void *arg __unused, wait_result_t wr __unused)
+ 		 * Phase 2a: the signed zap shader through TrustZone (sweet_a630_pas.c, PAS id 13). The files come
+ 		 * from the root volume (/usr/standalone/firmware/sweet/a508_zap.mdt, .b00-.b02) or the ADT.
+ 		 */
+-		extern bool sweet_a630_zap_load(void);
+ 		bool zap = sweet_a630_zap_load();
+ 		printf("SWEET GPU: zap shader %s; RBBM_STATUS 0x%08x\n", zap ? "LOADED" : "not loaded", a5_rd(a5.gpu, A5_RBBM_STATUS * 4));
++		if (zap && stage >= 3) {
++			bool cp = a5_stage3();
++			printf("SWEET GPU: %s\n", cp ? "THE ADRENO 508 COMMAND PROCESSOR RUNS" : "stage 3 did not finish");
++		}
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
+-- 
+2.56.0
+
