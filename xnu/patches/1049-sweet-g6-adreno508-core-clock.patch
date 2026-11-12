@@ -1,0 +1,68 @@
+From ca9e25f2bd7b6a3026755946c68c453e5b196213 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 17:39:14 -0300
+Subject: [PATCH] sweet g6: Adreno 508 core clock from GPLL0 (sweetgpumhz=), CP
+ batch timing in us
+
+---
+ bsd/dev/sweet_a508.c | 34 +++++++++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index 711aa856c..7e95c6cff 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -317,12 +317,18 @@ a5_submit(const char *what)
+ {
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	gw(A5_CP_RB_WPTR, a5_wptr);
+-	for (int i = 0; i < 2000; i++) {
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	for (int i = 0; i < 22000; i++) {
+ 		if (gr(A5_CP_RB_RPTR) == a5_wptr && !(gr(A5_RBBM_STATUS) & ~1u)) {
+-			printf("SWEET GPU: %s executed (%d ms, rptr %u, RBBM_STATUS 0x%08x)\n", what, i, gr(A5_CP_RB_RPTR), gr(A5_RBBM_STATUS));
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			printf("SWEET GPU: %s executed (%llu us, rptr %u, RBBM_STATUS 0x%08x)\n", what, ns / 1000, gr(A5_CP_RB_RPTR), gr(A5_RBBM_STATUS));
+ 			return true;
+ 		}
+-		a5_wait(1);
++		if (i < 20000) {
++			delay(10);
++		} else {
++			a5_wait(1);
++		}
+ 	}
+ 	a5_report(what);
+ 	printf("SWEET GPU: %s did NOT complete\n", what);
+@@ -726,6 +732,28 @@ a508_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	a5_wait(2);
+ 
++	/*
++	 * Core clock. XO (19.2 MHz) proved the power-up and the command processor (2026-11-12, ~350 ms per CP
++	 * batch). sweetgpumhz=N switches gfx3d_clk_src to GPLL0 (600 MHz, source 5, gcc_gpu_gpll0_clk already
++	 * gated on) with a half-integer divider: 300 (div 2), 240 (2.5), 200 (3), 150 (4), 120 (5). The stock
++	 * table's 160/240 MHz levels run at low SVS / SVS; CX is voted to SVS_PLUS (192) first for margin.
++	 * The GPU PLLs (370-700 MHz) are not programmed yet.
++	 */
++	uint32_t mhz = 0;
++	(void)PE_parse_boot_argn("sweetgpumhz", &mhz, sizeof(mhz));
++	if (mhz >= 100 && mhz <= 300) {
++		uint32_t div2m1 = (1200u + mhz / 2) / mhz - 1;          /* 2 * (600 / mhz) - 1, rounded */
++		int e = sweet_evert_rpm_level(RPM_RWCX, 0, 192);
++		printf("SWEET GPU: CX level 192 (SVS_PLUS) -> %d\n", e);
++		if (!e) {
++			a5_wait(5);
++			if (a5_rcg(CC_GFX3D_RCGR, 5, div2m1, "gfx3d_clk_src (GPLL0)")) {
++				a5_wr(a5.cc, CC_GFX3D_RCGR, a5_rd(a5.cc, CC_GFX3D_RCGR) | 2u);
++				printf("SWEET GPU: core clock %u MHz requested = 600 MHz / %u.%u (CMD 0x%08x CFG 0x%08x, branch 0x%08x)\n", mhz,
++				    (div2m1 + 1) / 2, ((div2m1 + 1) & 1) * 5, a5_rd(a5.cc, CC_GFX3D_RCGR), a5_rd(a5.cc, CC_GFX3D_RCGR + 4), a5_rd(a5.cc, CC_GFX3D_CBCR));
++			}
++		}
++	}
+ 	a5.gpu = ml_io_map(A508_GPU_PA, 0x40000);
+ 	if (!a5.gpu) {
+ 		printf("SWEET GPU: GPU mapping failed\n");
+-- 
+2.56.0
+
