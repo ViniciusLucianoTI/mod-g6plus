@@ -10,6 +10,7 @@
 #             PREFIX.watch = what the Mac's USB bus saw.
 # Nothing is written to the phone: `fastboot boot` loads the image into RAM. Needs adb authorised
 # ("always allow from this computer"), fastboot, libusb (brew install libusb).
+# Keys and touches for the phone: tools/g6plus/g6input.py (UDP 127.0.0.1:${G6_INPUT_PORT:-5606}).
 # Only one usbdisk_server.py may run at a time.
 set -u
 IMG=$1; ROOT=$2; SECS=$3; P=${4:-/tmp/g6-ios}
@@ -18,7 +19,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 if pgrep -f "g6plus/usbdisk_server.py" >/dev/null; then echo "a usbdisk_server.py is already running" >&2; exit 2; fi
 until adb devices | grep -qw device; do sleep 3; done
 rm -f "$P.log"
-python3 "$HERE/usbdisk_server.py" "$ROOT" --rw --log "$P.log" --secs $((SECS + 120)) > /dev/null 2> "$P.err" &
+python3 "$HERE/usbdisk_server.py" "$ROOT" --rw --input-port ${G6_INPUT_PORT:-5606} --log "$P.log" --secs $((SECS + 120)) > /dev/null 2> "$P.err" &
 SRV=$!
 "$HERE/usb_boot_watch.sh" "$IMG" "$SECS" > "$P.watch" 2>&1
 kill $SRV 2>/dev/null

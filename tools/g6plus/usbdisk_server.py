@@ -13,13 +13,18 @@ network configuration and no root. Runs until interrupted; it waits for the phon
 
 Message = 512-byte little-endian header [+ data]:
    0 magic 'SWDB'  4 type  8 seq  12 status  16 lba(u64)  24 nblk  28 len  32 nblocks(u64)  40 bsize  44 flags
-   64.. inline log text.   Types: 1 HELLO, 2 READ, 3 WRITE, 4 LOG, 5 FLUSH; replies carry type | 0x80.
+   64.. inline log text.   Types: 1 HELLO, 2 READ, 3 WRITE, 4 LOG, 5 FLUSH, 6 INPUT; replies carry type | 0x80.
+   INPUT (HELLO flag bit 2, --input-port): the kernel polls, the reply has the event count at 16 and 16-byte
+   events from 64 on: [0, key, down, 0] (key 0 power, 1 vol+, 2 vol-, 3 home) or [1, finger, down, x | y << 16]
+   (x, y 0..65535 across the panel). Events come from tools/g6plus/g6input.py as UDP text lines on 127.0.0.1:
+   "key home|power|volup|voldown 0|1" and "touch FINGER 0|1 X Y" with X, Y from 0 to 1.
 """
-import argparse, collections, ctypes, ctypes.util, os, struct, sys, threading, time
+import argparse, collections, ctypes, ctypes.util, os, socket, struct, sys, threading, time
 
 VID, PID, IFACE, EP_IN, EP_OUT = 0x1209, 0x0001, 2, 0x83, 0x03
 MAGIC, HDR = 0x42445753, 512
-HELLO, READ, WRITE, LOG, FLUSH = 1, 2, 3, 4, 5
+HELLO, READ, WRITE, LOG, FLUSH, INPUT = 1, 2, 3, 4, 5, 6
+KEYS = dict(power=0, volup=1, voldown=2, home=3)
 LIBUSB_ERROR_TIMEOUT = -7
 
 
@@ -138,6 +143,8 @@ def main():
     ap.add_argument('--rw', action='store_true', help='allow writes to IMAGE (kernel also needs usbrootrw=1)')
     ap.add_argument('--bs', type=int, default=4096, help='block size announced to the kernel (default 4096)')
     ap.add_argument('--log', help='append the kernel console text to this file as well')
+    ap.add_argument('--input-port', type=int, default=0, help='take key/touch events for the phone as UDP text lines on '
+                    '127.0.0.1:PORT (tools/g6plus/g6input.py); the kernel then polls for them')
     ap.add_argument('--once', action='store_true', help='exit when the phone disconnects after a session')
     ap.add_argument('--secs', type=int, default=0, help='give up after N seconds in total (0 = run until interrupted)')
     ap.add_argument('--sum', type=int, metavar='MIB', help='print the byte sum of the first MIB MiB of IMAGE '
@@ -168,6 +175,24 @@ def main():
         t.daemon = True
         t.start()
     had_session = False
+    events = collections.deque(maxlen=4096)
+    if a.input_port:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('127.0.0.1', a.input_port))
+
+        def input_loop():
+            while True:
+                for line in sock.recv(4096).decode('ascii', 'replace').splitlines():
+                    w = line.split()
+                    try:
+                        if w[0] == 'key':
+                            events.append(struct.pack('<IIII', 0, KEYS[w[1]], int(w[2]) & 1, 0))
+                        elif w[0] == 'touch':
+                            x, y = (min(65535, max(0, int(float(v) * 65535))) for v in w[3:5])
+                            events.append(struct.pack('<IIII', 1, int(w[1]), int(w[2]) & 1, x | y << 16))
+                    except (IndexError, KeyError, ValueError):
+                        print(f'[usbdisk] bad input line: {line!r}', file=sys.stderr, flush=True)
+        threading.Thread(target=input_loop, daemon=True).start()
     trace = collections.deque(maxlen=24)        # last messages, dumped when the framing breaks
 
     def note(s):
@@ -195,7 +220,7 @@ def main():
                     stats['aborts'] += 1
                     continue
                 magic, mtype, seq, _status, lba, nblk, length = struct.unpack_from('<IIIIQII', h, 0)
-                if magic == MAGIC and mtype != LOG:
+                if magic == MAGIC and mtype not in (LOG, INPUT):
                     trace.append(f'{time.strftime("%H:%M:%S")}.{int(time.time() * 1000) % 1000:03d} type {mtype} seq {seq} '
                                  f'lba {lba} nblk {nblk} len {length}')
                 if magic != MAGIC:
@@ -219,7 +244,7 @@ def main():
                         link.write(reply(HELLO, seq, status=1))
                         note('HELLO refused: no image given')
                     else:
-                        link.write(reply(HELLO, seq, nblocks=size // a.bs, bsize=a.bs, flags=(1 if a.rw else 0) | 2))
+                        link.write(reply(HELLO, seq, nblocks=size // a.bs, bsize=a.bs, flags=(1 if a.rw else 0) | 2 | (4 if a.input_port else 0)))
                         note(f'HELLO: {size // a.bs} blocks of {a.bs} ({size >> 20} MiB), {"rw" if a.rw else "ro"}')
                 elif mtype == READ:
                     n = nblk * a.bs
@@ -240,6 +265,10 @@ def main():
                         os.pwrite(fd, data, lba * a.bs)
                         stats['writes'] += 1
                     link.write(reply(WRITE, seq, status=0 if ok else 1))
+                elif mtype == INPUT:
+                    ev = [events.popleft() for _ in range(min(len(events), 24))]
+                    h = struct.pack('<IIIII', MAGIC, INPUT | 0x80, seq, 0, len(ev))
+                    link.write(h + b'\0' * (64 - len(h)) + b''.join(ev) + b'\0' * (HDR - 64 - 16 * len(ev)))
                 elif mtype == FLUSH:
                     if fd is not None and a.rw:
                         os.fsync(fd)

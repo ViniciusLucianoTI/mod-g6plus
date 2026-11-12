@@ -1,0 +1,108 @@
+From c77840912bd5fee7b7962ad441e94b32ced401b1 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 10:46:04 -0300
+Subject: [PATCH] sweet g6: SWDB INPUT, key and touch events from the host over
+ USB
+
+---
+ bsd/dev/sweet_usb.c | 56 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 8ac9e44e8..73197062d 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -372,6 +372,8 @@ static struct {
+ 	bool        hello;          /* the host answered HELLO */
+ 	bool        ready;          /* block device registered */
+ 	bool        writable;
++	bool        input;          /* the host has key/touch events for us */
++	uint32_t    input_events;
+ 	uint64_t    nblocks;
+ 	uint32_t    bsize;
+ 	uint32_t    secsize;
+@@ -1494,6 +1496,7 @@ sweet_usb_fix_core_reset(void)
+ #define SWD_WRITE       3u
+ #define SWD_LOG         4u
+ #define SWD_FLUSH       5u
++#define SWD_INPUT       6u      /* poll the host for key and touch events (HELLO flag bit 2) */
+ #define SWD_HDR         512u
+ #define SWD_LOG_MAX     448u
+ 
+@@ -1752,6 +1755,7 @@ swd_hello(void)
+ 			swd.secsize = bsize;
+ 			swd.writable = (r[11] & 1u) != 0;
+ 			swd_scramble_on = (r[11] & 2u) != 0;
++			swd.input = (r[11] & 4u) != 0;
+ 			swd.hello = true;
+ 		}
+ 	}
+@@ -1759,6 +1763,55 @@ swd_hello(void)
+ 	return error;
+ }
+ 
++/*
++ * Input from the host (evert has no key or touch driver yet): the phone polls with SWD_INPUT, the reply
++ * header carries r[4] = count (at most 24) and 16-byte events from byte 64 on: [kind, a, b, c].
++ *   kind 0  key: a = 0 power, 1 volume up, 2 volume down, 3 home; b = down
++ *   kind 1  touch: a = finger, b = down, c = x | y << 16, both 0..65535 across the panel
++ */
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++static void
++swd_input_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static uint32_t ev[24][4];
++	PE_Video video;
++	uint32_t poll_ms = 30;
++
++	PE_parse_boot_argn("usbinputms", &poll_ms, sizeof(poll_ms));
++	bzero(&video, sizeof(video));
++	PE_current_console(&video);
++	uint32_t pw = video.v_width ? (uint32_t)video.v_width : 1080, ph = video.v_height ? (uint32_t)video.v_height : 2160;
++	for (;;) {
++		ud_sleep_ms(poll_ms ? poll_ms : 30);
++		if (!ud.configured || !swd.hello || !swd.input) {
++			continue;
++		}
++		uint32_t n = 0;
++		lck_mtx_lock(swd.lock);
++		if (swd_request(SWD_INPUT, 0, 0, 0, 0, 1000) == 0) {
++			const volatile uint32_t *r = (const volatile uint32_t *)(ud.dma + UD_DRXB);
++			n = MIN(r[4], 24u);
++			for (uint32_t i = 0; i < n; i++) {
++				for (int k = 0; k < 4; k++) {
++					ev[i][k] = r[16 + i * 4 + k];
++				}
++			}
++		}
++		lck_mtx_unlock(swd.lock);
++		for (uint32_t i = 0; i < n; i++) {
++			if (ev[i][0] == 0) {
++				sweet_hid_key((int)ev[i][1], (int)ev[i][2]);
++			} else if (ev[i][0] == 1) {
++				sweet_hid_touch((int)ev[i][1], (int)ev[i][2], (int)((ev[i][3] & 0xffff) * pw >> 16),
++				    (int)((ev[i][3] >> 16) * ph >> 16));
++			}
++			swd.input_events++;
++		}
++	}
++}
++
+ /* Console text to the host, 448 bytes per message. Runs from the first configuration on. */
+ static void
+ swd_log_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2483,6 +2536,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (swd.lock != NULL && kernel_thread_start(swd_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (swd.lock != NULL && kernel_thread_start(swd_input_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	uint32_t disktest = 0;
+ 	if (swd.lock != NULL && PE_parse_boot_argn("usbdisktest", &disktest, sizeof(disktest)) && disktest &&
+ 	    kernel_thread_start(swd_test_thread, NULL, &thread) == KERN_SUCCESS) {
+-- 
+2.56.0
+
