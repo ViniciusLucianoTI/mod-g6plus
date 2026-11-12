@@ -74,6 +74,8 @@ Each phase ends in something observable in the USB log or on the panel. Kernel w
   done (`xnu/patches/1044`, `sweetgpu=1`: register write/read-back on the powered GPU, core clock on XO).
   Found on the way: SDM630 has no separate GFX rail (the core is on CX); the gx GDSC needs the gfx3d root
   forced on and both GDSCs must be up before any GPUCC branch turns on.
+* 2026-11-12: phase 2a done (`xnu/patches/1045`, `sweetgpu=2`): TrustZone authenticates `a508_zap` (PAS id 13,
+  relocatable image in a kernel-allocated region below 4 GiB). Risk 1 below did not materialise.
 
 ## Risks, in the order they can stop the work
 
