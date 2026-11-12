@@ -68,6 +68,13 @@ Each phase ends in something observable in the USB log or on the panel. Kernel w
 6. **Apps and polish.** Metal for apps system-wide, the GLES framework for GLES apps, zero-copy scanout,
    GPU frequency levels through RPM corners, recovery from hangs.
 
+## Progress
+
+* 2026-11-12: phase 0 done (firmware pulled, SSH over the USB link, `tools/g6plus/install-ssh.sh`); phase 1
+  done (`xnu/patches/1044`, `sweetgpu=1`: register write/read-back on the powered GPU, core clock on XO).
+  Found on the way: SDM630 has no separate GFX rail (the core is on CX); the gx GDSC needs the gfx3d root
+  forced on and both GDSCs must be up before any GPUCC branch turns on.
+
 ## Risks, in the order they can stop the work
 
 1. Zap shader / TrustZone (phase 2). 2. SMMU global registers being owned by the hypervisor/TZ (phase 3).
