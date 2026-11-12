@@ -1,0 +1,187 @@
+From cc375f025908f465405fbcf3c45f60cf04b127f4 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 16:28:47 -0300
+Subject: [PATCH] sweet g6: zap shader loader for evert (a508_zap, allocated
+ region), stage sweetgpu=2
+
+---
+ bsd/dev/sweet_a508.c     |  9 +++++
+ bsd/dev/sweet_a630_pas.c | 80 ++++++++++++++++++++++++++++++++++------
+ 2 files changed, 78 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index c40d5da01..c615c4865 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -238,6 +238,15 @@ a508_thread(void *arg __unused, wait_result_t wr __unused)
+ 	printf("SWEET GPU: ADRENO 508 ANSWERS: RBBM_STATUS 0x%08x VBIF_VERSION 0x%08x RBBM_CLOCK_CNTL 0x%08x; scratch 0x%08x -> wrote 0x508a5a5a read 0x%08x -> wrote 0 read 0x%08x (%s)\n",
+ 	    status, vbif, a5_rd(a5.gpu, A5_RBBM_CLOCK_CNTL * 4), s0, s1, s2,
+ 	    (s1 == 0x508a5a5au && s2 == 0) ? "register write/read-back OK" : "read-back MISMATCH");
++	if (stage >= 2) {
++		/*
++		 * Phase 2a: the signed zap shader through TrustZone (sweet_a630_pas.c, PAS id 13). The files come
++		 * from the root volume (/usr/standalone/firmware/sweet/a508_zap.mdt, .b00-.b02) or the ADT.
++		 */
++		extern bool sweet_a630_zap_load(void);
++		bool zap = sweet_a630_zap_load();
++		printf("SWEET GPU: zap shader %s; RBBM_STATUS 0x%08x\n", zap ? "LOADED" : "not loaded", a5_rd(a5.gpu, A5_RBBM_STATUS * 4));
++	}
+ out:
+ 	(void)thread_terminate(current_thread());
+ }
+diff --git a/bsd/dev/sweet_a630_pas.c b/bsd/dev/sweet_a630_pas.c
+index 131355df9..833f16499 100644
+--- a/bsd/dev/sweet_a630_pas.c
++++ b/bsd/dev/sweet_a630_pas.c
+@@ -18,6 +18,10 @@
+  * SCM calling convention (SMC64, x6 continuation token, -12 busy) follows
+  * the phone's drivers/soc/qcom/scm.c and Linux qcom_scm-smc.c as ported in
+  * the ios-sweet gpu branch (0088-0092).
++ *
++ * Moto G6 Plus (evert, SDM630, Adreno 508): files a508_zap.mdt/.bNN, same PAS id 13 (stock DT qcom,kgsl-hyp).
++ * The image is relocatable and the stock DT gives it no memory region (the vendor kernel's subsys-pil-tz
++ * allocates one), so the extent is allocated here: physically contiguous, below 4 GiB, never freed.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -108,6 +112,36 @@ scm_invoke(const struct scm_regs *initial, bool fast, struct scm_regs *out)
+ 
+ enum zap_result { ZAP_OK, ZAP_ERROR, ZAP_UNFINISHED };
+ static bool zap_unfinished, zap_authenticated, zap_attempted;
++static const char *zap_base = "a630_zap";
++static uint64_t zap_region_pa = ZAP_REGION_PA;
++static uint32_t zap_region_max = ZAP_REGION_SIZE;
++static bool zap_dyn;
++
++/* Physically contiguous, write-combined kernel memory below 4 GiB; returns the VA, *pa the address. */
++static vm_offset_t
++zap_alloc_contig(vm_size_t size, uint64_t *pa)
++{
++	vm_offset_t kva = 0;
++	if (kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, (ppnum_t)atop_64(0xffffffffull), 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	if (!pn) {
++		return 0;
++	}
++	for (unsigned i = 1; i < size / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			return 0;
++		}
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	for (unsigned i = 0; i < size / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	*pa = ptoa_64(pn);
++	return kva;
++}
+ 
+ static enum zap_result
+ zap_call(const char *name, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2)
+@@ -182,8 +216,15 @@ sweet_a630_zap_load(void)
+ 		return false;
+ 	}
+ 	zap_attempted = true;
+-	if (!sweet_a630_fw_get("zap-mdt", "a630_zap.mdt", &mdt, &mdt_size) || mdt_size < 52 + 32 || mdt_size > 0x4000) {
+-		printf("SWEET GPU: a630_zap.mdt missing or invalid\n");
++	if (sweet_board_evert()) {
++		zap_base = "a508_zap";
++		zap_dyn = true;
++		zap_region_max = 0x100000;
++	}
++	char mdt_name[24];
++	snprintf(mdt_name, sizeof(mdt_name), "%s.mdt", zap_base);
++	if (!sweet_a630_fw_get("zap-mdt", mdt_name, &mdt, &mdt_size) || mdt_size < 52 + 32 || mdt_size > 0x4000) {
++		printf("SWEET GPU: %s missing or invalid\n", mdt_name);
+ 		return false;
+ 	}
+ 	const uint8_t *e = mdt;
+@@ -209,14 +250,26 @@ sweet_a630_zap_load(void)
+ 		min_addr = MIN(min_addr, paddr);
+ 		max_addr = MAX(max_addr, (uint64_t)(paddr + memsz + 0xfff) & ~0xfffull);
+ 	}
+-	if (min_addr == ~0ull || max_addr <= min_addr || max_addr - min_addr > ZAP_REGION_SIZE) {
+-		printf("SWEET GPU: zap extent %#llx-%#llx does not fit the 0x%x byte carve-out\n", min_addr, max_addr, ZAP_REGION_SIZE);
++	if (min_addr == ~0ull || max_addr <= min_addr || max_addr - min_addr > zap_region_max) {
++		printf("SWEET GPU: zap extent %#llx-%#llx does not fit the 0x%x byte carve-out\n", min_addr, max_addr, zap_region_max);
+ 		goto out;
+ 	}
+ 	uint32_t mem_size = (uint32_t)(max_addr - min_addr);
++	vm_offset_t region = 0;
++	if (zap_dyn) {
++		if (!relocate) {
++			printf("SWEET GPU: fixed-address zap but no carve-out on this board; not loaded\n");
++			goto out;
++		}
++		region = zap_alloc_contig(round_page(mem_size), &zap_region_pa);
++		if (!region) {
++			printf("SWEET GPU: zap region allocation failed\n");
++			goto out;
++		}
++	}
+ 	printf("SWEET GPU: zap: %s image, %u bytes at %#llx (carve-out %#llx)\n", relocate ? "relocatable" : "fixed", mem_size,
+-	    relocate ? ZAP_REGION_PA : min_addr, ZAP_REGION_PA);
+-	if (!relocate && min_addr != ZAP_REGION_PA) {
++	    relocate ? zap_region_pa : min_addr, zap_region_pa);
++	if (!relocate && min_addr != zap_region_pa) {
+ 		printf("SWEET GPU: fixed-address zap outside the carve-out; not loaded\n");
+ 		goto out;
+ 	}
+@@ -226,7 +279,7 @@ sweet_a630_zap_load(void)
+ 	/* Metadata: the .mdt bytes in physically contiguous, non-cacheable memory (dma_alloc_coherent in Linux). */
+ 	vm_offset_t kva;
+ 	vm_size_t msize = round_page(mdt_size);
+-	if (kmem_alloc_contig(kernel_map, &kva, msize, PAGE_MASK, 0, 0,
++	if (kmem_alloc_contig(kernel_map, &kva, msize, PAGE_MASK, zap_dyn ? (ppnum_t)atop_64(0xffffffffull) : 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET GPU: zap metadata allocation failed\n");
+ 		goto out;
+@@ -255,11 +308,13 @@ sweet_a630_zap_load(void)
+ 	if (res != ZAP_OK) {
+ 		goto out;
+ 	}
+-	res = zap_call("MEM_SETUP", 2, 3, ZAP_REGION_PA, mem_size);
++	res = zap_call("MEM_SETUP", 2, 3, zap_region_pa, mem_size);
+ 	if (res != ZAP_OK) {
+ 		goto out_shutdown;
+ 	}
+-	vm_offset_t region = ml_io_map((vm_offset_t)ZAP_REGION_PA, ZAP_REGION_SIZE);
++	if (!zap_dyn) {
++		region = ml_io_map((vm_offset_t)ZAP_REGION_PA, ZAP_REGION_SIZE);
++	}
+ 	if (!region) {
+ 		printf("SWEET GPU: zap carve-out map failed\n");
+ 		goto out_shutdown;
+@@ -275,14 +330,14 @@ sweet_a630_zap_load(void)
+ 			continue;
+ 		}
+ 		char name[24];
+-		snprintf(name, sizeof(name), "a630_zap.b%02u", i);
++		snprintf(name, sizeof(name), "%s.b%02u", zap_base, i);
+ 		char prop[16];
+ 		snprintf(prop, sizeof(prop), "zap-b%02u", i);
+ 		if (!sweet_a630_fw_get(prop, name, &seg, &seg_size) || seg_size != filesz || filesz > memsz) {
+ 			printf("SWEET GPU: %s missing or %lu bytes (want %u)\n", name, (unsigned long)seg_size, filesz);
+ 			goto out_shutdown;
+ 		}
+-		uint64_t off = (relocate ? (uint64_t)paddr - min_addr : (uint64_t)paddr - ZAP_REGION_PA);
++		uint64_t off = (relocate ? (uint64_t)paddr - min_addr : (uint64_t)paddr - zap_region_pa);
+ 		if (off + filesz > mem_size) {
+ 			printf("SWEET GPU: zap segment %u outside the image\n", i);
+ 			goto out_shutdown;
+@@ -300,6 +355,9 @@ sweet_a630_zap_load(void)
+ 		seg = NULL;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	if (zap_dyn) {
++		sweet_dma_sync_va((const void *)region, round_page(mem_size));
++	}
+ 	res = zap_call("AUTH_AND_RESET", 5, 1, 0, 0);
+ 	if (res == ZAP_OK) {
+ 		zap_authenticated = true;
+-- 
+2.56.0
+

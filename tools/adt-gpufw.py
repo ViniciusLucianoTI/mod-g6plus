@@ -24,15 +24,24 @@ import adt  # noqa: E402
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('inp'); ap.add_argument('out')
-    ap.add_argument('--fw', required=True, help='directory with a630_gmu.bin and a630_sqe.fw')
+    ap.add_argument('--fw', help='directory with a630_gmu.bin and a630_sqe.fw')
+    ap.add_argument('--a508', help='Moto G6 Plus (Adreno 508): directory with a508_zap.mdt/.bNN, a530_pm4.fw and '
+                    'a530_pfp.fw as pulled from the phone; adds zap-mdt, zap-bNN, pm4-firmware, pfp-firmware')
     ap.add_argument('--zap', help='directory with a630_zap.mdt and a630_zap.bNN')
     a = ap.parse_args()
     root, _ = adt.parse(adt.load(a.inp))
     root.children = [c for c in root.children if c.name != 'sweet-gpu']
     n = adt.Node()
     n.props.append(('name', 0, b'sweet-gpu\0'))
-    n.props.append(('gmu-firmware', 0, open(os.path.join(a.fw, 'a630_gmu.bin'), 'rb').read()))
-    n.props.append(('sqe-firmware', 0, open(os.path.join(a.fw, 'a630_sqe.fw'), 'rb').read()))
+    if a.a508:
+        n.props.append(('zap-mdt', 0, open(os.path.join(a.a508, 'a508_zap.mdt'), 'rb').read()))
+        for f in sorted(glob.glob(os.path.join(a.a508, 'a508_zap.b[0-9][0-9]'))):
+            n.props.append(('zap-' + f[-3:], 0, open(f, 'rb').read()))
+        n.props.append(('pm4-firmware', 0, open(os.path.join(a.a508, 'a530_pm4.fw'), 'rb').read()))
+        n.props.append(('pfp-firmware', 0, open(os.path.join(a.a508, 'a530_pfp.fw'), 'rb').read()))
+    if a.fw:
+        n.props.append(('gmu-firmware', 0, open(os.path.join(a.fw, 'a630_gmu.bin'), 'rb').read()))
+        n.props.append(('sqe-firmware', 0, open(os.path.join(a.fw, 'a630_sqe.fw'), 'rb').read()))
     if a.zap:
         n.props.append(('zap-mdt', 0, open(os.path.join(a.zap, 'a630_zap.mdt'), 'rb').read()))
         for f in sorted(glob.glob(os.path.join(a.zap, 'a630_zap.b[0-9][0-9]'))):
