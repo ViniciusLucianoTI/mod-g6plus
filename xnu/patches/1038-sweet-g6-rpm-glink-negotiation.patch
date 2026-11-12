@@ -1,0 +1,94 @@
+From 3c02319a374173cd1a38e02a40b10adddb6ec798 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 11:58:12 -0300
+Subject: [PATCH] sweet g6: RPM G-Link feature negotiation as Linux, rx trace
+
+---
+ bsd/dev/sweet_touch.c | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 640512db1..427081b6b 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1242,7 +1242,7 @@ static struct {
+ 	vm_offset_t ram, ipc;
+ 	uint32_t tx_off, tx_len, rx_off, rx_len;
+ 	bool ver_ack, open_ack, remote_open, up;
+-	uint32_t msg_id, acked_id, err;
++	uint32_t msg_id, acked_id, err, rx_prints, features;
+ 	char errtext[40];
+ } erpm;
+ 
+@@ -1326,12 +1326,22 @@ erpm_pump(const bool *flag, unsigned ms)
+ 			uint32_t m[2], d[72];
+ 			erpm_rx_peek(m, 0, 8);
+ 			uint32_t cmd = m[0] & 0xffffu, p1 = m[0] >> 16, p2 = m[1];
++			if (erpm.rx_prints++ < 24) {
++				printf("SWEET RPM: rx cmd %u param1 %u param2 %#x (avail %u)\n", cmd, p1, p2, erpm_rx_avail());
++			}
+ 			if (cmd == GL_VERSION) {
++				/* as Linux qcom_glink_receive_version(): keep only the features both ends have, and say so */
+ 				erpm_rx_advance(8);
+-				erpm_cmd(GL_VERSION_ACK, 1, GL_INTENTLESS);
++				erpm.features &= p2;
++				erpm_cmd(GL_VERSION_ACK, 1, erpm.features);
+ 			} else if (cmd == GL_VERSION_ACK) {
+ 				erpm_rx_advance(8);
+-				erpm.ver_ack = true;
++				if (p2 == erpm.features) {
++					erpm.ver_ack = true;
++				} else {
++					erpm.features &= p2;
++					erpm_cmd(GL_VERSION, 1, erpm.features);
++				}
+ 			} else if (cmd == GL_OPEN) {
+ 				uint32_t need = 8 + ((p2 + 7u) & ~7u);
+ 				if (erpm_rx_avail() < need) {
+@@ -1360,6 +1370,10 @@ erpm_pump(const bool *flag, unsigned ms)
+ 				bzero(d, sizeof(d));
+ 				erpm_rx_peek(d, 16, n);
+ 				erpm_rx_advance(total);
++				if (erpm.rx_prints < 24) {
++					printf("SWEET RPM: rx data chunk %u left %u: %08x %08x %08x %08x %08x %08x %08x %08x\n", chunk, h[3],
++					    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
++				}
+ 				/* "req" header (service, length), then stacked messages: type, length, msg id or error text */
+ 				if (n >= 20 && d[0] == 0x00716572u) {
+ 					uint32_t end = MIN(8 + d[1], n);
+@@ -1429,7 +1443,8 @@ erpm_connect(void)
+ 	/* as Linux's probe: pristine FIFOs, then the version handshake and the channel */
+ 	erpm_wr(erpm.tx_off + 4, 0);
+ 	erpm_wr(erpm.rx_off, 0);
+-	erpm_cmd(GL_VERSION, 1, GL_INTENTLESS);
++	erpm.features = GL_INTENTLESS;
++	erpm_cmd(GL_VERSION, 1, erpm.features);
+ 	erpm_pump(&erpm.ver_ack, 1000);
+ 	if (!erpm.ver_ack) {
+ 		printf("SWEET RPM: no version ack (rx tail %u head %u, tx tail %u head %u)\n",
+@@ -1440,9 +1455,11 @@ erpm_connect(void)
+ 	memcpy(&open[2], "rpm_requests", 13);
+ 	(void)erpm_tx(open, 24);
+ 	erpm_pump(&erpm.open_ack, 1000);
+-	erpm_pump(&erpm.remote_open, 300);
++	erpm_pump(&erpm.remote_open, 3000);
+ 	printf("SWEET RPM: channel rpm_requests: open ack %d, remote open %d\n", erpm.open_ack, erpm.remote_open);
+ 	erpm.up = erpm.open_ack;
++	printf("SWEET RPM: after the handshake: rx tail %u head %u, tx tail %u head %u\n",
++	    erpm_rd(erpm.rx_off), erpm_rd(erpm.rx_off + 4), erpm_rd(erpm.tx_off), erpm_rd(erpm.tx_off + 4));
+ 	return erpm.up;
+ }
+ 
+@@ -1486,7 +1503,8 @@ erpm_vreg_enable(uint32_t type, uint32_t id, uint32_t uv)
+ 		return EIO;
+ 	}
+ 	if (erpm.acked_id != mid) {
+-		printf("SWEET RPM: request %u not acknowledged (last ack %u)\n", mid, erpm.acked_id);
++		printf("SWEET RPM: request %u not acknowledged (last ack %u; rx tail %u head %u, tx tail %u head %u)\n", mid, erpm.acked_id,
++		    erpm_rd(erpm.rx_off), erpm_rd(erpm.rx_off + 4), erpm_rd(erpm.tx_off), erpm_rd(erpm.tx_off + 4));
+ 		return ETIMEDOUT;
+ 	}
+ 	return 0;
+-- 
+2.56.0
+
