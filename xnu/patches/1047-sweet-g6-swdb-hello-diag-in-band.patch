@@ -1,0 +1,50 @@
+From c0816a306f972ed55b8f801b93e93dadb4ca36c9 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 17:19:42 -0300
+Subject: [PATCH] sweet g6: a failed HELLO's diagnosis rides in the next HELLO
+ packet
+
+---
+ bsd/dev/sweet_usb.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index cf3c9d99a..0fd2688d9 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1664,6 +1664,7 @@ swd_send_abort_marker(void)
+ }
+ 
+ static int swd_request_raw(uint32_t type, uint32_t seq, uint64_t lba, uint32_t nblk, uint32_t data_out, uint32_t data_in, unsigned timeout_ms);
++static char swd_hello_diag[400];
+ 
+ static int
+ swd_request(uint32_t type, uint64_t lba, uint32_t nblk, uint32_t data_out, uint32_t data_in, unsigned timeout_ms)
+@@ -1694,6 +1695,10 @@ swd_request_raw(uint32_t type, uint32_t seq, uint64_t lba, uint32_t nblk, uint32
+ 	swd_put32(UD_DTXB + 20, (uint32_t)(lba >> 32));
+ 	swd_put32(UD_DTXB + 24, nblk);
+ 	swd_put32(UD_DTXB + 28, data_out);
++	if (type == SWD_HELLO) {
++		bzero(h + 64, SWD_HDR - 64);
++		strlcpy((char *)h + 64, swd_hello_diag, SWD_HDR - 64);
++	}
+ 
+ 	swd.rx_done = false;
+ 	swd.tx_done = false;
+@@ -1752,6 +1757,13 @@ swd_request_raw(uint32_t type, uint32_t seq, uint64_t lba, uint32_t nblk, uint32
+ 			uint64_t idle_ns = 0;
+ 			ud_sync(UD_TRB_DRX, 0x20);
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - swd.evt_thread_seen, &idle_ns);
++			/* the same text rides in the next HELLO (bytes 64..): phone -> host works in this state, the host prints it */
++			snprintf(swd_hello_diag, sizeof(swd_hello_diag),
++			    "HELLO %u failed in %s err %d: reply %08x %08x %08x; txtrb %08x/%08x act %d rxtrb %08x/%08x act %d; ev tx %u rx %u idle %llu ms; "
++			    "GEVNTCOUNT %x DSTS %08x DALEPENA %x; rxbuf+0x40 %08x",
++			    swd.hello_failures, phase, error, r[0], r[1], r[2], tt[2], tt[3], ud.xfer_active[EP_DTX], rt[2], rt[3],
++			    ud.xfer_active[EP_DRX], swd.dtx_events, swd.drx_events, idle_ns / 1000000,
++			    dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(DSTS), dwc_rd(DALEPENA), r[16]);
+ 			printf("SWEET USBDISK: HELLO %u failed in %s (err %d): reply %08x %08x %08x; tx trb %08x/%08x act %d, rx trb %08x/%08x act %d; "
+ 			    "events tx %u rx %u, evt thread idle %llu ms, GEVNTCOUNT 0x%x DSTS 0x%08x DALEPENA 0x%x\n",
+ 			    swd.hello_failures, phase, error, r[0], r[1], r[2], tt[2], tt[3], ud.xfer_active[EP_DTX], rt[2], rt[3],
+-- 
+2.56.0
+

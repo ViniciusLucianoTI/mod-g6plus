@@ -240,6 +240,9 @@ def main():
                         logf.flush()
                     stats['logs'] += 1
                 elif mtype == HELLO:
+                    diag = h[64:].split(b'\0', 1)[0]
+                    if diag:        # what the kernel saw when its previous HELLO got no usable reply
+                        note('kernel: ' + diag.decode('ascii', 'replace'))
                     if fd is None:
                         link.write(reply(HELLO, seq, status=1))
                         note('HELLO refused: no image given')
