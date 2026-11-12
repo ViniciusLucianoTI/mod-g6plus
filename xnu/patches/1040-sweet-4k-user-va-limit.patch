@@ -1,0 +1,54 @@
+From fbea6571d852a1e86943363c50e751fdf33682cb Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 12:23:19 -0300
+Subject: [PATCH] sweet 4K: user maps never reach past the 39-bit range the
+ page tables cover
+
+---
+ osfmk/arm/pmap/pmap.c | 12 ++++++++++++
+ osfmk/vm/vm_map.c     |  5 +++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 2857ff9ea..617b44846 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -11359,6 +11359,18 @@ pmap_max_64bit_offset(
+ 		panic("pmap_max_64bit_offset illegal option 0x%x", option);
+ 	}
+ 
++#if !defined(__ARM_16K_PG__)
++	/*
++	 * SWEET 4K granule (SDM630): the user page tables cover 64 - T0SZ_BOOT = 39 bits, but this is a macOS
++	 * configuration where MACH_VM_MAX_ADDRESS is 47 bits, and a task's map took that as its limit. A
++	 * mapping placed above 512 GB was accepted by the map and has no page tables: seen on the Moto G6 Plus
++	 * as `pmap_remove_options(): invalid address range ... start=0x6b8b4568000` (2026-11-12, while using
++	 * SpringBoard). No map may reach past what the pmap can translate.
++	 */
++	if (max_offset_ret > (1ULL << (64 - T0SZ_BOOT))) {
++		max_offset_ret = 1ULL << (64 - T0SZ_BOOT);
++	}
++#endif
+ 	assert(max_offset_ret <= MACH_VM_MAX_ADDRESS);
+ 	assert(max_offset_ret >= min_max_offset);
+ #else
+diff --git a/osfmk/vm/vm_map.c b/osfmk/vm/vm_map.c
+index e5a6f9f82..00f5b64f6 100644
+--- a/osfmk/vm/vm_map.c
++++ b/osfmk/vm/vm_map.c
+@@ -20618,7 +20618,12 @@ vm_map_raise_max_offset(
+ 				ret = KERN_SUCCESS;
+ 			}
+ 		} else {
++#if defined(__arm64__)
++			/* SWEET 4K granule: never past what the pmap can translate (pmap_max_64bit_offset) */
++			if (new_max_offset <= pmap_max_offset(TRUE, ARM_PMAP_MAX_OFFSET_MAX)) {
++#else
+ 			if (new_max_offset <= (vm_map_offset_t)MACH_VM_MAX_ADDRESS) {
++#endif
+ 				map->max_offset = new_max_offset;
+ 				ret = KERN_SUCCESS;
+ 			}
+-- 
+2.56.0
+
