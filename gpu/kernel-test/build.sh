@@ -6,6 +6,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$HERE/out}"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 mkdir -p "$OUT"
+# TARGET=ios16-arm64 (Moto G6 Plus, iOS 16.7 plain arm64): no PAC to strip, ad-hoc signed with the SSH tools' entitlements.
+if [ "${TARGET:-}" = ios16-arm64 ]; then
+	xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" -O1 -g -Wall -Wextra -Wno-unused-parameter \
+	    "$HERE/adreno_uc_test.c" -o "$OUT/adreno_uc_test" -framework IOKit -framework CoreFoundation -framework IOSurface
+	codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$OUT/adreno_uc_test"
+	ls -l "$OUT/adreno_uc_test"
+	exit 0
+fi
 xcrun --sdk iphoneos clang -arch arm64e -miphoneos-version-min=18.0 -isysroot "$SDK" -O1 -g -Wall -Wextra -Wno-unused-parameter \
     "$HERE/adreno_uc_test.c" -o "$OUT/adreno_uc_test.arm64e" -framework IOKit -framework CoreFoundation -framework IOSurface
 "$HERE/../../tools/renegade/renegade" strip --sign -o "$OUT/adreno_uc_test" "$OUT/adreno_uc_test.arm64e"

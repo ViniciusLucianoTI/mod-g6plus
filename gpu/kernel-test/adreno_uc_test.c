@@ -116,11 +116,12 @@ main(int argc, char **argv)
 	/* 2 */
 	uint64_t v = 0;
 	kr = get_param(SWEET_MSM_PARAM_CHIP_ID, &v);
-	CHECK(kr == 0 && v == 0x06030001, "GET_PARAM CHIP_ID %#llx (want 0x06030001)", v);
+	int a508 = (v == 0x05000800);        /* Moto G6 Plus: Adreno 508 behind the same interface (xnu/patches 1050) */
+	CHECK(kr == 0 && (v == 0x06030001 || a508), "GET_PARAM CHIP_ID %#llx (want 0x06030001 or 0x05000800)", v);
 	kr = get_param(SWEET_MSM_PARAM_GPU_ID, &v);
-	CHECK(kr == 0 && v == 630, "GET_PARAM GPU_ID %llu", v);
+	CHECK(kr == 0 && v == (a508 ? 508u : 630u), "GET_PARAM GPU_ID %llu", v);
 	kr = get_param(SWEET_MSM_PARAM_GMEM_SIZE, &v);
-	CHECK(kr == 0 && v == 0x100000, "GET_PARAM GMEM_SIZE %#llx", v);
+	CHECK(kr == 0 && v == (a508 ? 0x22000u : 0x100000u), "GET_PARAM GMEM_SIZE %#llx", v);
 	kr = get_param(SWEET_MSM_PARAM_MAX_FREQ, &v);
 	CHECK(kr == 0 && v != 0, "GET_PARAM MAX_FREQ %llu Hz", v);
 	uint64_t t0 = 0, t1 = 0;
@@ -129,7 +130,8 @@ main(int argc, char **argv)
 	(void)get_param(SWEET_MSM_PARAM_TIMESTAMP, &t1);
 	CHECK(kr == 0 && t1 > t0, "GET_PARAM TIMESTAMP advances: %llu -> %llu (19.2 MHz: ~19200 per ms)", t0, t1);
 	kr = get_param(SWEET_MSM_PARAM_VA_START, &v);
-	CHECK(kr == 0 && v == 0x80000000ull, "GET_PARAM VA_START %#llx", v);
+	uint64_t va_start = a508 ? 0x02000000ull : 0x80000000ull;
+	CHECK(kr == 0 && v == va_start, "GET_PARAM VA_START %#llx", v);
 	kr = get_param(0x7777, &v);
 	CHECK(kr != 0, "GET_PARAM unknown -> %#x (expected error)", kr);
 
@@ -159,7 +161,7 @@ main(int argc, char **argv)
 	struct sweet_msm_gem_info gi = { .handle = nb2.handle, .info = SWEET_MSM_INFO_GET_IOVA };
 	kr = call(SWEET_GPU_SEL_GEM_INFO, &gi, sizeof(gi), sizeof(gi));
 	uint64_t iova = gi.value;
-	CHECK(kr == 0 && iova >= 0x80000000ull && iova < 0x100000000ull && !(iova & 0xfff), "GEM_INFO GET_IOVA %#llx", iova);
+	CHECK(kr == 0 && iova >= va_start && iova < 0x100000000ull && !(iova & 0xfff), "GEM_INFO GET_IOVA %#llx", iova);
 	struct sweet_msm_gem_info go = { .handle = nb2.handle, .info = SWEET_MSM_INFO_GET_OFFSET };
 	kr = call(SWEET_GPU_SEL_GEM_INFO, &go, sizeof(go), sizeof(go));
 	CHECK(kr == 0 && go.value == nb2.handle, "GEM_INFO GET_OFFSET %llu (= handle, the memoryType)", go.value);
@@ -316,6 +318,10 @@ main(int argc, char **argv)
 		struct sweet_gpu_info inf2;
 		memset(&inf2, 0, sizeof(inf2));
 		(void)call(SWEET_GPU_SEL_INFO, &inf2, 0, sizeof(inf2));
+		if (inf2.abi_minor < 1) {
+			printf("SKIP  surface import: INFO abi_minor %u (the kernel has no SURFACE_BO selector)\n", inf2.abi_minor);
+			goto done;
+		}
 		CHECK(inf2.abi_minor >= 1, "INFO abi_minor %u (>= 1: surface import with planes/flags)", inf2.abi_minor);
 		int w = 256, h = 64, bpr = 256 * 4, fmt = 'BGRA', bpe = 4;
 		CFNumberRef nw = CFNumberCreate(NULL, kCFNumberIntType, &w), nh = CFNumberCreate(NULL, kCFNumberIntType, &h),
@@ -444,6 +450,7 @@ main(int argc, char **argv)
 		CFRelease(d);
 	}
 
+done:
 	IOConnectUnmapMemory64(g_conn, (uint32_t)go.value, mach_task_self(), addr);
 	struct sweet_gem_close gc = { .handle = nb2.handle };
 	kr = call(SWEET_GPU_SEL_GEM_CLOSE, &gc, sizeof(gc), 0);
