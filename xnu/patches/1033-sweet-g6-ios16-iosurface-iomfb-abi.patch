@@ -1,0 +1,173 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 09ade9b13..a3bed7eda 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1782,44 +1782,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+-		/*
+-		 * iOS 18 IOMobileFramebuffer sends a 0x514 byte record (client+0x18) whose fields sit 0x48 bytes later than
+-		 * the iOS 16 record this driver was written for (read from IOMobileFramebufferSwapSetLayer/SwapBegin):
+-		 *   +0x98 swap id, +0x9c + 4*i surface id, +0xac + 16*i source rect (x, y, w, h), +0x10c + 16*i dest rect,
+-		 *   +0x15c + 4*i layer flags; there is no layer mask (a layer is in use when its surface id != 0).
+-		 * Translate into the legacy layout (id 0x50/0x54, rects 0x64/0xc4, mask 0x104) so nothing else changes.
+-		 * Without this every swap looked empty (mask 0): backboardd presented 5000 frames and the panel stayed black.
+-		 */
+-		const uint8_t *in = (const uint8_t *)args->structureInput;
+-		if (args->structureInputDescriptor == NULL && args->structureInputSize >= SWEET_FB_SWAP_REC_SIZE &&
+-		    args->structureInputSize < 0x514) {
+-			/*
+-			 * iOS 16 (patch 1032 of this line, Moto G6 Plus): the 0x46c byte record already has the legacy
+-			 * layout. Patch 0160 made this path iOS 18 only, so every swap of iOS 16.7's backboardd came
+-			 * back kIOReturnBadArgument (`backboardd sel 5 in 0/1132 -> 0xe00002c2`) and nothing was shown.
+-			 */
+-			memcpy(rec, in, sizeof(rec));
+-			fFB->swap(rec);
+-			break;
+-		}
+-		if (args->structureInputDescriptor != NULL || args->structureInputSize < 0x514) {
++		if (args->structureInputDescriptor != NULL ||
++		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		bzero(rec, sizeof(rec));
+-		uint32_t lmask = 0;
+-		memcpy(rec + 0x50, in + 0x98, 4);
+-		for (uint32_t i = 0; i < 4; i++) {
+-			uint32_t id;
+-			memcpy(&id, in + 0x9c + 4 * i, 4);
+-			memcpy(rec + 0x54 + 4 * i, &id, 4);
+-			memcpy(rec + 0x64 + 16 * i, in + 0xac + 16 * i, 16);
+-			memcpy(rec + 0xc4 + 16 * i, in + 0x10c + 16 * i, 16);
+-			if (id != 0) {
+-				lmask |= 1u << i;
+-			}
+-		}
+-		memcpy(rec + 0x104, &lmask, 4);
++		memcpy(rec, args->structureInput, sizeof(rec));
+ 		fFB->swap(rec);
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index d14de2923..0c165b8b9 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -75,7 +75,7 @@ enum {
+ 	kSweetSurfaceTrapReleaseFailed  = 5,
+ };
+ 
+-#define SWEET_SURFACE_RESULT_SIZE       0xc68   /* iOS 18: 0x88 header + 20 planes * 0x98 */
++#define SWEET_SURFACE_RESULT_SIZE       0xa68
+ #define SWEET_SURFACE_MAX_ID            4096
+ #define SWEET_SURFACE_MAX_DIM           16384
+ #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+@@ -903,18 +903,7 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+ 	memcpy(p + off, &v, 8);
+ }
+ 
+-/*
+- * IOSurface.framework's lock result. iOS 18 (22H352) copies it to IOSurfaceClient + 0x70 (iOS 16: + 0x68), layout read from
+- * the client getters (IOSurfaceClientGet*):
+- *   0x00 base address    0x08 state page   0x10 timestamps (5 x u64)   0x18 id (u32)
+- *   0x20 allocSize u64   0x28 width u64    0x30 height u64   0x38 bytesPerRow u64   0x40 offset (added to the base) u64
+- *   0x48 pixelFormat u32 0x58 planeCount u32  0x60 bytesPerElement u16  0x62 elementWidth u8  0x63 elementHeight u8
+- *   0x64 cacheMode u32   0x70 parentID u32    0x74 slice count (u32, <= 1 means 1)
+- *   0x88 + i * 0x98: plane i: +0 width u64, +8 height u64, +0x18 offset u64, +0x20 bytesPerRow u64, +0x28 size u64,
+- *                    +0x30 bytesPerElement u16, +0x32 elementWidth u8, +0x33 elementHeight u8, +0x6c u8 compressed flag
+- * The iOS 16 layout put 32-bit fields at 0x1c.., so the client read width/height/rowbytes as garbage and CoreUI wrote
+- * past the surface (SpringBoard SIGSEGV in vImageDeepmap2Decode, destination = base + bytesPerElement).
+- */
++/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
+ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+@@ -923,30 +912,31 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+-	put64(out, 0x20, s->allocSize);
+-	put64(out, 0x28, s->width);
+-	put64(out, 0x30, s->height);
+-	put64(out, 0x38, s->bytesPerRow);
+-	put64(out, 0x40, s->offset);
+-	put32(out, 0x48, s->pixelFormat);
+-	put32(out, 0x58, s->planeCount);
+-	memcpy(out + 0x60, &s->bytesPerElement, 2);
+-	out[0x62] = s->elementWidth;
+-	out[0x63] = s->elementHeight;
+-	put32(out, 0x64, s->cacheMode);
+-	put32(out, 0x70, s->parentID);
+-	put32(out, 0x74, 1);
+-	for (uint32_t i = 0; i < s->planeCount && i < 20; i++) {
+-		uint8_t *p = out + 0x88 + i * 0x98;
++	put32(out, 0x1c, s->allocSize);
++	put32(out, 0x20, s->width);
++	put32(out, 0x24, s->height);
++	put32(out, 0x28, s->bytesPerRow);
++	put32(out, 0x2c, s->offset);
++	put32(out, 0x30, s->pixelFormat);
++	put32(out, 0x34, s->allocSize);
++	put32(out, 0x38, s->planeCount);
++	memcpy(out + 0x40, &s->bytesPerElement, 2);
++	out[0x42] = s->elementWidth;
++	out[0x43] = s->elementHeight;
++	put32(out, 0x44, s->cacheMode);
++	put32(out, 0x50, s->parentID);
++	put32(out, 0x54, 1);
++	for (uint32_t i = 0; i < s->planeCount; i++) {
++		uint8_t *p = out + 0x68 + i * 0x80;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+-		put64(p, 0x00, pl->width);
+-		put64(p, 0x08, pl->height);
+-		put64(p, 0x18, pl->offset);
+-		put64(p, 0x20, pl->bytesPerRow);
+-		put64(p, 0x28, pl->size);
+-		memcpy(p + 0x30, &pl->bytesPerElement, 2);
+-		p[0x32] = pl->elementWidth;
+-		p[0x33] = pl->elementHeight;
++		put32(p, 0x00, pl->width);
++		put32(p, 0x04, pl->height);
++		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, 0x0c, pl->offset);
++		put32(p, 0x14, pl->size);
++		memcpy(p + 0x18, &pl->bytesPerElement, 2);
++		p[0x1a] = pl->elementWidth;
++		p[0x1b] = pl->elementHeight;
+ 	}
+ }
+ 
+@@ -1441,30 +1431,12 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 
+ 	switch (selector) {
+ 	case kSweetSurfaceLimits: {
+-		/*
+-		 * iOS 16 asked for 0x18 bytes (version byte at 0x16). IOSurface.framework 22H352 asks for 0x28 bytes
+-		 * and checks the u16 at 0x22 == 1, otherwise logs "IOSurface.framework versus IOSurface.kext version
+-		 * mismatch" and closes the connection (every IOSurface create then fails: "IOSurface open failed").
+-		 * Layout read from the client (_IOSurfaceClientGetPropertyAlignment / ...Maximum):
+-		 *   +0x00 u32 alignment-1 for Offset / PlaneOffset / PlaneBase
+-		 *   +0x04 u32 alignment-1 for BytesPerRow / PlaneBytesPerRow
+-		 *   +0x08 u64 max BytesPerRow   +0x10 u64 max Width   +0x18 u64 max Height
+-		 *   +0x20 u8 flag               +0x22 u16 version (1)
+-		 */
+-		uint8_t limits[0x28] = { 0 };
++		uint8_t limits[0x18] = { 0 };
+ 		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
+ 		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
+-		put64(limits, 0x08, 0x10000000ULL);
+-		put64(limits, 0x10, 0x10000ULL);
+-		put64(limits, 0x18, 0x10000ULL);
+ 		limits[0x16] = 1;
+-		limits[0x22] = 1;
+-		printf("SWEET SURF: limits sel 13 out %u desc %d\n", args->structureOutputSize,
+-		    args->structureOutputDescriptor != NULL);
+ 		sweet_surf_log_once("sel", selector);
+-		return sweet_struct_out(args, limits,
+-		    (args->structureOutputDescriptor == NULL && args->structureOutputSize < sizeof(limits)) ?
+-		    args->structureOutputSize : (uint32_t)sizeof(limits));
++		return sweet_struct_out(args, limits, sizeof(limits));
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
