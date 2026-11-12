@@ -1,0 +1,50 @@
+From 48e902b7708af9cb158896e267d46ac4a68d51ac Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 14:32:01 -0300
+Subject: [PATCH] sweet g6: failed HELLOs are reported in detail (panel), no
+ reconnect
+
+---
+ bsd/dev/sweet_usb.c | 26 +++++++++++++++-----------
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index d45dcb17f..cdac914b6 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1735,17 +1735,21 @@ swd_request_raw(uint32_t type, uint32_t seq, uint64_t lba, uint32_t nblk, uint32
+ 		/* no server answered yet (IOFindBSDRoot is still polling with HELLO): nothing to report or recover */
+ 		swd_abort(EP_DTX);
+ 		swd_abort(EP_DRX);
+-		/*
+-		 * Seen twice on evert: the host answers every HELLO but none of its replies arrives (host -> phone
+-		 * dead from the first packet on, for the whole boot). Start over on the bus after a few of those.
+-		 */
+-		if (phase[0] != 't' && ++swd.hello_failures % 6 == 0 && ud.configured) {
+-			printf("SWEET USBDISK: %u HELLOs sent, no valid reply (%s; %08x %08x %08x): reconnecting\n",
+-			    swd.hello_failures, phase, r[0], r[1], r[2]);
+-			swd.want_reconnect = true;
+-			for (int t = 0; t < 10000 && (swd.want_reconnect || !ud.configured); t++) {
+-				ud_sleep_ms(1);
+-			}
++		if (++swd.hello_failures <= 12 || swd.hello_failures % 20 == 0) {
++			/*
++			 * Nothing reaches the host log in this state: this goes to the panel (sweetearlyfb=2). A
++			 * reconnect was tried here (2026-11-12) and the phone never came back on the bus, so it is
++			 * report-only now.
++			 */
++			volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_DTX), *rt = (volatile uint32_t *)(ud.dma + UD_TRB_DRX);
++			uint64_t idle_ns = 0;
++			ud_sync(UD_TRB_DRX, 0x20);
++			absolutetime_to_nanoseconds(mach_absolute_time() - swd.evt_thread_seen, &idle_ns);
++			printf("SWEET USBDISK: HELLO %u failed in %s (err %d): reply %08x %08x %08x; tx trb %08x/%08x act %d, rx trb %08x/%08x act %d; "
++			    "events tx %u rx %u, evt thread idle %llu ms, GEVNTCOUNT 0x%x DSTS 0x%08x DALEPENA 0x%x\n",
++			    swd.hello_failures, phase, error, r[0], r[1], r[2], tt[2], tt[3], ud.xfer_active[EP_DTX], rt[2], rt[3],
++			    ud.xfer_active[EP_DRX], swd.dtx_events, swd.drx_events, idle_ns / 1000000,
++			    dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(DSTS), dwc_rd(DALEPENA));
+ 		}
+ 		return error;
+ 	}
+-- 
+2.56.0
+
