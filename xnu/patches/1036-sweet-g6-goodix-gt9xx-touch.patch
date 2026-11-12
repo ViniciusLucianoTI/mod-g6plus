@@ -1,19 +1,19 @@
-From 4ad7b76cf50dd0e881a5b40bde22480e25ce6353 Mon Sep 17 00:00:00 2001
+From 3af3dab96b148f08dcdec8b189513aa0b6c117ab Mon Sep 17 00:00:00 2001
 From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
 Date: Thu, 12 Nov 2026 11:10:39 -0300
 Subject: [PATCH] sweet g6: Goodix GT9xx touch screen on evert (bit-banged I2C
- on TLMM 10/11)
+ on TLMM 10/11, rail through a minimal RPM G-Link client)
 
 ---
- bsd/dev/sweet_touch.c | 173 ++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_touch.c | 464 ++++++++++++++++++++++++++++++++++++++++++
  bsd/dev/sweet_usb.c   |   2 +
- 2 files changed, 175 insertions(+)
+ 2 files changed, 466 insertions(+)
 
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 1ae50ee1b..b5df9eadc 100644
+index 1ae50ee1b..8d82202ba 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -1187,6 +1187,179 @@ out:
+@@ -1187,6 +1187,470 @@ out:
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -41,6 +41,287 @@ index 1ae50ee1b..b5df9eadc 100644
 +	10, 11, 0, 67, 66, 1080, 2160, false,
 +};
 +
++/*
++ * SDM630 RPM client, just enough to switch one regulator on. The GT9xx's rail is pm660l_l3 (RPM resource
++ * "ldob" 3), used by nothing else, so ABL hands it over off and the chip does not answer on the bus.
++ * Transport and protocol as Linux drivers/rpmsg/qcom_glink_rpm.c + qcom_glink_native.c (intentless G-Link
++ * over two FIFOs in the RPM message RAM 0x00778000+0x7000, found through the table of contents in its last
++ * 256 bytes; the RPM is kicked through bit 0 of 0x17911008), drivers/soc/qcom/smd-rpm.c (channel
++ * "rpm_requests", "req" packets) and drivers/regulator/qcom_smd-regulator.c (keys "swen", "uv").
++ * Polled, one caller (the touch thread).
++ */
++#define ERPM_RAM_PA      0x00778000u
++#define ERPM_RAM_SIZE    0x7000u
++#define ERPM_IPC_PA      0x17911000u
++#define ERPM_IPC_REG     0x8u
++#define ERPM_TOC_MAGIC   0x67727430u
++#define ERPM_TX_ID       0x61703272u
++#define ERPM_RX_ID       0x72326170u
++#define GL_VERSION       0u
++#define GL_VERSION_ACK   1u
++#define GL_OPEN          2u
++#define GL_CLOSE         3u
++#define GL_OPEN_ACK      4u
++#define GL_TX_DATA       9u
++#define GL_CLOSE_ACK     11u
++#define GL_TX_DATA_CONT  12u
++#define GL_INTENTLESS    2u
++#define ERPM_LCID        1u
++
++static struct {
++	vm_offset_t ram, ipc;
++	uint32_t tx_off, tx_len, rx_off, rx_len;
++	bool ver_ack, open_ack, remote_open, up;
++	uint32_t msg_id, acked_id, err;
++	char errtext[40];
++} erpm;
++
++static uint32_t
++erpm_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(erpm.ram + off);
++}
++
++static void
++erpm_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(erpm.ram + off) = v;
++}
++
++/* FIFO at off: tail, head, data. len and every message are multiples of 4. */
++static uint32_t
++erpm_rx_avail(void)
++{
++	uint32_t head = erpm_rd(erpm.rx_off + 4), tail = erpm_rd(erpm.rx_off);
++	return head < tail ? erpm.rx_len - tail + head : head - tail;
++}
++
++static void
++erpm_rx_peek(uint32_t *dst, uint32_t offset, uint32_t count)
++{
++	uint32_t tail = erpm_rd(erpm.rx_off) + offset;
++	for (uint32_t i = 0; i < count; i += 4) {
++		if (tail >= erpm.rx_len) {
++			tail -= erpm.rx_len;
++		}
++		dst[i / 4] = erpm_rd(erpm.rx_off + 8 + tail);
++		tail += 4;
++	}
++}
++
++static void
++erpm_rx_advance(uint32_t count)
++{
++	uint32_t tail = erpm_rd(erpm.rx_off) + count;
++	if (tail >= erpm.rx_len) {
++		tail -= erpm.rx_len;
++	}
++	erpm_wr(erpm.rx_off, tail);
++}
++
++static bool
++erpm_tx(const uint32_t *src, uint32_t count)        /* count: multiple of 8 */
++{
++	uint32_t head = erpm_rd(erpm.tx_off + 4), tail = erpm_rd(erpm.tx_off);
++	uint32_t avail = tail <= head ? erpm.tx_len - head + tail : tail - head;
++	if (avail <= count) {
++		return false;
++	}
++	for (uint32_t i = 0; i < count; i += 4) {
++		erpm_wr(erpm.tx_off + 8 + head, src[i / 4]);
++		head += 4;
++		if (head >= erpm.tx_len) {
++			head -= erpm.tx_len;
++		}
++	}
++	erpm_wr(erpm.tx_off + 4, head);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(erpm.ipc + ERPM_IPC_REG) = 1u;
++	return true;
++}
++
++static void
++erpm_cmd(uint32_t cmd, uint32_t p1, uint32_t p2)
++{
++	uint32_t m[2] = {cmd | (p1 << 16), p2};
++	(void)erpm_tx(m, 8);
++}
++
++/* Handle what the RPM sent; returns after ms milliseconds or when *flag is set. */
++static void
++erpm_pump(const bool *flag, unsigned ms)
++{
++	for (unsigned t = 0; t <= ms; t++) {
++		while (erpm_rx_avail() >= 8) {
++			uint32_t m[2], d[72];
++			erpm_rx_peek(m, 0, 8);
++			uint32_t cmd = m[0] & 0xffffu, p1 = m[0] >> 16, p2 = m[1];
++			if (cmd == GL_VERSION) {
++				erpm_rx_advance(8);
++				erpm_cmd(GL_VERSION_ACK, 1, GL_INTENTLESS);
++			} else if (cmd == GL_VERSION_ACK) {
++				erpm_rx_advance(8);
++				erpm.ver_ack = true;
++			} else if (cmd == GL_OPEN) {
++				uint32_t need = 8 + ((p2 + 7u) & ~7u);
++				if (erpm_rx_avail() < need) {
++					break;
++				}
++				erpm_rx_advance(need);
++				erpm_cmd(GL_OPEN_ACK, p1, 0);
++				erpm.remote_open = true;
++			} else if (cmd == GL_OPEN_ACK) {
++				erpm_rx_advance(8);
++				erpm.open_ack = true;
++			} else if (cmd == GL_CLOSE) {
++				erpm_rx_advance(8);
++				erpm_cmd(GL_CLOSE_ACK, p1, 0);
++			} else if (cmd == GL_TX_DATA || cmd == GL_TX_DATA_CONT) {
++				uint32_t h[4];
++				if (erpm_rx_avail() < 16) {
++					break;
++				}
++				erpm_rx_peek(h, 0, 16);
++				uint32_t chunk = h[2], total = (16 + chunk + 7u) & ~7u;
++				if (erpm_rx_avail() < 16 + chunk) {
++					break;
++				}
++				uint32_t n = MIN((chunk + 3u) & ~3u, (uint32_t)sizeof(d));
++				bzero(d, sizeof(d));
++				erpm_rx_peek(d, 16, n);
++				erpm_rx_advance(total);
++				/* "req" header (service, length), then stacked messages: type, length, msg id or error text */
++				if (n >= 20 && d[0] == 0x00716572u) {
++					uint32_t end = MIN(8 + d[1], n);
++					for (uint32_t o = 8; o + 12 <= end;) {
++						uint32_t type = d[o / 4], len = d[o / 4 + 1];
++						if (type == 0x2367736du) {
++							erpm.acked_id = d[o / 4 + 2];
++						} else if (type == 0x00727265u) {
++							erpm.err = 1;
++							strlcpy(erpm.errtext, (const char *)&d[o / 4 + 2], MIN(sizeof(erpm.errtext), (size_t)len + 1));
++						}
++						o += 8 + ((len + 3u) & ~3u);
++						if (len == 0) {
++							break;
++						}
++					}
++				}
++			} else {
++				erpm_rx_advance(8);
++			}
++		}
++		if ((flag && *flag) || t == ms) {
++			return;
++		}
++		touch_wait(1);
++	}
++}
++
++static bool
++erpm_connect(void)
++{
++	if (erpm.up) {
++		return true;
++	}
++	erpm.ram = ml_io_map(ERPM_RAM_PA, ERPM_RAM_SIZE);
++	erpm.ipc = ml_io_map(ERPM_IPC_PA, 0x1000);
++	if (!erpm.ram || !erpm.ipc) {
++		printf("SWEET RPM: mapping failed\n");
++		return false;
++	}
++	uint32_t toc = ERPM_RAM_SIZE - 256u;
++	uint32_t count = erpm_rd(toc + 4);
++	if (erpm_rd(toc) != ERPM_TOC_MAGIC || count > 20) {
++		printf("SWEET RPM: no table of contents in the message RAM (magic %#x count %u)\n", erpm_rd(toc), count);
++		return false;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t id = erpm_rd(toc + 8 + i * 12), off = erpm_rd(toc + 12 + i * 12), size = erpm_rd(toc + 16 + i * 12);
++		if (off > ERPM_RAM_SIZE || off + size > ERPM_RAM_SIZE || size < 64 || (size & 3u)) {
++			continue;
++		}
++		if (id == ERPM_TX_ID) {
++			erpm.tx_off = off;
++			erpm.tx_len = size;
++		} else if (id == ERPM_RX_ID) {
++			erpm.rx_off = off;
++			erpm.rx_len = size;
++		}
++	}
++	if (!erpm.tx_len || !erpm.rx_len) {
++		printf("SWEET RPM: FIFOs not found in the table of contents (%u entries)\n", count);
++		return false;
++	}
++	printf("SWEET RPM: tx fifo %#x+%u (tail %u head %u), rx fifo %#x+%u (tail %u head %u)\n",
++	    erpm.tx_off, erpm.tx_len, erpm_rd(erpm.tx_off), erpm_rd(erpm.tx_off + 4),
++	    erpm.rx_off, erpm.rx_len, erpm_rd(erpm.rx_off), erpm_rd(erpm.rx_off + 4));
++	/* as Linux's probe: pristine FIFOs, then the version handshake and the channel */
++	erpm_wr(erpm.tx_off + 4, 0);
++	erpm_wr(erpm.rx_off, 0);
++	erpm_cmd(GL_VERSION, 1, GL_INTENTLESS);
++	erpm_pump(&erpm.ver_ack, 1000);
++	if (!erpm.ver_ack) {
++		printf("SWEET RPM: no version ack (rx tail %u head %u, tx tail %u head %u)\n",
++		    erpm_rd(erpm.rx_off), erpm_rd(erpm.rx_off + 4), erpm_rd(erpm.tx_off), erpm_rd(erpm.tx_off + 4));
++		return false;
++	}
++	uint32_t open[6] = {GL_OPEN | (ERPM_LCID << 16), 13, 0, 0, 0, 0};
++	memcpy(&open[2], "rpm_requests", 13);
++	(void)erpm_tx(open, 24);
++	erpm_pump(&erpm.open_ack, 1000);
++	erpm_pump(&erpm.remote_open, 300);
++	printf("SWEET RPM: channel rpm_requests: open ack %d, remote open %d\n", erpm.open_ack, erpm.remote_open);
++	erpm.up = erpm.open_ack;
++	return erpm.up;
++}
++
++/* Active-set request: regulator type (e.g. "ldob" 0x626f646c) id on at uv microvolts. 0 or an errno. */
++static int
++erpm_vreg_enable(uint32_t type, uint32_t id, uint32_t uv)
++{
++	if (!erpm_connect()) {
++		return ENXIO;
++	}
++	uint32_t m[18];
++	bzero(m, sizeof(m));
++	uint32_t mid = ++erpm.msg_id;
++	m[0] = GL_TX_DATA | (ERPM_LCID << 16);
++	m[1] = 0;                       /* intent id */
++	m[2] = 52;                      /* chunk size */
++	m[3] = 0;                       /* left */
++	m[4] = 0x00716572u;             /* "req" */
++	m[5] = 20 + 24;
++	m[6] = mid;
++	m[7] = 0;                       /* active set */
++	m[8] = type;
++	m[9] = id;
++	m[10] = 24;
++	m[11] = 0x6e657773u;            /* "swen" */
++	m[12] = 4;
++	m[13] = 1;
++	m[14] = 0x00007675u;            /* "uv" */
++	m[15] = 4;
++	m[16] = uv;
++	erpm.err = 0;
++	erpm.errtext[0] = 0;
++	if (!erpm_tx(m, 72)) {
++		return EAGAIN;
++	}
++	for (int t = 0; t < 2000 && erpm.acked_id != mid && !erpm.err; t++) {
++		erpm_pump(NULL, 1);
++	}
++	if (erpm.err) {
++		printf("SWEET RPM: request %u refused: '%s'\n", mid, erpm.errtext);
++		return EIO;
++	}
++	if (erpm.acked_id != mid) {
++		printf("SWEET RPM: request %u not acknowledged (last ack %u)\n", mid, erpm.acked_id);
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
 +static int
 +gt9_write8(uint16_t reg, uint8_t v)
 +{
@@ -64,6 +345,16 @@ index 1ae50ee1b..b5df9eadc 100644
 +		goto out;
 +	}
 +	st.bitbang = true;
++	{
++		/* the chip's rail; sweettouchuv=0 leaves the RPM alone */
++		uint32_t uv = 3300000;
++		(void)PE_parse_boot_argn("sweettouchuv", &uv, sizeof(uv));
++		if (uv) {
++			int e = erpm_vreg_enable(0x626f646cu, 3, uv);
++			printf("SWEET TOUCH: pm660l_l3 on at %u uV through the RPM -> %d\n", uv, e);
++			touch_wait(30);
++		}
++	}
 +	printf("SWEET TOUCH: TLMM as left by ABL: sda%u=%#x/%#x scl%u=%#x/%#x irq%u=%#x/%#x rst%u=%#x/%#x\n",
 +	    tb->sda, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->sda)),
 +	    tb->scl, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->scl)),
