@@ -1,0 +1,696 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fd7f98b81..ddbb9b133 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -344,6 +344,13 @@ sweet_usb_start_evert(void)
+ #define UD_TRB_DTX      0x1070          /* ep3 IN (bulk, phone -> host) */
+ #define UD_DLOG         0x3000          /* one LOG message, 512 bytes */
+ #define UD_DMAX         0x10000         /* data bytes per block request */
++/*
++ * Data bytes per WRITE. A WRITE travels phone -> host on the bulk IN endpoint, and on the Moto G6 Plus
++ * 64 KiB IN transfers stalled about once in 300 (TX FIFO full, host reading, nothing moving, link ON:
++ * photos of 2026-11-12). With 4 KiB the whole message (512 + 4096 bytes) fits in TX FIFO 3 as sized in
++ * sweet_usb_gadget_start(), so the controller never refills the FIFO in the middle of a transfer.
++ */
++#define UD_WMAX         0x1000
+ #define UD_DTXB         0x4000          /* request: 512-byte header + data */
+ #define UD_DRXB         0x18000         /* reply: 512-byte header + data */
+ #define UD_SIZE         0x2c000
+@@ -357,6 +364,28 @@ sweet_usb_start_evert(void)
+ #define EP_DTX          7               /* 0x83 bulk IN, SWDB */
+ static void swd_rx_complete(void);
+ static void swd_tx_complete(void);
++/* SWDB state (the protocol is described at the end of the file) */
++static struct {
++	lck_mtx_t  *lock;
++	volatile bool rx_done, tx_done;
++	uint32_t    seq;
++	bool        hello;          /* the host answered HELLO */
++	bool        ready;          /* block device registered */
++	bool        writable;
++	uint64_t    nblocks;
++	uint32_t    bsize;
++	uint32_t    secsize;
++	int         bmajor, cmajor;
++	dev_t       bdev;
++	uint64_t    reads, writes, errors, log_msgs;
++	/* diagnostics + recovery (patch 1031 of the 8796 line) */
++	uint32_t    tx_timeouts, rx_timeouts, bad_replies, log_aborts, reconnects, fail_prints;
++	volatile bool want_reconnect;   /* ud_thread drops off the bus and comes back: both ends start clean */
++	volatile bool pipe_reset;       /* the host cleared a halt on a SWDB endpoint */
++	volatile uint64_t evt_thread_seen;      /* mach_absolute_time of ud_thread's last pass */
++	volatile uint32_t dtx_events, drx_events;       /* SWDB endpoint events seen by ud_thread */
++	uint32_t    pipe_resets, consecutive_failures;
++} swd;
+ 
+ #define UD_TXQ          32
+ 
+@@ -415,8 +444,33 @@ ud_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * One endpoint command at a time. Commands come from three kinds of threads: ud_thread (endpoint 0, the
++ * ECM OUT re-arm after every received frame, the notifications), the network stack (ECM IN) and the SWDB
++ * requesters (endpoints 6/7). Only the last two shared ud.lock, so a re-arm of the ECM OUT endpoint could
++ * be issued while a Start Transfer for an IN endpoint was still executing. On the Moto G6 Plus that left IN
++ * transfers queued but never sent: the ECM IN endpoint stuck after its second frame, and under iOS the
++ * SWDB IN endpoint stuck 50-70 s into the boot, exactly when the host's burst of ECM frames (it gives up
++ * DHCP and probes a link-local address) met heavy disk traffic. Linux issues every command under dwc->lock.
++ */
++static lck_mtx_t *ud_cmd_lock;
++static bool ud_ecm_off;
++static int ud_epcmd_locked(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2);
++
+ static int
+ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	if (ud_cmd_lock == NULL) {
++		return ud_epcmd_locked(ep, cmd, p0, p1, p2);
++	}
++	lck_mtx_lock(ud_cmd_lock);
++	int rc = ud_epcmd_locked(ep, cmd, p0, p1, p2);
++	lck_mtx_unlock(ud_cmd_lock);
++	return rc;
++}
++
++static int
++ud_epcmd_locked(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
+ 	dwc_wr(DEPCMDPAR0(ep), p0);
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+@@ -595,11 +649,7 @@ ud_configure(void)
+ 	 * SWDB endpoints. The IN one needs a third TX FIFO: ABL sized only the ones fastboot used, so give
+ 	 * FIFO 3 the depth of FIFO 1 right after FIFO 2 when it has none (GTXFIFOSIZn: start 31:16, depth 15:0).
+ 	 */
+-	uint32_t f1 = dwc_rd(0xc304), f2 = dwc_rd(0xc308), f3 = dwc_rd(0xc30c);
+-	if ((f3 & 0xffffu) == 0 || (f3 >> 16) < (f2 >> 16) + (f2 & 0xffffu)) {
+-		dwc_wr(0xc30c, (((f2 >> 16) + (f2 & 0xffffu)) << 16) | ((f1 & 0xffffu) ? (f1 & 0xffffu) : 0x184u));
+-	}
+-	printf("SWEET USB: GTXFIFOSIZ1-3 0x%08x 0x%08x 0x%08x -> 0x%08x\n", f1, f2, f3, dwc_rd(0xc30c));
++	printf("SWEET USB: GTXFIFOSIZ0-3 0x%08x 0x%08x 0x%08x 0x%08x\n", dwc_rd(0xc300), dwc_rd(0xc304), dwc_rd(0xc308), dwc_rd(0xc30c));
+ 	bool swdb = ud_epcmd(EP_DRX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_DRX << 25), 0) == 0 &&
+ 	    ud_epcmd(EP_DRX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) == 0 &&
+ 	    ud_epcmd(EP_DTX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (3u << 17), (1u << 8) | ((uint32_t)EP_DTX << 25), 0) == 0 &&
+@@ -608,7 +658,9 @@ ud_configure(void)
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT) |
+ 	    (swdb ? (1u << EP_DRX) | (1u << EP_DTX) : 0));
+ 	ud.configured = true;
+-	ud_rx_arm();
++	if (!ud_ecm_off) {
++		ud_rx_arm();
++	}
+ 	printf("SWEET USB: ECM endpoints configured\n");
+ }
+ 
+@@ -653,13 +705,42 @@ ud_setup(void)
+ 	} else if (req == 11) {         /* SET_INTERFACE */
+ 		if (index == 1) {
+ 			ud.data_alt = (uint8_t)value;
+-			if (value == 1 && ud.configured) {
++			if (value == 1 && ud.configured && !ud_ecm_off) {
+ 				ud_notify_connected();
+ 				ud_link_event(true);
+ 			}
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+ 		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
++	} else if (req == 1 && (type & 0x1f) == 2 && value == 0) {
++		/*
++		 * CLEAR_FEATURE(ENDPOINT_HALT). The host resets its data toggle with this (macOS and libusb send
++		 * it after any transfer error or abort), so the endpoint's sequence number must restart here too,
++		 * or the next packet is dropped as a duplicate. A transfer still queued on that endpoint is dead:
++		 * end it first. DWC3's Clear Stall command resets the sequence number.
++		 */
++		unsigned phys = (unsigned)(index & 0x0f) * 2 + ((index & 0x80) ? 1 : 0);
++		if (phys >= 2 && phys < 8) {
++			lck_mtx_lock(ud.lock);
++			if (ud.xfer_active[phys]) {
++				ud_epcmd(phys, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[phys] << 16), 0, 0, 0);
++				ud.xfer_active[phys] = false;
++			}
++			ud_epcmd(phys, DEPCMD_CLEARSTALL, 0, 0, 0);
++			if (phys == EP_TX) {
++				ud.tx_busy = false;
++				ud_tx_kick_locked();
++			}
++			lck_mtx_unlock(ud.lock);
++			if (phys == EP_RX && ud.configured && !ud_ecm_off) {
++				ud_rx_arm();
++			}
++			if (phys == EP_DRX || phys == EP_DTX) {
++				swd.pipe_resets++;
++				swd.pipe_reset = true;  /* the request in flight fails at once and is retried */
++			}
++			printf("SWEET USB: clear halt on endpoint 0x%02x (physical %u)\n", index & 0xff, phys);
++		}
+ 	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
+ 	} else {
+ 		ok = false;
+@@ -1151,6 +1232,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
+ 	for (;;) {
++		swd.evt_thread_seen = mach_absolute_time();
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 		if (count) {
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+@@ -1160,6 +1242,11 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 				bool routine = !(ev & 1) && ((ev >> 6) & 0xf) == 1 &&
+ 				    (((ev >> 1) & 0x1f) == EP_RX || ((ev >> 1) & 0x1f) == EP_TX);
+ 				if (!(ev & 1) && (((ev >> 1) & 0x1f) == EP_DRX || ((ev >> 1) & 0x1f) == EP_DTX)) {
++					if (((ev >> 1) & 0x1f) == EP_DTX) {
++						swd.dtx_events++;
++					} else {
++						swd.drx_events++;
++					}
+ 					ud_event(ev);       /* SWDB traffic is never printed: the console feeds it */
+ 					continue;
+ 				}
+@@ -1170,7 +1257,42 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		if (swd.want_reconnect) {
++			/* soft disconnect (DCTL.RUN_STOP = 0), a pause the host notices, and back on the bus */
++			swd.reconnects++;
++			printf("SWEET USBDISK: reconnect #%u (dropping off the bus for 1 s)\n", swd.reconnects);
++			ud_bus_reset("SWDB reconnect");
++			dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++			for (int i = 0; i < 500 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++				delay(1000);
++			}
++			ud_sleep_ms(1000);
++			uint32_t stale = dwc_rd(GEVNTCOUNT) & 0xffff;        /* events of the old session: skip them */
++			ud.evt_pos = (ud.evt_pos + stale) % UD_EVT_SIZE;
++			dwc_wr(GEVNTCOUNT, stale);
++			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			/* endpoint 0 from scratch, as in sweet_usb_gadget_start(): a stopped controller forgets it */
++			for (unsigned e = 0; e < 2; e++) {
++				if (ud.xfer_active[e]) {
++					ud_epcmd(e, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[e] << 16), 0, 0, 0);
++					ud.xfer_active[e] = false;
++				}
++			}
++			(void)ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0);
++			(void)ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0);
++			(void)ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
++			(void)ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0);
++			(void)ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
++			dwc_wr(DALEPENA, 0x3);
++			ud_start_setup();
++			dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++			swd.want_reconnect = false;
++			continue;
++		}
+ 		if ((++ticks % 30000) == 0) {
++			printf("SWEET USBDISK: seq %u reads %llu writes %llu retries %llu; tmo tx %u rx %u bad %u logabort %u reconnects %u; "
++			    "dtx act %d drx act %d\n", swd.seq, swd.reads, swd.writes, swd.errors, swd.tx_timeouts, swd.rx_timeouts,
++			    swd.bad_replies, swd.log_aborts, swd.reconnects, ud.xfer_active[EP_DTX], ud.xfer_active[EP_DRX]);
+ 			volatile uint32_t *rx = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 			volatile uint32_t *tx = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
+ 			ud_sync(UD_TRB_RX, 0x20);
+@@ -1375,20 +1497,6 @@ sweet_usb_fix_core_reset(void)
+ #define SWD_HDR         512u
+ #define SWD_LOG_MAX     448u
+ 
+-static struct {
+-	lck_mtx_t  *lock;
+-	volatile bool rx_done, tx_done;
+-	uint32_t    seq;
+-	bool        hello;          /* the host answered HELLO */
+-	bool        ready;          /* block device registered */
+-	bool        writable;
+-	uint64_t    nblocks;
+-	uint32_t    bsize;
+-	uint32_t    secsize;
+-	int         bmajor, cmajor;
+-	dev_t       bdev;
+-	uint64_t    reads, writes, errors, log_msgs;
+-} swd;
+ 
+ static inline void
+ swd_put32(uint32_t off, uint32_t v)
+@@ -1404,6 +1512,24 @@ swd_abort(unsigned ep)
+ 		ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[ep] << 16), 0, 0, 0);
+ 		ud.xfer_active[ep] = false;
+ 	}
++	if (ep == EP_DTX) {
++		/*
++		 * End Transfer leaves the packets already loaded in the TX FIFO: the one the host never
++		 * acknowledges would stay at its head and block everything sent after it (the abort marker, the
++		 * retry). Flush TX FIFO 3 (DGCMD 0x09 Selected FIFO Flush, parameter bit 5 = TX | FIFO number).
++		 */
++		if (ud_cmd_lock != NULL) {
++			lck_mtx_lock(ud_cmd_lock);
++		}
++		dwc_wr(0xc710, (1u << 5) | 3u);
++		dwc_wr(0xc714, 0x09u | (1u << 10));
++		for (int i = 0; i < 2000 && (dwc_rd(0xc714) & (1u << 10)); i++) {
++			delay(10);
++		}
++		if (ud_cmd_lock != NULL) {
++			lck_mtx_unlock(ud_cmd_lock);
++		}
++	}
+ 	lck_mtx_unlock(ud.lock);
+ }
+ 
+@@ -1417,21 +1543,97 @@ swd_wait(volatile bool *flag, unsigned ms)
+ 		if (!ud.configured) {
+ 			return ENXIO;
+ 		}
++		if (swd.pipe_reset) {
++			return EPIPE;
++		}
+ 		ud_sleep_ms(1);
+ 	}
+ 	return *flag ? 0 : ETIMEDOUT;
+ }
+ 
+ /* swd.lock held. data_out: bytes after the header we send; data_in: bytes after the header we expect. */
++/*
++ * Payload whitening. On the Moto G6 Plus one particular 64 KiB WRITE (same LBA in every boot of the iOS 16
++ * root) stalled half-way with a host-side I/O error while thousands of other transfers passed: a
++ * data-dependent failure of the physical link. Block payloads are XORed with a fixed pseudo-random
++ * keystream on both ends (HELLO reply flag bit 1), so no payload reaches the wire as a long regular
++ * pattern. xorshift64*, seed 0x9E3779B97F4A7C15, one 64-bit little-endian word per 8 bytes.
++ */
++static uint64_t swd_key[UD_DMAX / 8];
++static bool swd_scramble_on;
++
++static void
++swd_key_init(void)
++{
++	uint64_t x = 0x9E3779B97F4A7C15ULL;
++	for (unsigned i = 0; i < UD_DMAX / 8; i++) {
++		x ^= x >> 12;
++		x ^= x << 25;
++		x ^= x >> 27;
++		swd_key[i] = x * 0x2545F4914F6CDD1DULL;
++	}
++}
++
++static void
++swd_scramble(uint32_t dma_off, uint32_t len, uint32_t seq)
++{
++	uint64_t *p = (uint64_t *)(ud.dma + dma_off);
++	if (!swd_scramble_on) {
++		return;
++	}
++	/*
++	 * The keystream starts at a position that depends on the message's sequence number. The link of the
++	 * Moto G6 Plus has "killer packets": one particular 512-byte packet (the same block of the iOS root in
++	 * every boot) is never acknowledged by the host, however often it is repeated, while a gigabyte of other
++	 * data passes. With a fixed key a retry sends the same bits and fails again; with the rotation a retry
++	 * (new sequence number) is a different bit pattern on the wire.
++	 */
++	uint32_t r = (uint32_t)(((uint64_t)seq * 2654435761u) % (UD_DMAX / 8));
++	for (uint32_t i = 0; i < len / 8; i++) {
++		p[i] ^= swd_key[(i + r) % (UD_DMAX / 8)];
++	}
++}
++
++/* Tell the host that the message in flight is abandoned: a short packet ends whatever read it has pending. */
++static void
++swd_send_abort_marker(void)
++{
++	memcpy((void *)(ud.dma + UD_DLOG), "SWDBABRT", 8);
++	swd.tx_done = false;
++	lck_mtx_lock(ud.lock);
++	if (ud.configured) {
++		ud_start_trb(EP_DTX, UD_TRB_DTX, UD_DLOG, 8, TRBCTL_NORMAL);
++	}
++	lck_mtx_unlock(ud.lock);
++	if (swd_wait(&swd.tx_done, 300) != 0) {
++		swd_abort(EP_DTX);
++	}
++}
++
++static int swd_request_raw(uint32_t type, uint32_t seq, uint64_t lba, uint32_t nblk, uint32_t data_out, uint32_t data_in, unsigned timeout_ms);
++
+ static int
+ swd_request(uint32_t type, uint64_t lba, uint32_t nblk, uint32_t data_out, uint32_t data_in, unsigned timeout_ms)
++{
++	/* the caller's data stays in the clear in the buffers: scramble around the transfer only */
++	uint32_t seq = ++swd.seq;
++	swd_scramble(UD_DTXB + SWD_HDR, data_out, seq);
++	int error = swd_request_raw(type, seq, lba, nblk, data_out, data_in, timeout_ms);
++	swd_scramble(UD_DTXB + SWD_HDR, data_out, seq);
++	if (!error) {
++		swd_scramble(UD_DRXB + SWD_HDR, data_in, seq);
++	}
++	return error;
++}
++
++static int
++swd_request_raw(uint32_t type, uint32_t seq, uint64_t lba, uint32_t nblk, uint32_t data_out, uint32_t data_in, unsigned timeout_ms)
+ {
+ 	if (!ud.configured) {
+ 		return ENXIO;
+ 	}
+ 	uint8_t *h = (uint8_t *)(ud.dma + UD_DTXB);
+ 	bzero(h, 64);
+-	uint32_t seq = ++swd.seq;
+ 	swd_put32(UD_DTXB + 0, SWD_MAGIC);
+ 	swd_put32(UD_DTXB + 4, type);
+ 	swd_put32(UD_DTXB + 8, seq);
+@@ -1442,6 +1644,7 @@ swd_request(uint32_t type, uint64_t lba, uint32_t nblk, uint32_t data_out, uint3
+ 
+ 	swd.rx_done = false;
+ 	swd.tx_done = false;
++	swd.pipe_reset = false;
+ 	lck_mtx_lock(ud.lock);
+ 	if (!ud.configured) {
+ 		lck_mtx_unlock(ud.lock);
+@@ -1451,21 +1654,85 @@ swd_request(uint32_t type, uint64_t lba, uint32_t nblk, uint32_t data_out, uint3
+ 	ud_start_trb(EP_DTX, UD_TRB_DTX, UD_DTXB, SWD_HDR + data_out, TRBCTL_NORMAL);
+ 	lck_mtx_unlock(ud.lock);
+ 
+-	int error = swd_wait(&swd.tx_done, timeout_ms);
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	const char *phase = "tx";
++	int error = swd_wait(&swd.tx_done, swd.hello ? MIN(timeout_ms, 400u) : timeout_ms);
+ 	if (!error) {
++		phase = "rx";
+ 		error = swd_wait(&swd.rx_done, timeout_ms);
+ 	}
+-	if (error) {
++	const volatile uint32_t *r = (const volatile uint32_t *)(ud.dma + UD_DRXB);
++	if (!error) {
++		ud_sync(UD_DRXB, SWD_HDR + data_in);
++		if (r[0] != SWD_MAGIC || r[1] != (type | 0x80u) || r[2] != seq) {
++			phase = "reply";
++			error = EIO;
++			swd.bad_replies++;
++		} else if (r[3]) {
++			swd.consecutive_failures = 0;
++			return EIO;             /* the host refused this request: the link itself is fine */
++		} else {
++			swd.consecutive_failures = 0;
++			return 0;
++		}
++	} else if (phase[0] == 't') {
++		swd.tx_timeouts++;
++	} else {
++		swd.rx_timeouts++;
++	}
++	/*
++	 * A request that did not complete leaves bytes of unknown length in flight in both directions, and
++	 * the framing has no way to find the next header again. Drop off the bus instead: the host sees a
++	 * disconnect, reopens the device, and both ends start from a clean pipe. The caller retries.
++	 */
++	if (!swd.hello) {
++		/* no server answered yet (IOFindBSDRoot is still polling with HELLO): nothing to report or recover */
+ 		swd_abort(EP_DTX);
+ 		swd_abort(EP_DRX);
+ 		return error;
+ 	}
+-	ud_sync(UD_DRXB, SWD_HDR + data_in);
+-	const volatile uint32_t *r = (const volatile uint32_t *)(ud.dma + UD_DRXB);
+-	if (r[0] != SWD_MAGIC || r[1] != (type | 0x80u) || r[2] != seq) {
+-		return EIO;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_DTX), *rt = (volatile uint32_t *)(ud.dma + UD_TRB_DRX);
++	ud_sync(UD_TRB_DRX, 0x20);
++	if (swd.fail_prints++ < 40) {
++		printf("SWEET USBDISK: request type %u seq %u lba %llu nblk %u failed in %s after %llu ms (error %d, cfg %d); "
++		    "tx trb %08x/%08x act %d, rx trb %08x/%08x act %d; reply %08x %08x %08x; tmo tx %u rx %u bad %u logabort %u piperst %u\n",
++		    type, seq, lba, nblk, phase, ns / 1000000, error, ud.configured,
++		    tt[2], tt[3], ud.xfer_active[EP_DTX], rt[2], rt[3], ud.xfer_active[EP_DRX], r[0], r[1], r[2],
++		    swd.tx_timeouts, swd.rx_timeouts, swd.bad_replies, swd.log_aborts, swd.pipe_resets);
++	}
++	if (swd.fail_prints <= 40) {
++		/* which side is stuck: events not picked up, a full FIFO nobody drains, or a controller that stopped */
++		uint64_t idle_ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - swd.evt_thread_seen, &idle_ns);
++		dwc_wr(0xc160, 1);
++		uint32_t sp1 = dwc_rd(0xc160) >> 16;
++		dwc_wr(0xc160, 3);
++		uint32_t sp3 = dwc_rd(0xc160) >> 16;
++		printf("SWEET USBDISK:   event thread idle %llu ms, GEVNTCOUNT 0x%x, DSTS 0x%08x, TXFIFO space 1:%u 3:%u words, "
++		    "GTXFIFOSIZ3 0x%08x, DALEPENA 0x%x, SWDB events tx %u rx %u, ECM txbusy %d txq %u rx %llu tx %llu\n",
++		    idle_ns / 1000000, dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(DSTS), sp1, sp3, dwc_rd(0xc30c), dwc_rd(DALEPENA),
++		    swd.dtx_events, swd.drx_events, ud.tx_busy, ud.txq_count, ud.rx_frames, ud.tx_frames);
++	}
++	swd_abort(EP_DTX);
++	swd_abort(EP_DRX);
++	if (phase[0] == 't') {
++		swd_send_abort_marker();        /* the host drops the partial message and waits for a header again */
++	}
++	/*
++	 * Normally the host has reset the pipes by now (its transfer failed, it reopened the interface and
++	 * cleared the halts) and a plain retry works. Only when that keeps failing drop off the bus.
++	 */
++	if (++swd.consecutive_failures >= 12 && ud.configured) {
++		swd.consecutive_failures = 0;
++		swd.want_reconnect = true;
++		for (int t = 0; t < 10000 && (swd.want_reconnect || !ud.configured); t++) {
++			ud_sleep_ms(1);
++		}
++	} else {
++		ud_sleep_ms(20);
+ 	}
+-	return r[3] ? EIO : 0;
++	return error;
+ }
+ 
+ static int
+@@ -1484,6 +1751,7 @@ swd_hello(void)
+ 			swd.bsize = bsize;
+ 			swd.secsize = bsize;
+ 			swd.writable = (r[11] & 1u) != 0;
++			swd_scramble_on = (r[11] & 2u) != 0;
+ 			swd.hello = true;
+ 		}
+ 	}
+@@ -1514,9 +1782,14 @@ swd_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			uint8_t *h = (uint8_t *)(ud.dma + UD_DLOG);
+ 			bzero(h, 64);
+ 			swd_put32(UD_DLOG + 0, SWD_MAGIC);
++			uint32_t lseq = ++swd.seq;
+ 			swd_put32(UD_DLOG + 4, SWD_LOG);
++			swd_put32(UD_DLOG + 8, lseq);
++			swd_put32(UD_DLOG + 12, swd_scramble_on ? 1u : 0u);     /* text whitened (after HELLO) */
+ 			swd_put32(UD_DLOG + 28, n);
++			bzero(h + 64, SWD_LOG_MAX);
+ 			memcpy(h + 64, chunk, n);
++			swd_scramble(UD_DLOG + 64, SWD_LOG_MAX, lseq);
+ 			swd.tx_done = false;
+ 			int error = ENXIO;
+ 			lck_mtx_lock(ud.lock);
+@@ -1526,9 +1799,13 @@ swd_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			lck_mtx_unlock(ud.lock);
+ 			if (!error) {
+-				error = swd_wait(&swd.tx_done, 200);
++				error = swd_wait(&swd.tx_done, 2000);
+ 				if (error) {
+ 					swd_abort(EP_DTX);      /* nobody is reading: keep the text for later */
++					swd.log_aborts++;
++					if (swd.hello) {
++						swd_send_abort_marker();
++					}
+ 				}
+ 			}
+ 			lck_mtx_unlock(swd.lock);
+@@ -1606,7 +1883,7 @@ swd_strategy(buf_t bp)
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / swd.bsize;
+ 		uint32_t skip = (uint32_t)(pos % swd.bsize);
+-		uint32_t want = MIN(count - done, UD_DMAX - skip);
++		uint32_t want = MIN(count - done, (rd ? UD_DMAX : UD_WMAX) - skip);
+ 		uint32_t blocks = (skip + want + swd.bsize - 1) / swd.bsize;
+ 		if (rd) {
+ 			error = swd_rw(true, lba, blocks);
+@@ -1685,7 +1962,7 @@ swd_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unu
+ 		*o = UD_DMAX / swd.secsize;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+-		*o = swd.writable ? UD_DMAX / swd.secsize : 0;
++		*o = swd.writable ? UD_WMAX / swd.secsize : 0;
+ 		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+@@ -1804,8 +2081,8 @@ sweet_usbdisk_rootdev(dev_t *dev)
+ 	devfs_make_node(swd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "usbroot0");
+ 	devfs_make_node(makedev(swd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rusbroot0");
+ 	swd.ready = true;
+-	printf("SWEET USBDISK: usbroot0: %llu blocks of %u bytes (%llu MiB), %s\n", swd.nblocks, swd.bsize,
+-	    swd.nblocks * swd.bsize >> 20, swd.writable ? "read-write" : "read-only");
++	printf("SWEET USBDISK: usbroot0: %llu blocks of %u bytes (%llu MiB), %s, payload whitening %s\n", swd.nblocks, swd.bsize,
++	    swd.nblocks * swd.bsize >> 20, swd.writable ? "read-write" : "read-only", swd_scramble_on ? "on" : "off");
+ 	*dev = swd.bdev;
+ 	return 0;
+ }
+@@ -1815,6 +2092,19 @@ sweet_usbdisk_rootdev(dev_t *dev)
+  * 64 KiB requests and print the byte sum and the time, to check the link without mounting anything
+  * (compare with `usbdisk_server.py --sum N IMAGE`).
+  */
++/* usbdiskburn: keep a CPU busy (the iOS boot has all eight at 100% when the link stalls), yielding now and then */
++static void
++swd_burn_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	volatile uint64_t x = 1;
++	for (;;) {
++		for (uint32_t i = 0; i < 20000000u; i++) {
++			x = x * 6364136223846793005ULL + 1442695040888963407ULL;
++		}
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
+ static void
+ swd_test_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1869,19 +2159,19 @@ swd_test_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	uint32_t bad = 0;
+ 	for (int pass = 0; pass < 2 && !error; pass++) {
+-		for (uint32_t off = 0; off < (1u << 20) && !error; off += UD_DMAX) {
+-			uint32_t nblk = UD_DMAX / swd.bsize;
++		for (uint32_t off = 0; off < (1u << 20) && !error; off += UD_WMAX) {
++			uint32_t nblk = UD_WMAX / swd.bsize;
+ 			lck_mtx_lock(swd.lock);
+ 			if (pass == 0) {
+ 				uint8_t *o = (uint8_t *)(ud.dma + UD_DTXB + SWD_HDR);
+-				for (uint32_t i = 0; i < UD_DMAX; i++) {
++				for (uint32_t i = 0; i < UD_WMAX; i++) {
+ 					o[i] = (uint8_t)((off + i) * 7 + ((off + i) >> 12));
+ 				}
+-				error = swd_request(SWD_WRITE, (total + off) / swd.bsize, nblk, UD_DMAX, 0, 5000);
++				error = swd_request(SWD_WRITE, (total + off) / swd.bsize, nblk, UD_WMAX, 0, 5000);
+ 			} else {
+-				error = swd_request(SWD_READ, (total + off) / swd.bsize, nblk, 0, UD_DMAX, 5000);
++				error = swd_request(SWD_READ, (total + off) / swd.bsize, nblk, 0, UD_WMAX, 5000);
+ 				const uint8_t *d = (const uint8_t *)(ud.dma + UD_DRXB + SWD_HDR);
+-				for (uint32_t i = 0; i < UD_DMAX && !error; i++) {
++				for (uint32_t i = 0; i < UD_WMAX && !error; i++) {
+ 					bad += d[i] != (uint8_t)((off + i) * 7 + ((off + i) >> 12));
+ 				}
+ 			}
+@@ -1893,6 +2183,55 @@ swd_test_thread(void *arg __unused, wait_result_t wr __unused)
+ 	lck_mtx_unlock(swd.lock);
+ 	printf("SWEET USBDISK TEST: write check %s: 1 MiB at byte %llu, %u bad bytes on read-back, error %d, flush %d\n",
+ 	    (!error && !bad && !ferr) ? "OK" : "FAILED", total, bad, error, ferr);
++	/*
++	 * usbdiskhammer=N: N MiB of consecutive zero-filled WRITEs (what HFS does when it zero-fills a new
++	 * extent: the pattern at which the iOS 16 boot loses the link), then the same amount of READs.
++	 * usbdiskchunk=BYTES sets the WRITE size (default UD_WMAX, at most UD_DMAX).
++	 */
++	uint32_t hammer = 0, chunk = UD_WMAX, loops = 1, burn = 0;
++	PE_parse_boot_argn("usbdiskhammer", &hammer, sizeof(hammer));
++	PE_parse_boot_argn("usbdiskchunk", &chunk, sizeof(chunk));
++	PE_parse_boot_argn("usbdiskloops", &loops, sizeof(loops));    /* repeat the hammer this many times */
++	PE_parse_boot_argn("usbdiskburn", &burn, sizeof(burn));       /* CPU-burning kernel threads meanwhile */
++	for (uint32_t b = 0; b < burn && b < 8; b++) {
++		thread_t bt;
++		if (kernel_thread_start(swd_burn_thread, NULL, &bt) == KERN_SUCCESS) {
++			thread_deallocate(bt);
++		}
++	}
++	for (uint32_t loop = 0; loop < loops; loop++)
++	if (hammer && !error) {
++		chunk = MIN(MAX(chunk, swd.bsize), UD_DMAX) / swd.bsize * swd.bsize;
++		uint64_t base = total + (1u << 20), want_bytes = MIN((uint64_t)hammer << 20, swd.nblocks * swd.bsize - base);
++		uint32_t fails = 0;
++		uint64_t h0 = mach_absolute_time();
++		printf("SWEET USBDISK HAMMER: %llu bytes of zero WRITEs in %u-byte requests\n", want_bytes, chunk);
++		for (int pass = 0; pass < 2; pass++) {
++			for (uint64_t off = 0; off + chunk <= want_bytes; off += chunk) {
++				lck_mtx_lock(swd.lock);
++				int e;
++				if (pass == 0) {
++					bzero((void *)(ud.dma + UD_DTXB + SWD_HDR), chunk);
++					e = swd_request(SWD_WRITE, (base + off) / swd.bsize, chunk / swd.bsize, chunk, 0, 5000);
++				} else {
++					e = swd_request(SWD_READ, (base + off) / swd.bsize, chunk / swd.bsize, 0, chunk, 5000);
++				}
++				lck_mtx_unlock(swd.lock);
++				if (e) {
++					fails++;
++					off -= chunk;           /* retry the same request */
++					if (fails > 50) {
++						break;
++					}
++				}
++				if ((off & ((4u << 20) - 1)) == 0 && !e) {
++					printf("SWEET USBDISK HAMMER: %s %llu MiB, %u failures\n", pass ? "read" : "write", off >> 20, fails);
++				}
++			}
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - h0, &ns);
++		printf("SWEET USBDISK HAMMER: done, %u failures, %llu ms\n", fails, ns / 1000000);
++	}
+ }
+ 
+ static void
+@@ -1915,6 +2254,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
++	ud_cmd_lock = lck_mtx_alloc_init(&ud_swd_grp, LCK_ATTR_NULL);
+ 	/* TRB buffer pointers are written as 32 bits here: keep the DMA area below 4 GB (the G6 has RAM above) */
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, (ppnum_t)atop_64(0xffffffffULL), 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -1930,8 +2270,21 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		printf("SWEET USB: DMA area at 0x%llx is above 4 GB, not started\n", ud.dma_pa);
+ 		return;
+ 	}
+-	ud_if_create();
+-	ud_net_start();
++	/*
++	 * sweetusbecm=0: no network interface and the ECM endpoints stay idle (frames from the host are never
++	 * accepted, nothing is ever queued for it). The SWDB log/disk interface does not need ECM.
++	 */
++	int ecm = 1;
++	PE_parse_boot_argn("sweetusbecm", &ecm, sizeof(ecm));
++	ud_ecm_off = (ecm == 0);
++	if (ud_ecm_off) {
++		lck_grp_t *g = lck_grp_alloc_init("sweet_usb", LCK_GRP_ATTR_NULL);
++		ud.lock = lck_mtx_alloc_init(g, LCK_ATTR_NULL);
++		printf("SWEET USB: ECM off (sweetusbecm=0): no ue0, ECM endpoints idle\n");
++	} else {
++		ud_if_create();
++		ud_net_start();
++	}
+ 
+ 	/*
+ 	 * SDM845: the DWC3 is USB3-capable and clocks its PIPE side (and RAM)
+@@ -2071,6 +2424,28 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
+ 
++	/*
++	 * TX FIFOs. ABL sized them for fastboot (FIFO 1), and its values for FIFO 2 and 3 (0x01c60184,
++	 * 0x034a0184 on the Moto G6 Plus) reach to word 0x4ce. On the G6 the 64 KiB SWDB IN transfers
++	 * (FIFO 3) stalled whenever the ECM bulk IN endpoint (FIFO 1) had a frame queued at the same time:
++	 * FIFO 3 as left by ABL is not usable next to the others (probably beyond the controller's TX RAM,
++	 * GHWPARAMS7 is printed to check). Keep FIFO 1 and carve FIFO 2 (interrupt, 16-byte notifications)
++	 * and FIFO 3 (SWDB bulk IN) out of the space ABL gave FIFO 2, which the Poco F1 driver proved usable.
++	 */
++	{
++		uint32_t f0 = dwc_rd(0xc300), f1 = dwc_rd(0xc304), f2 = dwc_rd(0xc308), f3 = dwc_rd(0xc30c);
++		uint32_t s2 = (f1 >> 16) + (f1 & 0xffffu), d2 = f2 & 0xffffu;
++		if (d2 >= 0x100) {
++			/* FIFO 3: everything up to the end of the TX RAM (GHWPARAMS7[15:0]), at most 0x800 words */
++			uint32_t ram = dwc_rd(0xc15c) & 0xffffu, s3 = s2 + 0x20u;
++			uint32_t d3 = (ram > s3 + 0x100u) ? MIN(ram - s3, 0x800u) : (d2 - 0x20u);
++			dwc_wr(0xc308, (s2 << 16) | 0x20u);
++			dwc_wr(0xc30c, (s3 << 16) | d3);
++		}
++		printf("SWEET USB: GHWPARAMS3 0x%08x GHWPARAMS7 0x%08x; GTXFIFOSIZ0-3 0x%08x 0x%08x 0x%08x 0x%08x -> FIFO2 0x%08x FIFO3 0x%08x\n",
++		    dwc_rd(0xc14c), dwc_rd(0xc15c), f0, f1, f2, f3, dwc_rd(0xc308), dwc_rd(0xc30c));
++	}
++
+ 	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+ 	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+@@ -2103,6 +2478,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	swd_key_init();
+ 	swd.lock = lck_mtx_alloc_init(&ud_swd_grp, LCK_ATTR_NULL);
+ 	if (swd.lock != NULL && kernel_thread_start(swd_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

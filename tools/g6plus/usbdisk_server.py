@@ -15,7 +15,7 @@ Message = 512-byte little-endian header [+ data]:
    0 magic 'SWDB'  4 type  8 seq  12 status  16 lba(u64)  24 nblk  28 len  32 nblocks(u64)  40 bsize  44 flags
    64.. inline log text.   Types: 1 HELLO, 2 READ, 3 WRITE, 4 LOG, 5 FLUSH; replies carry type | 0x80.
 """
-import argparse, ctypes, ctypes.util, os, struct, sys, threading, time
+import argparse, collections, ctypes, ctypes.util, os, struct, sys, threading, time
 
 VID, PID, IFACE, EP_IN, EP_OUT = 0x1209, 0x0001, 2, 0x83, 0x03
 MAGIC, HDR = 0x42445753, 512
@@ -41,6 +41,8 @@ class Link:
         lib.libusb_open_device_with_vid_pid.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_uint16]
         lib.libusb_claim_interface.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.libusb_close.argtypes = [ctypes.c_void_p]
+        lib.libusb_clear_halt.argtypes = [ctypes.c_void_p, ctypes.c_ubyte]
+        self.err = ''
         lib.libusb_bulk_transfer.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_void_p, ctypes.c_int,
                                              ctypes.POINTER(ctypes.c_int), ctypes.c_uint]
         if lib.libusb_init(ctypes.byref(self.ctx)) != 0:
@@ -56,6 +58,10 @@ class Link:
             self.err = f'claim interface {IFACE}: libusb error {rc}'
             return False
         self.h = h
+        # Start from clean pipes: CLEAR_FEATURE(ENDPOINT_HALT) resets the data toggle on both ends (the kernel ends
+        # any transfer still queued there and fails its request, which it then retries from the header).
+        for ep in (EP_IN, EP_OUT):
+            self.lib.libusb_clear_halt(h, ep)
         return True
 
     def close(self):
@@ -96,6 +102,31 @@ class Link:
             raise OSError(f'bulk OUT: libusb error {rc}, {sent.value}/{len(data)} bytes')
 
 
+def make_key(nbytes=0x10000):
+    """The kernel's whitening keystream (bsd/dev/sweet_usb.c swd_key_init): xorshift64*, as one big integer."""
+    x, m, out = 0x9E3779B97F4A7C15, (1 << 64) - 1, bytearray()
+    for _ in range(nbytes // 8):
+        x ^= x >> 12
+        x = (x ^ (x << 25)) & m
+        x ^= x >> 27
+        out += ((x * 0x2545F4914F6CDD1D) & m).to_bytes(8, 'little')
+    return bytes(out)
+
+
+KEY = make_key()
+
+
+KEY2 = KEY + KEY
+
+
+def whiten(data, seq):
+    """XOR with the keystream (its own inverse), started at a position derived from the message's sequence number
+    (swd_scramble in the kernel): a retried message is a different bit pattern on the wire. Payloads only."""
+    n = len(data)
+    r = ((seq * 2654435761) % (len(KEY) // 8)) * 8
+    return (int.from_bytes(data, 'little') ^ int.from_bytes(KEY2[r:r + n], 'little')).to_bytes(n, 'little')
+
+
 def reply(mtype, seq, status=0, nblocks=0, bsize=0, flags=0, data=b''):
     h = struct.pack('<IIIIQIIQII', MAGIC, mtype | 0x80, seq, status, 0, 0, len(data), nblocks, bsize, flags)
     return h + b'\0' * (HDR - len(h)) + data
@@ -126,17 +157,18 @@ def main():
             print(f'warning: {a.image} is not a multiple of {a.bs} bytes; the tail is not served', file=sys.stderr)
     logf = open(a.log, 'ab') if a.log else None
     link = Link(load_libusb())
-    stats = dict(reads=0, read_bytes=0, writes=0, logs=0, bad=0)
+    stats = dict(reads=0, read_bytes=0, writes=0, logs=0, bad=0, aborts=0)
     deadline = time.time() + a.secs if a.secs else None
     if a.secs:      # the reads block without a timeout: --secs is enforced from a timer instead
         def give_up():
             print(f'[usbdisk] --secs {a.secs} reached: logs {stats["logs"]}, reads {stats["reads"]} '
-                  f'({stats["read_bytes"] >> 10} KiB), writes {stats["writes"]}, bad {stats["bad"]}', file=sys.stderr, flush=True)
+                  f'({stats["read_bytes"] >> 10} KiB), writes {stats["writes"]}, bad {stats["bad"]}, aborted messages {stats["aborts"]}', file=sys.stderr, flush=True)
             os._exit(0)
         t = threading.Timer(a.secs, give_up)
         t.daemon = True
         t.start()
     had_session = False
+    trace = collections.deque(maxlen=24)        # last messages, dumped when the framing breaks
 
     def note(s):
         print(f'[usbdisk {time.strftime("%H:%M:%S")}] {s}', file=sys.stderr, flush=True)
@@ -144,6 +176,9 @@ def main():
     note('waiting for the phone (1209:0001, interface 2)')
     while deadline is None or time.time() < deadline:
         if not link.open():
+            if link.err:
+                note(link.err)
+                link.err = ''
             if had_session and a.once:
                 break
             time.sleep(0.3)
@@ -155,17 +190,24 @@ def main():
                 h = link.read(HDR, 0)
                 if not h:
                     continue
-                if len(h) < 64:
-                    note(f'short header ({len(h)} bytes), ignored')
+                if len(h) < HDR:
+                    # the kernel's abort marker ("SWDBABRT", a short packet) or the tail of an abandoned message
+                    stats['aborts'] += 1
                     continue
                 magic, mtype, seq, _status, lba, nblk, length = struct.unpack_from('<IIIIQII', h, 0)
+                if magic == MAGIC and mtype != LOG:
+                    trace.append(f'{time.strftime("%H:%M:%S")}.{int(time.time() * 1000) % 1000:03d} type {mtype} seq {seq} '
+                                 f'lba {lba} nblk {nblk} len {length}')
                 if magic != MAGIC:
                     stats['bad'] += 1
-                    if stats['bad'] <= 5 or stats['bad'] % 1000 == 0:
-                        note(f'bad magic {magic:#x} (#{stats["bad"]}), ignored: the framing is lost')
-                    continue
+                    if stats['bad'] == 1:
+                        note('framing lost; last requests before it:')
+                        for t in trace:
+                            note('   ' + t)
+                    note(f'bad magic {magic:#x} (#{stats["bad"]}): reopening the interface to reset both pipes')
+                    raise OSError('framing lost')
                 if mtype == LOG:
-                    text = h[64:64 + min(length, HDR - 64)]
+                    text = (whiten(h[64:], seq) if _status & 1 else h[64:])[:min(length, HDR - 64)]
                     sys.stdout.buffer.write(text)
                     sys.stdout.buffer.flush()
                     if logf:
@@ -177,17 +219,22 @@ def main():
                         link.write(reply(HELLO, seq, status=1))
                         note('HELLO refused: no image given')
                     else:
-                        link.write(reply(HELLO, seq, nblocks=size // a.bs, bsize=a.bs, flags=1 if a.rw else 0))
+                        link.write(reply(HELLO, seq, nblocks=size // a.bs, bsize=a.bs, flags=(1 if a.rw else 0) | 2))
                         note(f'HELLO: {size // a.bs} blocks of {a.bs} ({size >> 20} MiB), {"rw" if a.rw else "ro"}')
                 elif mtype == READ:
                     n = nblk * a.bs
                     data = os.pread(fd, n, lba * a.bs) if fd is not None else b''
                     ok = fd is not None and len(data) == n
-                    link.write(reply(READ, seq, status=0 if ok else 1, data=data if ok else b'\0' * n))
+                    link.write(reply(READ, seq, status=0 if ok else 1, data=whiten(data if ok else b'\0' * n, seq)))
                     stats['reads'] += 1
                     stats['read_bytes'] += n
                 elif mtype == WRITE:
-                    data = link.read_exact(length, 0)
+                    data = link.read(length, 0)
+                    if len(data) != length:
+                        # a short packet ended the read: the kernel gave this message up (abort marker) and resends it
+                        stats['aborts'] += 1
+                        continue
+                    data = whiten(data, seq)
                     ok = fd is not None and a.rw and length == nblk * a.bs
                     if ok:
                         os.pwrite(fd, data, lba * a.bs)
