@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ddbb9b133..8ac9e44e8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -350,7 +350,7 @@ sweet_usb_start_evert(void)
+  * photos of 2026-11-12). With 4 KiB the whole message (512 + 4096 bytes) fits in TX FIFO 3 as sized in
+  * sweet_usb_gadget_start(), so the controller never refills the FIFO in the middle of a transfer.
+  */
+-#define UD_WMAX         0x1000
++#define UD_WMAX         0x10000         /* back to 64 KiB: the per-attempt whitening recovers killer packets */
+ #define UD_DTXB         0x4000          /* request: 512-byte header + data */
+ #define UD_DRXB         0x18000         /* reply: 512-byte header + data */
+ #define UD_SIZE         0x2c000
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fa501356b..09ade9b13 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1791,6 +1791,17 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		 * Without this every swap looked empty (mask 0): backboardd presented 5000 frames and the panel stayed black.
+ 		 */
+ 		const uint8_t *in = (const uint8_t *)args->structureInput;
++		if (args->structureInputDescriptor == NULL && args->structureInputSize >= SWEET_FB_SWAP_REC_SIZE &&
++		    args->structureInputSize < 0x514) {
++			/*
++			 * iOS 16 (patch 1032 of this line, Moto G6 Plus): the 0x46c byte record already has the legacy
++			 * layout. Patch 0160 made this path iOS 18 only, so every swap of iOS 16.7's backboardd came
++			 * back kIOReturnBadArgument (`backboardd sel 5 in 0/1132 -> 0xe00002c2`) and nothing was shown.
++			 */
++			memcpy(rec, in, sizeof(rec));
++			fFB->swap(rec);
++			break;
++		}
+ 		if (args->structureInputDescriptor != NULL || args->structureInputSize < 0x514) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
