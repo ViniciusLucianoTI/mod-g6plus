@@ -1,0 +1,62 @@
+From 88311f361c9d2d949fb7e6d27112478eff71cfb3 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Thu, 12 Nov 2026 14:22:27 -0300
+Subject: [PATCH] sweet g6: print the QUSB2 HS tuning ABL left and Android's
+ values; sweetusbtune=
+
+---
+ bsd/dev/sweet_usb.c | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index c9e3c3130..d45dcb17f 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1437,6 +1437,44 @@ sweet_usb_fix_phy(void)
+ 		printf("SWEET USB FIX: QUSB2(v1) POWERDOWN 0x%02x PLL_STATUS 0x%02x after (%s, %d us)\n",
+ 		    usb_rd(phy, QUSB1_PORT_POWERDOWN) & 0xff, usb_rd(phy, QUSB1_PLL_STATUS) & 0xff,
+ 		    n < 1000 ? "locked" : "NOT locked", n);
++		/*
++		 * HS transmitter tuning. Android programs qcom,qusb-phy-init-seq (stock DT: TUNE1 0x80 = 0xf8,
++		 * TUNE2 0x84 = 0x80, TUNE3 0x88 = 0x81, TUNE4 0x8c = 0xcf) and replaces TUNE2's high nibble with the
++		 * factory trim from the efuse (0x00780240 bits 28:25) plus a correction of -5 (msm-4.4
++		 * phy-msm-qusb.c). ABL's values are what we run with; they are printed here because phone -> host
++		 * packets with particular contents are never acknowledged on this board (SWDB "killer packets",
++		 * an ECM frame stuck forever). sweetusbtune=1 programs Android's values.
++		 */
++		uint32_t efuse = 0, tune = 0;
++		vm_offset_t ef = ml_io_map(0x00780000u, 0x1000);
++		if (ef) {
++			efuse = usb_rd(ef, 0x240);
++		}
++		uint32_t trim = (efuse >> 25) & 0xfu;
++		uint32_t t2 = 0x80u;
++		if (trim) {
++			int v = (int)trim - 5;
++			v = v < 0 ? 0 : (v > 15 ? 15 : v);
++			t2 = (0x80u & 0x0fu) | ((uint32_t)v << 4);
++		}
++		printf("SWEET USB FIX: QUSB2(v1) TUNE1-4 0x%02x 0x%02x 0x%02x 0x%02x, efuse 0x%08x (trim %u); Android would use 0xf8 0x%02x 0x81 0xcf\n",
++		    usb_rd(phy, 0x80) & 0xff, usb_rd(phy, 0x84) & 0xff, usb_rd(phy, 0x88) & 0xff, usb_rd(phy, 0x8c) & 0xff,
++		    efuse, trim, t2);
++		PE_parse_boot_argn("sweetusbtune", &tune, sizeof(tune));
++		if (tune == 1) {
++			*(volatile uint32_t *)(phy + 0x80) = 0xf8u;
++			*(volatile uint32_t *)(phy + 0x84) = t2;
++			*(volatile uint32_t *)(phy + 0x88) = 0x81u;
++			*(volatile uint32_t *)(phy + 0x8c) = 0xcfu;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			printf("SWEET USB FIX: QUSB2(v1) TUNE1-4 now 0x%02x 0x%02x 0x%02x 0x%02x\n",
++			    usb_rd(phy, 0x80) & 0xff, usb_rd(phy, 0x84) & 0xff, usb_rd(phy, 0x88) & 0xff, usb_rd(phy, 0x8c) & 0xff);
++		} else if (tune > 1) {
++			/* sweetusbtune=0xT2 : only TUNE2 (HS amplitude), raw value */
++			*(volatile uint32_t *)(phy + 0x84) = tune & 0xffu;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			printf("SWEET USB FIX: QUSB2(v1) TUNE2 now 0x%02x\n", usb_rd(phy, 0x84) & 0xff);
++		}
+ 		return;
+ 	}
+ 	/* The block replicates each 8-bit register across the 32-bit word. */
+-- 
+2.56.0
+
