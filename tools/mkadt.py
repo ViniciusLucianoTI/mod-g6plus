@@ -92,6 +92,15 @@ BOARDS = {
         # 0x50000000 (1.25 GB, L1 entries 2-3 only). ABL put the boot.img ramdisk at 0x84200000 (live FDT
         # linux,initrd-start), far below.
         mem=(0xb0000000, 0xce400000),
+        # Same reason as beryllium's chosen_extra: without /chosen mac-address-wifi0 MobileGestalt's Wi-Fi
+        # address resolver waits for an IONetworkController, lsd blocks on it while it seeds the
+        # LaunchServices database, and SpringBoard stays behind the Apple logo (seen on the G6, 2026-11-12:
+        # 7 logo swaps, then nothing for 15 min; NOTES.md 2026-10-19 has the Poco F1 analysis). Synthetic,
+        # locally administered addresses.
+        chosen_extra=[
+            ('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x77, 0xe6, 0x01])),
+            ('mac-address-bluetooth0', bytes([0x02, 0x00, 0x5e, 0x77, 0xe6, 0x02])),
+        ],
         # no UFS node: the G6 boots from eMMC (sdhc_1), which the kernel has no driver for yet
         ufs=False),
 }
