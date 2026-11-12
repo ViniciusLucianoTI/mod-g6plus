@@ -95,6 +95,7 @@
   * adb comes back `unauthorized` after a reset unless "always allow from this computer" was ticked; the loop needs that.
   * Also seen in the video: ~10 s with no output after `using 1584 buffer headers` (up_s 14 -> 24), boot reaches PID 1 around up_s 45 like with cpus=1. Not investigated.
   * Current phone image: enxerto/out/enxerto-boot.img = kernel 1034 + tools/g6plus/bootargs.txt (cpus=8, no smptest).
+* **1035 + mkadt: the kernel gets 3.2 GB on the G6 (2026-11-11 ~22:40), NOT yet booted on the phone.** tools/mkadt.py evert mem = 0xb0000000 + 0xce400000 (to 0x17e400000, the end of Linux's System RAM range), new `--mem BASE:SIZE` (also with --qemu). start.s maps all of memSize twice with one 4K L2 table per GB; the stock 8 bootstrap table pages overflowed into kernel data (observed in QEMU with the 3.2 GB map and kernel 1034: data abort in ml_parse_cpu_topology, boot_cpu pointer = a page-table descriptor). 1035 = BOOTSTRAP_TABLE_SIZE 16 pages for SWEET. Observed in QEMU: kernel 1035 (local, sha256 50aee0c763117960...) reaches `BSD root: md0` with the 3.2 GB map; qemu_gic_test PASS. Phone image built with evert-full.adt + bootargs.txt.
 * Next (old): user installs platform-tools, connects the G6 Plus; check unlock state (`fastboot getvar all`), run collect.sh, confirm ID registers (LSE absent), then decide the LSE strategy.
 
 ---

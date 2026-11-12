@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium|evert] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium|evert] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE] [--mem BASE:SIZE]
 """
 import hashlib, os, struct, sys
 
@@ -87,10 +87,11 @@ BOARDS = {
         gicr=0x17b00000,
         # Kernel RAM: 0xb0000000 + 1.25 GB, inside the Linux System RAM range 0xaf0c0000-0x17e4bffff (above
         # ramoops/tzlog/wdog_cpu, which end at 0xaf0c0000; all fixed carve-outs are below 0x9f800000). It
-        # stays in L1 entries 2-3, so with the KVA side the 4K bootstrap tables need at most 7 of their 8
-        # pages, it is > 1 GB (arm_init keeps 16K VM pages for userland) and below 4 GB. ABL put the
-        # boot.img ramdisk at 0x84200000 (live FDT linux,initrd-start), far below.
-        mem=(0xb0000000, 0x50000000),
+        # is > 1 GB (arm_init keeps 16K VM pages for userland). The whole range to 0x17e400000 (3.2 GB of the
+        # 4 GB; needs xnu patch 1035: 16 bootstrap table pages, the stock 8 cover 2 GB). Until 1035 this was
+        # 0x50000000 (1.25 GB, L1 entries 2-3 only). ABL put the boot.img ramdisk at 0x84200000 (live FDT
+        # linux,initrd-start), far below.
+        mem=(0xb0000000, 0xce400000),
         # no UFS node: the G6 boots from eMMC (sdhc_1), which the kernel has no driver for yet
         ufs=False),
 }
@@ -176,7 +177,7 @@ def bluetooth_node(ph):
 
 
 def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, points=(375, 812), lowpool=None,
-          identity='d22ap'):
+          identity='d22ap', mem=None):
     ident = IDENTITIES[identity]
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
@@ -184,6 +185,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
     if board != 'sweet' and not qemu:
         if not highmem:
             phys_base, mem_size = b['mem']
+    if mem is not None:     # --mem BASE:SIZE (hex): explicit kernel RAM, also with --qemu (to rehearse a phone map)
+        phys_base, mem_size = mem
     fb, fb_size = b['fb']
     fb_w, fb_h = b['fb_wh']
     if lowpool is not None:
@@ -375,8 +378,9 @@ if __name__ == '__main__':
     points = tuple(int(v) for v in sys.argv[sys.argv.index('--points') + 1].split('x')) if '--points' in sys.argv else (375, 812)
     lowpool = parse_lowpool(sys.argv[sys.argv.index('--lowpool') + 1]) if '--lowpool' in sys.argv else None
     identity = sys.argv[sys.argv.index('--identity') + 1] if '--identity' in sys.argv else 'd22ap'
+    mem = tuple(int(v, 16) for v in sys.argv[sys.argv.index('--mem') + 1].split(':')) if '--mem' in sys.argv else None
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board, display_scale=scale, points=points,
-                 lowpool=lowpool, identity=identity)
+                 lowpool=lowpool, identity=identity, mem=mem)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

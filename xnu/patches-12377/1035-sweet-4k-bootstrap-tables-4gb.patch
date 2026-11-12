@@ -1,0 +1,16 @@
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -115,6 +115,13 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * patch 1035: start.s maps all of boot_args.memSize twice (V=P and KVA) with one 4K L2 table per 1 GB.
++ * Apple's 8 pages cover a 2 GB device; the 3.2 GB range of the Moto G6 Plus (0xb0000000-0x17e400000,
++ * four or five L1 entries per side) overran them into the kernel's data. 2 L1 + 2 * 7 L2 tables.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
