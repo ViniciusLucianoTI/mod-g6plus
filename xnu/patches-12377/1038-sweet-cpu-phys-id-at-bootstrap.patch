@@ -1,0 +1,20 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1638,6 +1638,17 @@
+ 			cpu_data_init(this_cpu_datap);
+ 		}
+ 		this_cpu_datap->cpu_number = (unsigned short)cpu_id;
++#if defined(SWEET)
++		/*
++		 * patch 1038: the reset vector (start.s) finds a starting CPU's data by comparing MPIDR with
++		 * cpu_phys_id over all registered entries, and cpu_phys_id stays 0 until that CPU's
++		 * ml_processor_register(). IOKit registers the CPUs in no fixed order, so a secondary whose
++		 * MPIDR is 0 (Moto G6 Plus: cpu4, the boot CPU is 0x100) matched the data of a lower-numbered
++		 * CPU that was not registered yet and never reached arm_init_cpu (stage 1, intermittent).
++		 * Give every entry its real ID from the topology before any secondary can start.
++		 */
++		this_cpu_datap->cpu_phys_id = topology_info.cpus[cpu_id].phys_id;
++#endif
+ 		if (is_boot_cpu) {
+ 			/* cpu_data_register()'ed by arm_init(). */
+ 

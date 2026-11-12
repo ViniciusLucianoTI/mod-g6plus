@@ -1,0 +1,1 @@
+debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=usbroot0 usbrootrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetusb=2 sweetearlyfb=2 sweetselfreset=240
