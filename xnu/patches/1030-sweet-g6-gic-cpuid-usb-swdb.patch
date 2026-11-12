@@ -1,0 +1,1184 @@
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+index 3d9c06a5b..e13c8e10e 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -3,6 +3,8 @@
+  * (tools/mkadt.py --board) names the board; everything else is common.
+  *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
+  *   xiaomi,beryllium  Poco F1, SDM845
++ *   motorola,evert    Moto G6 Plus, SDM630 (4K granule build; no UFS, so sweet_ufs_init() and the
++ *                     drivers it starts never run there)
+  */
+ #ifndef _SWEET_BOARD_H_
+ #define _SWEET_BOARD_H_
+@@ -76,4 +78,14 @@ sweet_board_beryllium(void)
+ 	return cached == 1;
+ }
+ 
++static inline bool
++sweet_board_evert(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("motorola,evert") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
+ #endif /* _SWEET_BOARD_H_ */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 012a1d000..fd7f98b81 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -40,10 +40,19 @@
+ #include <sys/kern_event.h>
+ #include <net/route.h>
+ #include <libkern/OSAtomic.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_smmu_map_sid(unsigned sid);
+ void sweet_usb_probe(void);
++void sweet_usb_start_evert(void);
++static void sweet_usb_probe_evert(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* iokit/Kernel/arm/SweetNetwork.cpp */
+@@ -69,9 +78,34 @@ static const struct {
+ 	{ "clkref", 0x8c010 },
+ };
+ 
+-#define DWC3_PA                 0x0a600000
++/*
++ * Moto G6 Plus (SDM630, patch 1036). Live DT: ssusb@a800000 (core 0xa800000 + 0xfc100, so the Qualcomm
++ * wrapper "QSCRATCH" is at 0xa8f8800), qusb@c012000 "qcom,qusb2phy" major-rev 1 (the older register
++ * layout: PLL_STATUS 0x38, PORT_TUNE1 0x80, PORT_POWERDOWN 0xb4). GCC offsets from Linux gcc-sdm660.c.
++ * No IOMMU in front of the controller (no iommus property).
++ */
++static const struct {
++	const char *name;
++	uint32_t    off;
++} usb_cbcr_evert[] = {
++	{ "master", 0x0f008 },
++	{ "sleep", 0x0f00c },
++	{ "utmi", 0x0f010 },
++	{ "cfg-noc-axi", 0x05018 },
++	{ "aggre2-axi", 0x0f03c },
++	{ "ahb2phy", 0x6a004 },
++};
++#define DWC3_PA_EVERT           0x0a800000
++#define QUSB2_PA_EVERT          0x0c012000
++#define QSCRATCH_PA_EVERT       0x0a8f8800
++#define QUSB1_PLL_STATUS        0x38            /* bit 5: PLL locked */
++#define QUSB1_PORT_TUNE1        0x80
++#define QUSB1_PORT_POWERDOWN    0xb4            /* bit 0 POWER_DOWN, bit 1 FREEZIO_N, bit 5 CLAMP_N_EN */
++#define QUSB1_PORT_TEST2        0x9c
++
++#define DWC3_PA                 (sweet_board_evert() ? DWC3_PA_EVERT : 0x0a600000)
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
++#define QUSB2_PA                (sweet_board_evert() ? QUSB2_PA_EVERT : 0x088e2000)
+ #define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+@@ -89,6 +123,11 @@ sweet_usb_probe(void)
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
++	if (sweet_board_evert()) {
++		sweet_usb_probe_evert();
++		return;
++	}
++
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+@@ -143,6 +182,86 @@ sweet_usb_probe(void)
+ 	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
++/*
++ * Moto G6 Plus: same read-only report with the SDM630 offsets. Called from IOFindBSDRoot
++ * (sweet_usb_start_evert) because sweet_ufs_init(), which starts the drivers on the Xiaomi boards,
++ * never runs without a UFS node. Default sweetusb=0 here: nothing is touched unless asked.
++ */
++static void
++sweet_usb_probe_evert(void)
++{
++	int enabled = 0;
++	uint32_t cbcr[sizeof(usb_cbcr_evert) / sizeof(usb_cbcr_evert[0])];
++
++	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		printf("SWEET USB: GCC map failed\n");
++		return;
++	}
++	uint32_t gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	printf("SWEET USB: evert GDSC usb30 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
++	for (unsigned i = 0; i < sizeof(usb_cbcr_evert) / sizeof(usb_cbcr_evert[0]); i++) {
++		cbcr[i] = usb_rd(gcc, usb_cbcr_evert[i].off);
++		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr_evert[i].name, cbcr[i],
++		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
++	}
++	if (!(gdscr & (1u << 31)) || (cbcr[0] & CBCR_CLK_OFF) || (cbcr[3] & CBCR_CLK_OFF)) {
++		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
++		return;
++	}
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (dwc == 0) {
++		printf("SWEET USB: DWC3 map failed\n");
++		return;
++	}
++	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x\n",
++	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200), usb_rd(dwc, 0xc2c0));
++	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x GUCTL1 0x%08x\n",
++	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
++	    usb_rd(dwc, 0xc720), usb_rd(dwc, 0xc11c));
++	if (!(cbcr[5] & CBCR_CLK_OFF)) {
++		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++		if (phy != 0) {
++			printf("SWEET USB: QUSB2(v1) PLL_STATUS 0x%02x POWERDOWN 0x%02x TUNE1 0x%02x TEST2 0x%02x\n",
++			    usb_rd(phy, QUSB1_PLL_STATUS) & 0xff, usb_rd(phy, QUSB1_PORT_POWERDOWN) & 0xff,
++			    usb_rd(phy, QUSB1_PORT_TUNE1) & 0xff, usb_rd(phy, QUSB1_PORT_TEST2) & 0xff);
++		}
++	} else {
++		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
++	}
++	if (enabled >= 2) {
++		sweet_usb_gadget_start(dwc);
++	}
++}
++
++/* Reboot path (osfmk/arm64/machine_routines.c, "MACH Reboot"): only the Moto G6 Plus resets here. */
++void sweet_evert_system_reset(void);
++void
++sweet_evert_system_reset(void)
++{
++	if (!sweet_board_evert()) {
++		return;
++	}
++	register uint64_t r0 __asm__("x0") = 0x84000009ULL;     /* PSCI SYSTEM_RESET */
++	__asm__ volatile("smc #0" : "+r"(r0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++	    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++}
++
++void
++sweet_usb_start_evert(void)
++{
++	static int started;
++	if (!sweet_board_evert() || started) {
++		return;
++	}
++	started = 1;
++	sweet_usb_probe_evert();
++}
++
+ /*
+  * Step 2: USB device mode with only the default control endpoint, enough
+  * for the host to enumerate the phone (boot-arg sweetusb=2). ABL leaves
+@@ -176,7 +295,7 @@ sweet_usb_probe(void)
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             (sweet_board_evert() ? QSCRATCH_PA_EVERT : 0x0a6f8800)
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+@@ -220,13 +339,24 @@ sweet_usb_probe(void)
+ #define UD_RX           0x2000          /* one received frame */
+ #define UD_TX           0x2800          /* one frame to send */
+ #define UD_FRAME_MAX    0x800
+-#define UD_SIZE         0x4000
++/* patch 1037: SWDB vendor interface (log + block requests), see the end of the file */
++#define UD_TRB_DRX      0x1060          /* ep3 OUT (bulk, host -> phone) */
++#define UD_TRB_DTX      0x1070          /* ep3 IN (bulk, phone -> host) */
++#define UD_DLOG         0x3000          /* one LOG message, 512 bytes */
++#define UD_DMAX         0x10000         /* data bytes per block request */
++#define UD_DTXB         0x4000          /* request: 512-byte header + data */
++#define UD_DRXB         0x18000         /* reply: 512-byte header + data */
++#define UD_SIZE         0x2c000
+ 
+ /* Physical endpoints: 2n = OUT, 2n+1 = IN */
+ #define EP_RX           2               /* 0x01 bulk OUT */
+ #define EP_TX           3               /* 0x81 bulk IN */
+ #define EP_INT          5               /* 0x82 interrupt IN */
+ #define TRBCTL_NORMAL   (1u << 4)
++#define EP_DRX          6               /* 0x03 bulk OUT, SWDB (patch 1037) */
++#define EP_DTX          7               /* 0x83 bulk IN, SWDB */
++static void swd_rx_complete(void);
++static void swd_tx_complete(void);
+ 
+ #define UD_TXQ          32
+ 
+@@ -248,8 +378,8 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
+-	bool        xfer_active[6]; /* a STARTTRANSFER is outstanding (physical ep) */
+-	uint8_t     xfer_res[6];    /* its transfer resource index */
++	bool        xfer_active[8]; /* a STARTTRANSFER is outstanding (physical ep) */
++	uint8_t     xfer_res[8];    /* its transfer resource index */
+ 	uint32_t    resets;
+ 	uint8_t     notify_stage;   /* 1 NETWORK_CONNECTION sent, 2 SPEED_CHANGE sent */
+ 	int         net_route;      /* sweetnetroute=1: add the default route via the host at link-up */
+@@ -325,7 +455,7 @@ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0 && ep < 6) {
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0 && ep < 8) {
+ 		ud.xfer_res[ep] = (uint8_t)((dwc_rd(DEPCMD(ep)) >> 16) & 0x7f);
+ 		ud.xfer_active[ep] = true;
+ 	}
+@@ -360,8 +490,8 @@ static const uint8_t ud_dev_desc[18] = {
+ 	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
+ 	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
+ };
+-static const uint8_t ud_cfg_desc[80] = {
+-	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++static const uint8_t ud_cfg_desc[103] = {
++	9, 2, 103, 0, 3, 1, 0, 0x80, 250,               /* config: 3 interfaces, 500 mA */
+ 	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
+ 	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
+ 	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
+@@ -371,6 +501,9 @@ static const uint8_t ud_cfg_desc[80] = {
+ 	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++	9, 4, 2, 0, 2, 0xff, 0x53, 0x57, 0,             /* interface 2: vendor "SWDB" (log + disk), patch 1037 */
++	7, 5, 0x83, 0x02, 0x00, 0x02, 0,                /* ep 0x83 bulk IN, 512 */
++	7, 5, 0x03, 0x02, 0x00, 0x02, 0,                /* ep 0x03 bulk OUT, 512 */
+ };
+ /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+ static const char *const ud_strings[] = {
+@@ -458,7 +591,22 @@ ud_configure(void)
+ 		printf("SWEET USB: data endpoints setup failed\n");
+ 		return;
+ 	}
+-	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	/*
++	 * SWDB endpoints. The IN one needs a third TX FIFO: ABL sized only the ones fastboot used, so give
++	 * FIFO 3 the depth of FIFO 1 right after FIFO 2 when it has none (GTXFIFOSIZn: start 31:16, depth 15:0).
++	 */
++	uint32_t f1 = dwc_rd(0xc304), f2 = dwc_rd(0xc308), f3 = dwc_rd(0xc30c);
++	if ((f3 & 0xffffu) == 0 || (f3 >> 16) < (f2 >> 16) + (f2 & 0xffffu)) {
++		dwc_wr(0xc30c, (((f2 >> 16) + (f2 & 0xffffu)) << 16) | ((f1 & 0xffffu) ? (f1 & 0xffffu) : 0x184u));
++	}
++	printf("SWEET USB: GTXFIFOSIZ1-3 0x%08x 0x%08x 0x%08x -> 0x%08x\n", f1, f2, f3, dwc_rd(0xc30c));
++	bool swdb = ud_epcmd(EP_DRX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_DRX << 25), 0) == 0 &&
++	    ud_epcmd(EP_DRX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) == 0 &&
++	    ud_epcmd(EP_DTX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (3u << 17), (1u << 8) | ((uint32_t)EP_DTX << 25), 0) == 0 &&
++	    ud_epcmd(EP_DTX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) == 0;
++	printf("SWEET USB: SWDB endpoints %s\n", swdb ? "configured" : "setup FAILED");
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT) |
++	    (swdb ? (1u << EP_DRX) | (1u << EP_DTX) : 0));
+ 	ud.configured = true;
+ 	ud_rx_arm();
+ 	printf("SWEET USB: ECM endpoints configured\n");
+@@ -692,7 +840,7 @@ ud_if_detach(ifnet_t ifp __unused)
+ static void
+ ud_net_start(void)
+ {
+-	int net = sweet_board_beryllium() ? 1 : 0;
++	int net = (sweet_board_beryllium() || sweet_board_evert()) ? 1 : 0;
+ 	int route = 0;
+ 
+ 	PE_parse_boot_argn("sweetnet", &net, sizeof(net));
+@@ -868,12 +1016,12 @@ ud_if_create(void)
+ static void
+ ud_bus_reset(const char *why)
+ {
+-	static const unsigned data_eps[] = { EP_RX, EP_TX, EP_INT };
++	static const unsigned data_eps[] = { EP_RX, EP_TX, EP_INT, EP_DRX, EP_DTX };
+ 	bool was = ud.configured;
+ 
+ 	lck_mtx_lock(ud.lock);
+ 	ud.configured = false;          /* stops ud_tx_kick_locked */
+-	for (unsigned i = 0; i < 3; i++) {
++	for (unsigned i = 0; i < sizeof(data_eps) / sizeof(data_eps[0]); i++) {
+ 		unsigned ep = data_eps[i];
+ 		if (ud.xfer_active[ep]) {
+ 			ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[ep] << 16), 0, 0, 0);
+@@ -932,9 +1080,19 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
+-	if (type == 1 && ep < 6) {
++	if (type == 1 && ep < 8) {
+ 		ud.xfer_active[ep] = false;     /* XferComplete: the single TRB is done */
+ 	}
++	if (ep == EP_DRX || ep == EP_DTX) {     /* SWDB: the requesting thread polls these flags */
++		if (type == 1) {
++			if (ep == EP_DRX) {
++				swd_rx_complete();
++			} else {
++				swd_tx_complete();
++			}
++		}
++		return;
++	}
+ 	if (ep == EP_INT && type == 1) {
+ 		if (ud.notify_stage == 1 && ud.configured) {
+ 			ud_notify_speed();
+@@ -1001,6 +1159,10 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+ 				bool routine = !(ev & 1) && ((ev >> 6) & 0xf) == 1 &&
+ 				    (((ev >> 1) & 0x1f) == EP_RX || ((ev >> 1) & 0x1f) == EP_TX);
++				if (!(ev & 1) && (((ev >> 1) & 0x1f) == EP_DRX || ((ev >> 1) & 0x1f) == EP_DTX)) {
++					ud_event(ev);       /* SWDB traffic is never printed: the console feeds it */
++					continue;
++				}
+ 				if (ud.events++ < 200 || (!routine && ud.events < 5000)) {
+ 					printf("SWEET USB: event 0x%08x\n", ev);
+ 				}
+@@ -1110,8 +1272,15 @@ sweet_usb_fix_mask(void)
+ 	 * traffic (2026-10-20, boots 0105u/0108l); QUSB2 PWR_CTRL1.POWER_DOWN
+ 	 * left set by ABL was the cause. sweetusbfix=0 turns it off.
+ 	 */
++	/* evert: mask 1 only (power the PHY up if ABL left it down); the dwc3 quirk writes are SDM845's */
+ 	int fix = sweet_board_beryllium() ? 1 : 0;
++	if (sweet_board_evert()) {
++		fix = 8;        /* bit 3 = "PHY fix only" marker, see below */
++	}
+ 	PE_parse_boot_argn("sweetusbfix", &fix, sizeof(fix));
++	if (fix == 8) {
++		return 1;
++	}
+ 	return fix == 1 ? 7 : (fix & 7);
+ }
+ 
+@@ -1123,6 +1292,24 @@ sweet_usb_fix_phy(void)
+ 		printf("SWEET USB FIX: QUSB2 map failed\n");
+ 		return;
+ 	}
++	if (sweet_board_evert()) {
++		/* QUSB2 v1 (Linux phy-qcom-qusb2.c msm8996 layout): enable = clear POWER_DOWN, keep the clamps off */
++		uint32_t pd = usb_rd(phy, QUSB1_PORT_POWERDOWN) & 0xff, st = usb_rd(phy, QUSB1_PLL_STATUS) & 0xff;
++		printf("SWEET USB FIX: QUSB2(v1) POWERDOWN 0x%02x PLL_STATUS 0x%02x before\n", pd, st);
++		if (pd & 0x01u) {
++			*(volatile uint32_t *)(phy + QUSB1_PORT_POWERDOWN) = (pd & ~0x01u) | 0x20u | 0x02u;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			delay(250);
++		}
++		int n;
++		for (n = 0; n < 1000 && !(usb_rd(phy, QUSB1_PLL_STATUS) & 0x20u); n++) {
++			delay(1);
++		}
++		printf("SWEET USB FIX: QUSB2(v1) POWERDOWN 0x%02x PLL_STATUS 0x%02x after (%s, %d us)\n",
++		    usb_rd(phy, QUSB1_PORT_POWERDOWN) & 0xff, usb_rd(phy, QUSB1_PLL_STATUS) & 0xff,
++		    n < 1000 ? "locked" : "NOT locked", n);
++		return;
++	}
+ 	/* The block replicates each 8-bit register across the 32-bit word. */
+ 	uint32_t pwr = usb_rd(phy, QUSB2_PWR_CTRL1) & 0xff, pll = usb_rd(phy, QUSB2_PLL_STATUS) & 0xff;
+ 	printf("SWEET USB FIX: QUSB2 PWR_CTRL1 0x%02x PLL_STATUS 0x%02x before\n", pwr, pll);
+@@ -1163,13 +1350,573 @@ sweet_usb_fix_core_reset(void)
+ 	    dwc_rd(GCTL), dwc_rd(GUSB3PIPECTL_REG), dwc_rd(GUSB2PHYCFG_REG));
+ }
+ 
++
++/*
++ * ---- patch 1037: "SWDB" vendor interface: kernel log + a block device served by the host ----
++ *
++ * Interface 2 (class 0xff/0x53/0x57), bulk OUT 0x03 (physical ep 6) and bulk IN 0x83 (physical ep 7).
++ * Every message starts with a 512-byte header (little endian):
++ *    0 u32 magic 'SWDB'   4 u32 type   8 u32 seq   12 u32 status   16 u64 lba   24 u32 nblk
++ *   28 u32 len            32 u64 nblocks (HELLO reply)             40 u32 block size (HELLO reply)
++ *   44 u32 flags (HELLO reply: bit 0 writable)                     64 .. inline log text (LOG)
++ * Phone -> host: HELLO 1, READ 2, WRITE 3 (header + len bytes of data), LOG 4 (len <= 448 bytes inline,
++ * no reply), FLUSH 5. Host -> phone: the same header with type | 0x80, for READ followed by the data.
++ * One request at a time (swd.lock); the reply is received into a TRB of exactly the expected size.
++ * The host side is tools/g6plus/usbdisk_server.py (libusb, no network setup, no root).
++ * rd=usbroot0 makes it the root device (IOFindBSDRoot waits for the server). Nothing here may printf
++ * per message: the console feeds the LOG channel.
++ */
++#define SWD_MAGIC       0x42445753u
++#define SWD_HELLO       1u
++#define SWD_READ        2u
++#define SWD_WRITE       3u
++#define SWD_LOG         4u
++#define SWD_FLUSH       5u
++#define SWD_HDR         512u
++#define SWD_LOG_MAX     448u
++
++static struct {
++	lck_mtx_t  *lock;
++	volatile bool rx_done, tx_done;
++	uint32_t    seq;
++	bool        hello;          /* the host answered HELLO */
++	bool        ready;          /* block device registered */
++	bool        writable;
++	uint64_t    nblocks;
++	uint32_t    bsize;
++	uint32_t    secsize;
++	int         bmajor, cmajor;
++	dev_t       bdev;
++	uint64_t    reads, writes, errors, log_msgs;
++} swd;
++
++static inline void
++swd_put32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ud.dma + off) = v;
++}
++
++static void
++swd_abort(unsigned ep)
++{
++	lck_mtx_lock(ud.lock);
++	if (ud.xfer_active[ep]) {
++		ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[ep] << 16), 0, 0, 0);
++		ud.xfer_active[ep] = false;
++	}
++	lck_mtx_unlock(ud.lock);
++}
++
++static int
++swd_wait(volatile bool *flag, unsigned ms)
++{
++	for (unsigned t = 0; t < ms; t++) {
++		if (*flag) {
++			return 0;
++		}
++		if (!ud.configured) {
++			return ENXIO;
++		}
++		ud_sleep_ms(1);
++	}
++	return *flag ? 0 : ETIMEDOUT;
++}
++
++/* swd.lock held. data_out: bytes after the header we send; data_in: bytes after the header we expect. */
++static int
++swd_request(uint32_t type, uint64_t lba, uint32_t nblk, uint32_t data_out, uint32_t data_in, unsigned timeout_ms)
++{
++	if (!ud.configured) {
++		return ENXIO;
++	}
++	uint8_t *h = (uint8_t *)(ud.dma + UD_DTXB);
++	bzero(h, 64);
++	uint32_t seq = ++swd.seq;
++	swd_put32(UD_DTXB + 0, SWD_MAGIC);
++	swd_put32(UD_DTXB + 4, type);
++	swd_put32(UD_DTXB + 8, seq);
++	swd_put32(UD_DTXB + 16, (uint32_t)lba);
++	swd_put32(UD_DTXB + 20, (uint32_t)(lba >> 32));
++	swd_put32(UD_DTXB + 24, nblk);
++	swd_put32(UD_DTXB + 28, data_out);
++
++	swd.rx_done = false;
++	swd.tx_done = false;
++	lck_mtx_lock(ud.lock);
++	if (!ud.configured) {
++		lck_mtx_unlock(ud.lock);
++		return ENXIO;
++	}
++	ud_start_trb(EP_DRX, UD_TRB_DRX, UD_DRXB, SWD_HDR + data_in, TRBCTL_NORMAL);
++	ud_start_trb(EP_DTX, UD_TRB_DTX, UD_DTXB, SWD_HDR + data_out, TRBCTL_NORMAL);
++	lck_mtx_unlock(ud.lock);
++
++	int error = swd_wait(&swd.tx_done, timeout_ms);
++	if (!error) {
++		error = swd_wait(&swd.rx_done, timeout_ms);
++	}
++	if (error) {
++		swd_abort(EP_DTX);
++		swd_abort(EP_DRX);
++		return error;
++	}
++	ud_sync(UD_DRXB, SWD_HDR + data_in);
++	const volatile uint32_t *r = (const volatile uint32_t *)(ud.dma + UD_DRXB);
++	if (r[0] != SWD_MAGIC || r[1] != (type | 0x80u) || r[2] != seq) {
++		return EIO;
++	}
++	return r[3] ? EIO : 0;
++}
++
++static int
++swd_hello(void)
++{
++	lck_mtx_lock(swd.lock);
++	int error = swd_request(SWD_HELLO, 0, 0, 0, 0, 1000);
++	if (!error) {
++		const volatile uint32_t *r = (const volatile uint32_t *)(ud.dma + UD_DRXB);
++		uint64_t nblocks = (uint64_t)r[8] | ((uint64_t)r[9] << 32);
++		uint32_t bsize = r[10];
++		if (nblocks == 0 || bsize < 512 || bsize > 4096 || (bsize & (bsize - 1))) {
++			error = EINVAL;
++		} else {
++			swd.nblocks = nblocks;
++			swd.bsize = bsize;
++			swd.secsize = bsize;
++			swd.writable = (r[11] & 1u) != 0;
++			swd.hello = true;
++		}
++	}
++	lck_mtx_unlock(swd.lock);
++	return error;
++}
++
++/* Console text to the host, 448 bytes per message. Runs from the first configuration on. */
++static void
++swd_log_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static char chunk[SWD_LOG_MAX];
++	uint64_t pos = sweet_log_position();
++
++	pos = pos > 262144 ? pos - 262144 : 0;
++	for (;;) {
++		ud_sleep_ms(20);
++		if (!ud.configured) {
++			continue;
++		}
++		for (int burst = 0; burst < 64; burst++) {
++			uint64_t before = pos;
++			uint32_t n = sweet_log_copy(&pos, chunk, sizeof(chunk));
++			if (n == 0) {
++				break;
++			}
++			lck_mtx_lock(swd.lock);
++			uint8_t *h = (uint8_t *)(ud.dma + UD_DLOG);
++			bzero(h, 64);
++			swd_put32(UD_DLOG + 0, SWD_MAGIC);
++			swd_put32(UD_DLOG + 4, SWD_LOG);
++			swd_put32(UD_DLOG + 28, n);
++			memcpy(h + 64, chunk, n);
++			swd.tx_done = false;
++			int error = ENXIO;
++			lck_mtx_lock(ud.lock);
++			if (ud.configured) {
++				ud_start_trb(EP_DTX, UD_TRB_DTX, UD_DLOG, SWD_HDR, TRBCTL_NORMAL);
++				error = 0;
++			}
++			lck_mtx_unlock(ud.lock);
++			if (!error) {
++				error = swd_wait(&swd.tx_done, 200);
++				if (error) {
++					swd_abort(EP_DTX);      /* nobody is reading: keep the text for later */
++				}
++			}
++			lck_mtx_unlock(swd.lock);
++			if (error) {
++				pos = before;
++				ud_sleep_ms(300);
++				break;
++			}
++			swd.log_msgs++;
++		}
++	}
++}
++
++static int
++swd_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!swd.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !swd.writable) ? EROFS : 0;
++}
++
++static int
++swd_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++/* swd.lock held: nblk device blocks at lba, to or from the data area of the reply/request buffers. */
++static int
++swd_rw(bool rd, uint64_t lba, uint32_t nblk)
++{
++	int error = 0;
++	/* The cable can drop and the server can restart: keep trying for a while, a root device must not fail fast. */
++	for (int attempt = 0; attempt < 600; attempt++) {
++		error = rd ? swd_request(SWD_READ, lba, nblk, 0, nblk * swd.bsize, 5000)
++		    : swd_request(SWD_WRITE, lba, nblk, nblk * swd.bsize, 0, 5000);
++		if (!error) {
++			return 0;
++		}
++		swd.errors++;
++		ud_sleep_ms(100);
++	}
++	return error;
++}
++
++static void
++swd_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * swd.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t bytes = swd.nblocks * swd.bsize;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !swd.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > bytes || count > bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++	lck_mtx_lock(swd.lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / swd.bsize;
++		uint32_t skip = (uint32_t)(pos % swd.bsize);
++		uint32_t want = MIN(count - done, UD_DMAX - skip);
++		uint32_t blocks = (skip + want + swd.bsize - 1) / swd.bsize;
++		if (rd) {
++			error = swd_rw(true, lba, blocks);
++			if (!error) {
++				memcpy(vaddr + done, (const char *)(ud.dma + UD_DRXB + SWD_HDR) + skip, want);
++				swd.reads++;
++			}
++		} else {
++			char *out = (char *)(ud.dma + UD_DTXB + SWD_HDR);
++			if (skip || (want % swd.bsize)) {       /* partial blocks: read, merge, write back */
++				error = swd_rw(true, lba, blocks);
++				if (!error) {
++					memcpy(out, (const char *)(ud.dma + UD_DRXB + SWD_HDR), blocks * swd.bsize);
++				}
++			}
++			if (!error) {
++				memcpy(out + skip, vaddr + done, want);
++				error = swd_rw(false, lba, blocks);
++				swd.writes++;
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(swd.lock);
++	buf_unmap(bp);
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++swd_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = swd.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > swd.bsize || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		swd.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = swd.bsize;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = swd.nblocks * swd.bsize / swd.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = swd.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE: {
++		if (!swd.writable) {
++			return 0;
++		}
++		lck_mtx_lock(swd.lock);
++		int error = swd_request(SWD_FLUSH, 0, 0, 0, 0, 10000);
++		lck_mtx_unlock(swd.lock);
++		return error;
++	}
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = UD_DMAX / swd.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = swd.writable ? UD_DMAX / swd.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++swd_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return swd_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++swd_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return swd_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++swd_psize(__unused dev_t dev)
++{
++	return swd.ready ? (int)MIN(swd.nblocks * swd.bsize / swd.secsize, INT_MAX) : -1;
++}
++
++static int
++swd_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(swd_strategy, NULL, dev, B_READ, minphys, uio, (int)swd.secsize);
++}
++
++static int
++swd_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!swd.writable) {
++		return EROFS;
++	}
++	return physio(swd_strategy, NULL, dev, B_WRITE, minphys, uio, (int)swd.secsize);
++}
++
++static const struct bdevsw swd_bdevsw = {
++	.d_open     = swd_open,
++	.d_close    = swd_close,
++	.d_strategy = swd_strategy,
++	.d_ioctl    = swd_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = swd_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw swd_cdevsw = {
++	.d_open       = swd_open,
++	.d_close      = swd_close,
++	.d_read       = swd_read,
++	.d_write      = swd_write,
++	.d_ioctl      = swd_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++/* Root device for rd=usbroot0 (IOFindBSDRoot): start the gadget and wait for the host's disk server. */
++int sweet_usbdisk_rootdev(dev_t *dev);
++
++int
++sweet_usbdisk_rootdev(dev_t *dev)
++{
++	if (swd.ready) {
++		*dev = swd.bdev;
++		return 0;
++	}
++	if (ud.dma == 0 || swd.lock == NULL) {
++		printf("SWEET USBDISK: the USB device is not running (boot-arg sweetusb=2, Moto G6 Plus only for now)\n");
++		return ENXIO;
++	}
++	uint32_t wait_s = 600;
++	PE_parse_boot_argn("usbrootwait", &wait_s, sizeof(wait_s));
++	printf("SWEET USBDISK: waiting up to %u s for tools/g6plus/usbdisk_server.py on the host\n", wait_s);
++	int error = ENXIO;
++	for (uint32_t t = 0; t < wait_s * 4; t++) {
++		if (ud.configured) {
++			error = swd_hello();
++			if (!error) {
++				break;
++			}
++		}
++		if ((t % 40) == 39) {
++			printf("SWEET USBDISK: still waiting for the host (%u s, configured %d, last error %d)\n",
++			    (t + 1) / 4, ud.configured, error);
++		}
++		ud_sleep_ms(250);
++	}
++	if (error) {
++		return error;
++	}
++	uint32_t rw = 0;
++	PE_parse_boot_argn("usbrootrw", &rw, sizeof(rw));
++	swd.writable = swd.writable && rw;
++	swd.bmajor = bdevsw_add(-1, &swd_bdevsw);
++	if (swd.bmajor < 0) {
++		return ENXIO;
++	}
++	swd.cmajor = cdevsw_add_with_bdev(-1, &swd_cdevsw, swd.bmajor);
++	if (swd.cmajor < 0) {
++		return ENXIO;
++	}
++	swd.bdev = makedev(swd.bmajor, 0);
++	devfs_make_node(swd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "usbroot0");
++	devfs_make_node(makedev(swd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rusbroot0");
++	swd.ready = true;
++	printf("SWEET USBDISK: usbroot0: %llu blocks of %u bytes (%llu MiB), %s\n", swd.nblocks, swd.bsize,
++	    swd.nblocks * swd.bsize >> 20, swd.writable ? "read-write" : "read-only");
++	*dev = swd.bdev;
++	return 0;
++}
++
++/*
++ * Boot-arg usbdisktest=N (MiB): once the host answers HELLO, read the first N MiB of the image in
++ * 64 KiB requests and print the byte sum and the time, to check the link without mounting anything
++ * (compare with `usbdisk_server.py --sum N IMAGE`).
++ */
++static void
++swd_test_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t mib = 0;
++	PE_parse_boot_argn("usbdisktest", &mib, sizeof(mib));
++	for (int t = 0; t < 2400 && !swd.hello; t++) {
++		if (ud.configured) {
++			(void)swd_hello();
++		}
++		if (!swd.hello) {
++			ud_sleep_ms(250);
++		}
++	}
++	if (!swd.hello) {
++		printf("SWEET USBDISK TEST: no host disk server\n");
++		return;
++	}
++	uint64_t total = MIN((uint64_t)mib << 20, swd.nblocks * swd.bsize), sum = 0, done = 0;
++	uint32_t per = UD_DMAX / swd.bsize;
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	int error = 0;
++	printf("SWEET USBDISK TEST: image %llu blocks of %u, reading %llu bytes\n", swd.nblocks, swd.bsize, total);
++	while (done < total && !error) {
++		uint32_t nblk = (uint32_t)MIN((uint64_t)per, (total - done) / swd.bsize);
++		if (nblk == 0) {
++			break;
++		}
++		lck_mtx_lock(swd.lock);
++		error = swd_request(SWD_READ, done / swd.bsize, nblk, 0, nblk * swd.bsize, 5000);
++		if (!error) {
++			const uint8_t *d = (const uint8_t *)(ud.dma + UD_DRXB + SWD_HDR);
++			for (uint32_t i = 0; i < nblk * swd.bsize; i++) {
++				sum += d[i];
++			}
++		}
++		lck_mtx_unlock(swd.lock);
++		done += (uint64_t)nblk * swd.bsize;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("SWEET USBDISK TEST: %s: %llu bytes, byte sum %llu, %llu ms, %llu KiB/s (error %d)\n",
++	    error ? "FAILED" : "done", done, sum, ns / 1000000, ns ? (done >> 10) * 1000000000ULL / ns : 0, error);
++	/*
++	 * Write check (server started with --rw and boot-arg usbrootrw=1): 1 MiB of a known pattern right
++	 * after the area read above, then read back and compared. The host can check the file as well:
++	 * byte i of that MiB is (i * 7 + (i >> 12)) & 0xff.
++	 */
++	uint32_t rw = 0;
++	PE_parse_boot_argn("usbrootrw", &rw, sizeof(rw));
++	if (error || !rw || !swd.writable || total + (1u << 20) > swd.nblocks * swd.bsize) {
++		printf("SWEET USBDISK TEST: write check skipped (usbrootrw %u, host writable %d)\n", rw, swd.writable);
++		return;
++	}
++	uint32_t bad = 0;
++	for (int pass = 0; pass < 2 && !error; pass++) {
++		for (uint32_t off = 0; off < (1u << 20) && !error; off += UD_DMAX) {
++			uint32_t nblk = UD_DMAX / swd.bsize;
++			lck_mtx_lock(swd.lock);
++			if (pass == 0) {
++				uint8_t *o = (uint8_t *)(ud.dma + UD_DTXB + SWD_HDR);
++				for (uint32_t i = 0; i < UD_DMAX; i++) {
++					o[i] = (uint8_t)((off + i) * 7 + ((off + i) >> 12));
++				}
++				error = swd_request(SWD_WRITE, (total + off) / swd.bsize, nblk, UD_DMAX, 0, 5000);
++			} else {
++				error = swd_request(SWD_READ, (total + off) / swd.bsize, nblk, 0, UD_DMAX, 5000);
++				const uint8_t *d = (const uint8_t *)(ud.dma + UD_DRXB + SWD_HDR);
++				for (uint32_t i = 0; i < UD_DMAX && !error; i++) {
++					bad += d[i] != (uint8_t)((off + i) * 7 + ((off + i) >> 12));
++				}
++			}
++			lck_mtx_unlock(swd.lock);
++		}
++	}
++	lck_mtx_lock(swd.lock);
++	int ferr = swd_request(SWD_FLUSH, 0, 0, 0, 0, 10000);
++	lck_mtx_unlock(swd.lock);
++	printf("SWEET USBDISK TEST: write check %s: 1 MiB at byte %llu, %u bad bytes on read-back, error %d, flush %d\n",
++	    (!error && !bad && !ferr) ? "OK" : "FAILED", total, bad, error, ferr);
++}
++
++static void
++swd_rx_complete(void)
++{
++	swd.rx_done = true;
++}
++
++static void
++swd_tx_complete(void)
++{
++	swd.tx_done = true;
++}
++
++static LCK_GRP_DECLARE(ud_swd_grp, "sweet_usbdisk");
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	/* TRB buffer pointers are written as 32 bits here: keep the DMA area below 4 GB (the G6 has RAM above) */
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, (ppnum_t)atop_64(0xffffffffULL), 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+ 		return;
+@@ -1179,6 +1926,10 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
++	if (ud.dma_pa + UD_SIZE > 0x100000000ULL) {
++		printf("SWEET USB: DMA area at 0x%llx is above 4 GB, not started\n", ud.dma_pa);
++		return;
++	}
+ 	ud_if_create();
+ 	ud_net_start();
+ 
+@@ -1188,7 +1939,16 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	 * from the QUSB2 UTMI clock instead, as Linux dwc3_qcom_select_utmi_clk()
+ 	 * does for "qcom,select-utmi-as-pipe-clk" (QSCRATCH_GENERAL_CFG).
+ 	 */
+-	if (sweet_board_beryllium()) {
++	/*
++	 * evert: same situation by the DT (USB3-capable core with a QMP PHY nobody starts, port wired for
++	 * high speed), so it takes the Poco F1 path by default; each step has a boot-arg to turn it off:
++	 * sweetusbutmi=0, sweetusbreset=1, sweetusb20clk=0.
++	 */
++	int hs_only_core = (sweet_board_beryllium() || sweet_board_evert()) ? 1 : 0;
++	int utmi_pipe = hs_only_core, force_20clk = hs_only_core;
++	PE_parse_boot_argn("sweetusbutmi", &utmi_pipe, sizeof(utmi_pipe));
++	PE_parse_boot_argn("sweetusb20clk", &force_20clk, sizeof(force_20clk));
++	if (utmi_pipe) {
+ 		vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 		if (qs != 0) {
+ 			volatile uint32_t *cfg = (volatile uint32_t *)(qs + 0x08);
+@@ -1223,7 +1983,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	 * Boot-arg sweetusbreset=1 forces the reset, 0 skips it on any board.
+ 	 */
+ 	uint32_t gctl_abl = dwc_rd(GCTL);
+-	int do_reset = sweet_board_beryllium() ? 0 : 1;
++	int do_reset = hs_only_core ? 0 : 1;
+ 	PE_parse_boot_argn("sweetusbreset", &do_reset, sizeof(do_reset));
+ 	if (fix & 2) {
+ 		do_reset = 1;
+@@ -1271,7 +2031,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		printf("SWEET USB FIX: GUCTL1 0x%08x DCTL 0x%08x GUSB2PHYCFG 0x%08x\n",
+ 		    dwc_rd(0xc11c), dwc_rd(DCTL), dwc_rd(GUSB2PHYCFG_REG));
+ 	}
+-	if (sweet_board_beryllium()) {
++	if (force_20clk) {
+ 		/*
+ 		 * DWC3 >= 2.90a used at high speed only: Linux dwc3_core_init sets
+ 		 * GUCTL1.DEV_FORCE_20_CLK_FOR_30_CLK so the USB3 logic runs from the
+@@ -1282,6 +2042,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		dwc_wr(0xc11c, guctl1 | (1u << 26));
+ 		printf("SWEET USB: GUCTL1 0x%08x -> 0x%08x (force 2.0 clock for 3.0 logic)\n",
+ 		    guctl1, dwc_rd(0xc11c));
++	}
++	if (sweet_board_beryllium()) {
+ 		/* apps_smmu stream 0x740: the first DMA would fault and reset the SoC */
+ 		int se = sweet_smmu_map_sid(0x740);
+ 		printf("SWEET USB: apps_smmu sid 0x740 -> %d\n", se);
+@@ -1341,6 +2103,15 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	swd.lock = lck_mtx_alloc_init(&ud_swd_grp, LCK_ATTR_NULL);
++	if (swd.lock != NULL && kernel_thread_start(swd_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	uint32_t disktest = 0;
++	if (swd.lock != NULL && PE_parse_boot_argn("usbdisktest", &disktest, sizeof(disktest)) && disktest &&
++	    kernel_thread_start(swd_test_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index dd077e085..45bbc82c7 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -183,6 +183,18 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	{
++		/* test only (patch 1036): sweetselfreset=N resets the SoC N seconds after the SMP start whatever
++		 * happens later, so unattended test boots return to Android (and adb) by themselves. */
++		uint32_t selfreset = 0;
++		if (PE_parse_boot_argn("sweetselfreset", &selfreset, sizeof(selfreset)) && selfreset) {
++			kprintf("SWEET CPU: sweetselfreset: PSCI SYSTEM_RESET in %u s\n", selfreset);
++			IOSleep(selfreset * 1000);
++			register uint64_t r0 __asm__("x0") = 0x84000009ULL;
++			__asm__ volatile("smc #0" : "+r"(r0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++			    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		}
++	}
+ 	thread_terminate(current_thread());
+ }
+ 
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 01c820890..15945bae2 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -773,6 +773,26 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		// Moto G6 Plus (patch 1036): no UFS, so nothing else starts the USB driver (boot-arg sweetusb=N)
++		extern void sweet_usb_start_evert(void);
++		sweet_usb_start_evert();
++	}
++//
++//	SWEET: root on a disk image served by the host over USB (bsd/dev/sweet_usb.c, patch 1037)
++//
++	if (strcmp(rdBootVar, "usbroot0") == 0) {
++		extern int sweet_usbdisk_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int usb_error = sweet_usbdisk_rootdev(root);
++		if (usb_error) {
++			panic("IOFindBSDRoot: SWEET USB disk root %s unavailable: %d", rdBootVar, usb_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+ //
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index c303ed78a..ad5e928e9 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -748,6 +748,13 @@ halt_all_cpus(boolean_t reboot)
+ {
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");
++#if defined(SWEET)
++		{
++			/* Moto G6 Plus: PSCI SYSTEM_RESET (bsd/dev/sweet_usb.c); returns on the other boards */
++			extern void sweet_evert_system_reset(void);
++			sweet_evert_system_reset();
++		}
++#endif
+ 		PEHaltRestart(kPERestartCPU);
+ 	} else {
+ 		printf("CPU halted\n");
+@@ -1400,6 +1407,14 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+ 
+ 	this_cpu_datap->cpu_id = in_processor_info->cpu_id;
+ 
++#if defined(SWEET)
++	/*
++	 * patch 1038: the reset vector finds a starting CPU's data by MPIDR == cpu_phys_id, and a fresh
++	 * entry has cpu_phys_id 0 = the real MPIDR of cpu4 on the Moto G6 Plus. Set it before the entry
++	 * becomes visible (cpu_data_register below), not a few lines after.
++	 */
++	this_cpu_datap->cpu_phys_id = in_processor_info->phys_id;
++#endif
+ 	if (!is_boot_cpu) {
+ 		this_cpu_datap->cpu_number = (unsigned short)(in_processor_info->log_id);
+ 
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9c7..fbf07a296 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -143,6 +143,30 @@ pe_init_fiq()
+ 		gicr_size = gicr_size_prop;
+ 	}
+ 
++#if defined(SWEET)
++	/*
++	 * patch 1030: distributor before redistributor, the order Linux (gic_dist_init, then gic_cpu_init) and
++	 * Enxerto's test_gic use. While GICD_CTLR.ARE_NS is 0 the SGI/PPI priority and enable registers of the
++	 * redistributor frame are RAZ/WI (their function is in the legacy GICD_*0 registers).
++	 *   SM7150/SDM845: ARE_NS reads as one, ABL hands over GICD_CTLR 0x10, so the order did not matter.
++	 *   SDM630 (Moto G6 Plus): ARE_NS is programmable and ABL hands over 0x0 (Enxerto: "GICD 0x0 -> 0x12").
++	 *   With the distributor written last, the IPRIORITYR/ISENABLER0 writes below were dropped: neither the
++	 *   virtual timer nor SGI1 was ever forwarded and the boot stopped at the first IOSleep.
++	 * Both enable bits are written because a write that changes ARE is decoded in the format in force before
++	 * it: EnableGrp1 (bit 0) with ARE_NS 0, EnableGrp1A (bit 1) with ARE_NS 1. ABL leaves both clear, which
++	 * the 0 -> 1 change of ARE_NS requires.
++	 */
++	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
++	gicd_write32(GICD_CTLR, gicd_ctlr | GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1);
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++	if (gicd_read32(GICD_CTLR) != gicd_ctlr) {
++		/* boot CPU only: later CPUs find it set */
++		kprintf("SWEET GIC: GICD_CTLR 0x%x -> 0x%x\n", gicd_ctlr, gicd_read32(GICD_CTLR));
++	}
++#endif /* SWEET */
++
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+ 
+@@ -175,7 +199,13 @@ pe_init_fiq()
+ 	for (unsigned int i = 0; i < 32; i += 4) {
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+-	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	const uint32_t gicr_enable = (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI);
++	gicr_write32(GICR_ISENABLER0, gicr_enable);
++	if ((gicr_read32(GICR_ISENABLER0) & gicr_enable) != gicr_enable) {
++		/* What patch 1030 fixes looked like this: the write is silently dropped. Not fatal, but say so. */
++		kprintf("SWEET GIC: redistributor kept ISENABLER0 0x%x, wanted 0x%x (GICD_CTLR 0x%x)\n",
++		    gicr_read32(GICR_ISENABLER0), gicr_enable, gicd_read32(GICD_CTLR));
++	}
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+@@ -204,13 +234,7 @@ pe_init_fiq()
+ 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
+ 
+ #if defined(SWEET)
+-	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
+-	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+-	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
+-	gicd_write32(GICD_CTLR, gicd_ctlr);
+-	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
+-		;
+-	}
++	// The distributor (ARE_NS | EnableGrp1A | EnableGrp1) is enabled before the redistributor, above
+ 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
+ #else
