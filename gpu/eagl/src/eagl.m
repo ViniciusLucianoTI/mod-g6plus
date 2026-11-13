@@ -578,7 +578,26 @@ static void (*o_FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
 static void h_FramebufferRenderbuffer(GLenum a, GLenum b, GLenum c, GLuint d) { o_FramebufferRenderbuffer(a, b, c, d); EAGLContext *x = cur_ctx(); if (x) update_cur_target(x); }
 static void (*o_DeleteFramebuffers)(GLsizei, const GLuint *);
 static void h_DeleteFramebuffers(GLsizei n, const GLuint *f) { o_DeleteFramebuffers(n, f); EAGLContext *x = cur_ctx(); if (x) update_cur_target(x); }
+// Debug: say why a program the render server links does not link (info log + the sources of its shaders).
+static void (*o_LinkProgram)(GLuint);
+static void h_LinkProgram(GLuint prog) {
+    o_LinkProgram(prog);
+    if (!g_debug) return;
+    GLint ok = 1; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (ok) return;
+    static int n; if (n++ >= 6) return;
+    char log[2048] = ""; glGetProgramInfoLog(prog, sizeof log, NULL, log);
+    fprintf(stderr, "EAGL(shim): LINK FAILED program %u: %s\n", prog, log);
+    GLuint sh[4]; GLsizei ns = 0; glGetAttachedShaders(prog, 4, &ns, sh);
+    for (GLsizei i = 0; i < ns; i++) {
+        GLint type = 0, cs = 0, len = 0; glGetShaderiv(sh[i], GL_SHADER_TYPE, &type); glGetShaderiv(sh[i], GL_COMPILE_STATUS, &cs); glGetShaderiv(sh[i], GL_SHADER_SOURCE_LENGTH, &len);
+        char *src = calloc(1, (size_t)len + 1), sl[1024] = ""; glGetShaderSource(sh[i], len + 1, NULL, src); glGetShaderInfoLog(sh[i], sizeof sl, NULL, sl);
+        fprintf(stderr, "---- shader %u type 0x%x compiled %d log: %s\n%s\n----\n", sh[i], type, cs, sl, src);
+        free(src);
+    }
+}
 static const struct { const char *name; void **orig; void *hook; } g_dirty_hooks[] = {
+    { "glLinkProgram", (void **)&o_LinkProgram, h_LinkProgram },
     { "glDrawArrays", (void **)&o_DrawArrays, h_DrawArrays }, { "glDrawElements", (void **)&o_DrawElements, h_DrawElements },
     { "glDrawArraysInstanced", (void **)&o_DrawArraysInstanced, h_DrawArraysInstanced }, { "glDrawElementsInstanced", (void **)&o_DrawElementsInstanced, h_DrawElementsInstanced },
     { "glDrawRangeElements", (void **)&o_DrawRangeElements, h_DrawRangeElements }, { "glClear", (void **)&o_Clear, h_Clear }, { "glClearBufferfv", (void **)&o_ClearBufferfv, h_ClearBufferfv },
