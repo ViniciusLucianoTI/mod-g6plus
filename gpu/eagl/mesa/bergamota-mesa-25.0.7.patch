@@ -125,6 +125,115 @@ index 29e1bc4..e3d4279 100644
    subdir('computerator')
  endif
  
+diff --git a/src/gallium/drivers/freedreno/a5xx/fd5_blitter.c b/src/gallium/drivers/freedreno/a5xx/fd5_blitter.c
+index 6a3b092..7beeb9c 100644
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_blitter.c
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_blitter.c
+@@ -133,7 +133,7 @@ can_do_blit(const struct pipe_blit_info *info)
+ }
+ 
+ static void
+-emit_setup(struct fd_ringbuffer *ring)
++emit_setup(struct fd_ringbuffer *ring, struct fd_screen *screen)
+ {
+    OUT_PKT4(ring, REG_A5XX_RB_RENDER_CNTL, 1);
+    OUT_RING(ring, 0x00000008);
+@@ -151,13 +151,13 @@ emit_setup(struct fd_ringbuffer *ring)
+    OUT_RING(ring, A5XX_RB_CNTL_BYPASS);
+ 
+    OUT_PKT4(ring, REG_A5XX_RB_MODE_CNTL, 1);
+-   OUT_RING(ring, 0x00000004); /* RB_MODE_CNTL */
++   OUT_RING(ring, fd5_hbb_field(screen) << 1); /* RB_MODE_CNTL: highest bank bit of this GPU (Bergamota, see fd5_emit.h) */
+ 
+    OUT_PKT4(ring, REG_A5XX_SP_MODE_CNTL, 1);
+    OUT_RING(ring, 0x0000000c); /* SP_MODE_CNTL */
+ 
+    OUT_PKT4(ring, REG_A5XX_TPL1_MODE_CNTL, 1);
+-   OUT_RING(ring, 0x00000344); /* TPL1_MODE_CNTL */
++   OUT_RING(ring, 0x00000244 | (fd5_hbb_field(screen) << 7)); /* TPL1_MODE_CNTL */
+ 
+    OUT_PKT4(ring, REG_A5XX_HLSQ_MODE_CNTL, 1);
+    OUT_RING(ring, 0x00000002); /* HLSQ_MODE_CNTL */
+@@ -428,7 +428,7 @@ fd5_blitter_blit(struct fd_context *ctx,
+ 
+    fd_batch_update_queries(batch);
+ 
+-   emit_setup(batch->draw);
++   emit_setup(batch->draw, ctx->screen);
+ 
+    if ((info->src.resource->target == PIPE_BUFFER) &&
+        (info->dst.resource->target == PIPE_BUFFER)) {
+diff --git a/src/gallium/drivers/freedreno/a5xx/fd5_emit.c b/src/gallium/drivers/freedreno/a5xx/fd5_emit.c
+index 8137297..4906a39 100644
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_emit.c
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_emit.c
+@@ -6,6 +6,7 @@
+  *    Rob Clark <robclark@freedesktop.org>
+  */
+ 
++#include <stdlib.h>
+ #include "pipe/p_state.h"
+ #include "util/format/u_format.h"
+ #include "util/u_helpers.h"
+@@ -949,11 +950,18 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
+    OUT_RING(ring, 0x00000000); /* UNKNOWN_E292 */
+    OUT_RING(ring, 0x00000000); /* UNKNOWN_E293 */
+ 
++   /* Bergamota: the two MODE_CNTL values of this restore list are an A530 capture and carry ITS highest bank bit
++    * (15 -> field 2). The A505/506/508 have 14 (freedreno_devices.py, and the kernel programs field 1). FD5_HBB=N
++    * overrides the field for experiments. */
+    OUT_PKT4(ring, REG_A5XX_RB_MODE_CNTL, 1);
+-   OUT_RING(ring, 0x00000044); /* RB_MODE_CNTL */
++   OUT_RING(ring, 0x00000040 | (fd5_hbb_field(batch->ctx->screen) << 1)); /* RB_MODE_CNTL */
+ 
++   /* Bergamota (Adreno 508 on the Moto G6 Plus): bit 9 disables the RB sampler datapath (DP2) clock gating optimisation.
++    * The kernel sets it for the single-SP parts (Linux a5xx_hw_init: A506/A508/A509/A512; the stock DT's
++    * qcom,gpu-quirk-dp2clockgating-disable), and this restore value, an A530 capture, cleared it again: every draw that
++    * samples a texture then wrote 64x4-pixel blocks of noise for part of the target. */
+    OUT_PKT4(ring, REG_A5XX_RB_DBG_ECO_CNTL, 1);
+-   OUT_RING(ring, 0x00100000); /* RB_DBG_ECO_CNTL */
++   OUT_RING(ring, 0x00100000 | (getenv("FD5_NO_DP2_FIX") ? 0 : (1 << 9))); /* RB_DBG_ECO_CNTL */
+ 
+    OUT_PKT4(ring, REG_A5XX_VFD_MODE_CNTL, 1);
+    OUT_RING(ring, 0x00000000); /* VFD_MODE_CNTL */
+@@ -979,7 +987,7 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
+    }
+ 
+    OUT_PKT4(ring, REG_A5XX_TPL1_MODE_CNTL, 1);
+-   OUT_RING(ring, 0x00000544); /* TPL1_MODE_CNTL */
++   OUT_RING(ring, 0x00000444 | (fd5_hbb_field(batch->ctx->screen) << 7)); /* TPL1_MODE_CNTL */
+ 
+    OUT_PKT4(ring, REG_A5XX_HLSQ_TIMEOUT_THRESHOLD_0, 2);
+    OUT_RING(ring, 0x00000080); /* HLSQ_TIMEOUT_THRESHOLD_0 */
+diff --git a/src/gallium/drivers/freedreno/a5xx/fd5_emit.h b/src/gallium/drivers/freedreno/a5xx/fd5_emit.h
+index 2c40d46..4e697c0 100644
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_emit.h
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_emit.h
+@@ -9,12 +9,24 @@
+ #ifndef FD5_EMIT_H
+ #define FD5_EMIT_H
+ 
++#include <stdlib.h>
+ #include "pipe/p_context.h"
+ 
+ #include "fd5_context.h"
+ #include "fd5_format.h"
+ #include "fd5_program.h"
+ #include "fd5_screen.h"
++
++/* Bergamota: MODE_CNTL highest-bank-bit field (bit number - 13): 2 on the A530/A540, 1 on the A505/506/508. */
++static inline uint32_t
++fd5_hbb_field(struct fd_screen *screen)
++{
++   const char *e = getenv("FD5_HBB");
++   if (e)
++      return (uint32_t)atoi(e) & 3;
++   uint32_t hbb = screen->info->highest_bank_bit;
++   return (hbb >= 13 && hbb <= 16) ? hbb - 13 : 2;
++}
+ #include "freedreno_batch.h"
+ #include "freedreno_context.h"
+ #include "ir3_gallium.h"
 diff --git a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
 index e41699a..bc326aa 100644
 --- a/src/gallium/drivers/freedreno/freedreno_screen.c

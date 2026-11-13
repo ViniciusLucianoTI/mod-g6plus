@@ -84,6 +84,72 @@ main(int argc, char **argv)
 		CHECK(good == w * h, "source texture by glReadPixels: %d of %d pixels are pure red/green/blue", good, w * h);
 		free(all);
 	}
+	{       /*
+		 * Sampling alone, no IOSurface and no rendered source: a texture uploaded from the CPU (four colour
+		 * quadrants), drawn as a full-screen quad into a second FBO texture, read back whole.
+		 */
+		static const char *vs = "attribute vec2 p; varying vec2 t; void main() { t = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }";
+		static const char *fs = "precision mediump float; varying vec2 t; uniform sampler2D s; void main() { gl_FragColor = texture2D(s, t); }";
+		GLuint sh[2], prog = glCreateProgram(), tex2, tex3, fbo2;
+		for (int i = 0; i < 2; i++) {
+			sh[i] = glCreateShader(i ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+			glShaderSource(sh[i], 1, i ? &fs : &vs, NULL);
+			glCompileShader(sh[i]);
+			glAttachShader(prog, sh[i]);
+		}
+		glBindAttribLocation(prog, 0, "p");
+		glLinkProgram(prog);
+		unsigned char *img = malloc((size_t)w * h * 4), *out = malloc((size_t)w * h * 4);
+		for (int y = 0; y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				unsigned char *p = img + 4 * ((size_t)y * w + x);
+				p[0] = x < w / 2 ? 255 : 0; p[1] = y < h / 2 ? 255 : 0; p[2] = (x < w / 2) == (y < h / 2) ? 0 : 255; p[3] = 255;
+			}
+		}
+		glGenTextures(1, &tex2);
+		glBindTexture(GL_TEXTURE_2D, tex2);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+		glGenTextures(1, &tex3);
+		glBindTexture(GL_TEXTURE_2D, tex3);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glGenFramebuffers(1, &fbo2);
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo2);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex3, 0);
+		glViewport(0, 0, w, h);
+		glClearColor(0.5f, 0.5f, 0.5f, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glUseProgram(prog);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, tex2);
+		glUniform1i(glGetUniformLocation(prog, "s"), 0);
+		static const GLfloat quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+		glEnableVertexAttribArray(0);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+		int same = 0;
+		for (int i = 0; i < w * h; i++) {
+			same += !memcmp(img + 4 * i, out + 4 * i, 3);
+		}
+		CHECK(same == w * h, "textured quad from a CPU-uploaded texture: %d of %d pixels equal the texture (GL error %#x)", same, w * h, glGetError());
+		{
+			FILE *fp = fopen("/tmp/blit-quad.ppm", "wb");
+			if (fp) {
+				fprintf(fp, "P6\n%d %d\n255\n", w, h);
+				for (int i = 0; i < w * h; i++) {
+					fwrite(out + 4 * i, 1, 3, fp);
+				}
+				fclose(fp);
+			}
+		}
+		glDisableVertexAttribArray(0);
+		glUseProgram(0);
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		free(img);
+		free(out);
+	}
 	for (int flip = 0; flip <= 1; flip++) {
 		IOSurfaceRef s = make_surface(w, h);
 		if (!s) {
