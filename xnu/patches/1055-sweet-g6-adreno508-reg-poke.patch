@@ -1,0 +1,51 @@
+From 613e82f4190f1cad9f918fa0c2c23a98fe08ebeb Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Fri, 13 Nov 2026 01:19:38 -0300
+Subject: [PATCH] sweet g6: GPU register peek/poke through the debug selector
+ (sweetgpupoke=1)
+
+---
+ bsd/dev/sweet_a508.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index bd48f770f..d52dddf20 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -1176,7 +1176,33 @@ sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned co
+ void
+ sweet_gpu_debug(uint32_t *w)
+ {
++	/*
++	 * Bring-up aid, only with boot-arg sweetgpupoke=1: the caller's input words 36..39 can ask for one GPU
++	 * register read or write (w[39] = 'PEEK' / 'POKE', w[36] = register index, w[37] = value). The answer
++	 * is in w[37], with w[39] = 'DONE'. gpu/kernel-test/gpureg.c. The interface is root's and single-tenant
++	 * as it is; this lets a hypothesis about a register be tried without a kernel build and a boot.
++	 */
++	static int poke = -1;
++	uint32_t op = w[39], reg = w[36], val = w[37], out = 0;
++	bool did = false;
++	if (poke < 0) {
++		uint32_t v = 0;
++		PE_parse_boot_argn("sweetgpupoke", &v, sizeof(v));
++		poke = v != 0;
++	}
++	if (poke && a5.gpu && a5dev.ready && reg < 0x10000 && (op == 0x5045454bu || op == 0x504f4b45u)) {
++		if (op == 0x504f4b45u) {
++			gw(reg, val);
++		}
++		out = gr(reg);
++		did = true;
++	}
+ 	bzero(w, 40 * sizeof(uint32_t));
++	if (did) {
++		w[36] = reg;
++		w[37] = out;
++		w[39] = 0x444f4e45u;
++	}
+ 	if (!a5.cc || !a5.gpu) {
+ 		return;
+ 	}
+-- 
+2.56.0
+

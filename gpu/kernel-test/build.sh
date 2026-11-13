@@ -12,6 +12,8 @@ if [ "${TARGET:-}" = ios16-arm64 ]; then
 	    "$HERE/adreno_uc_test.c" -o "$OUT/adreno_uc_test" -framework IOKit -framework CoreFoundation -framework IOSurface
 	codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$OUT/adreno_uc_test"
 	ls -l "$OUT/adreno_uc_test"
+	xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" -O1 -Wall -Wextra "$HERE/gpureg.c" -o "$OUT/gpureg" -framework IOKit -framework CoreFoundation
+	codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$OUT/gpureg"
 	# With a Mesa build (ARCH=arm64 MINOS=16.0 GPU_EAGL_WORK=DIR gpu/eagl/mesa/build-mesa.sh): osmesa_tri and the two
 	# libraries it needs, side by side in $OUT/mesa16 (copy the directory to the phone, e.g. /usr/local/mesa16).
 	if [ -n "${GPU_EAGL_WORK:-}" ] && [ -f "$GPU_EAGL_WORK/build-hw/src/gallium/targets/osmesa/libOSMesa.8.dylib" ]; then
