@@ -1,0 +1,641 @@
+From 608e7c95b678d082976dab98045fe53f1c4bb5d2 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Fri, 13 Nov 2026 00:25:32 -0300
+Subject: [PATCH] sweet g6: SweetAdreno user client up to 11215 0187 (driver
+ lock, epoch, IOSurface import: SURFACE_BO, abi minor 1)
+
+---
+ bsd/dev/sweet_a508.c              |  29 ++++
+ iokit/Kernel/arm/SweetAdreno.cpp  | 224 +++++++++++++++++++++++-------
+ iokit/Kernel/arm/SweetAdrenoABI.h |  24 +++-
+ 3 files changed, 225 insertions(+), 52 deletions(-)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index 96a77cf20..7aad3666e 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -29,6 +29,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include "sweet_board.h"
+@@ -699,6 +700,34 @@ uint32_t sweet_gpu_fence_last(void);
+ void sweet_gpu_mark_lost(void);
+ void sweet_gpu_report(const char *why);
+ void sweet_gpu_debug(uint32_t *w);
++void sweet_gpu_lock(void);
++void sweet_gpu_unlock(void);
++uint32_t sweet_gpu_epoch(void);
++
++/*
++ * The driver's lock (SweetAdreno.cpp takes it around every call since 11215's 0186; there it also serializes the
++ * power governor and recovery, which do not exist here yet) and the recovery epoch (never changes: no recovery).
++ */
++static LCK_GRP_DECLARE(a5_lck_grp, "sweet_a508");
++static LCK_MTX_DECLARE(a5_lck, &a5_lck_grp);
++
++void
++sweet_gpu_lock(void)
++{
++	lck_mtx_lock(&a5_lck);
++}
++
++void
++sweet_gpu_unlock(void)
++{
++	lck_mtx_unlock(&a5_lck);
++}
++
++uint32_t
++sweet_gpu_epoch(void)
++{
++	return 1;
++}
+ 
+ static void
+ a5_pte_wr(volatile uint64_t *slot, uint64_t v)
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index b869464a8..94334b76d 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -48,6 +48,9 @@ void sweet_gpu_iova_free(uint64_t iova, uint64_t size);
+ bool sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly);
+ void sweet_gpu_vm_unmap(uint64_t iova, uint64_t size);
+ void sweet_gpu_vm_flush(void);
++void sweet_gpu_lock(void);
++void sweet_gpu_unlock(void);
++uint32_t sweet_gpu_epoch(void);
+ bool sweet_gpu_check_fault(void);
+ void sweet_gpu_cache_sync(void *va, size_t len);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
+@@ -70,8 +73,11 @@ void SweetAdrenoPublish(void);
+ #define IOVA_UNSET              0
+ #define GPU_PAGE                0x1000ull       /* SMMU granule; never PAGE_SIZE (16 KiB) */
+ 
+-static IOLock *gAdrenoLock;
+-static uint32_t gAdrenoClients;
++static IOLock *gClientsLock;           /* only the pid list below; the device lock is sweet_gpu_lock() */
++static struct {
++	int32_t pid;
++	uint32_t count;
++} gClientPids[32];
+ 
+ struct sweet_gem {
+ 	IOMemoryDescriptor       *md;           /* NULL: free slot */
+@@ -97,6 +103,7 @@ class SweetAdrenoUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(SweetAdrenoUserClient);
+ 
+ 	task_t            fTask;
++	int32_t           fPid;
+ 	struct sweet_gem *fGems;
+ 	uint32_t          fNextGem;
+ 	uint64_t          fQueues;      /* bit n = submitqueue id n open (id 0 = default, always) */
+@@ -141,6 +148,34 @@ OSDefineMetaClassAndStructors(AGXDeviceUserClient, SweetAdrenoUserClient);
+ 
+ /* ------------------------------------------------------------------ */
+ 
++/* "pid,pid" of the open clients (with a trailing "+" when the list is cut) and their number; for kern.sweet_gpu. */
++extern "C" void
++SweetAdrenoClients(char *buf, size_t size, uint32_t *count)
++{
++	size_t n = 0;
++
++	buf[0] = 0;
++	*count = 0;
++	if (gClientsLock == NULL) {
++		strlcpy(buf, "-", size);
++		return;
++	}
++	IOLockLock(gClientsLock);
++	for (unsigned i = 0; i < 32; i++) {
++		if (gClientPids[i].count) {
++			*count += gClientPids[i].count;
++			int w = snprintf(buf + n, size - n, "%s%d", n ? "," : "", gClientPids[i].pid);
++			if (w > 0 && n + (size_t)w < size) {
++				n += (size_t)w;
++			}
++		}
++	}
++	IOLockUnlock(gClientsLock);
++	if (n == 0) {
++		strlcpy(buf, "-", size);
++	}
++}
++
+ extern "C" void
+ SweetAdrenoPublish(void)
+ {
+@@ -149,10 +184,10 @@ SweetAdrenoPublish(void)
+ 	if (!sweet_gpu_ready()) {
+ 		return;
+ 	}
+-	if (gAdrenoLock == NULL) {
+-		gAdrenoLock = IOLockAlloc();
++	if (gClientsLock == NULL) {
++		gClientsLock = IOLockAlloc();
+ 	}
+-	if (gAdrenoLock == NULL) {
++	if (gClientsLock == NULL) {
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("sweetgpuuc", &agx, sizeof(agx));
+@@ -184,10 +219,28 @@ SweetAdrenoUserClient::initWithTask(task_t owningTask, void *securityID, UInt32
+ 	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
+ 		return false;
+ 	}
+-	if (!sweet_gpu_ready() || gAdrenoLock == NULL) {
++	if (!sweet_gpu_ready() || gClientsLock == NULL) {
+ 		return false;
+ 	}
+ 	fTask = owningTask;
++	fPid = proc_selfpid();
++	IOLockLock(gClientsLock);
++	int slot = -1;
++	for (int i = 0; i < 32 && slot < 0; i++) {
++		if (gClientPids[i].count && gClientPids[i].pid == fPid) {
++			slot = i;
++		}
++	}
++	for (int i = 0; i < 32 && slot < 0; i++) {
++		if (!gClientPids[i].count) {
++			slot = i;
++			gClientPids[i].pid = fPid;
++		}
++	}
++	if (slot >= 0) {
++		gClientPids[slot].count++;
++	}
++	IOLockUnlock(gClientsLock);
+ 	fGems = (struct sweet_gem *)IOMallocZeroData(sizeof(struct sweet_gem) * GEM_MAX);
+ 	return fGems != NULL;
+ }
+@@ -205,9 +258,17 @@ SweetAdrenoUserClient::free()
+ IOReturn
+ SweetAdrenoUserClient::clientClose(void)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	if (!fClosed) {
+ 		fClosed = true;
++		IOLockLock(gClientsLock);
++		for (unsigned i = 0; i < 32; i++) {
++			if (gClientPids[i].count && gClientPids[i].pid == fPid) {
++				gClientPids[i].count--;
++				break;
++			}
++		}
++		IOLockUnlock(gClientsLock);
+ 		if (fGems != NULL) {
+ 			for (uint32_t i = 0; i < GEM_MAX; i++) {
+ 				if (fGems[i].md != NULL) {
+@@ -216,7 +277,7 @@ SweetAdrenoUserClient::clientClose(void)
+ 			}
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -263,6 +324,7 @@ bool
+ SweetAdrenoUserClient::waitFence(uint32_t fence, uint64_t ns)
+ {
+ 	uint64_t began = mach_absolute_time(), limit, cap, early;
++	uint32_t epoch = sweet_gpu_epoch();
+ 
+ 	if (fence == 0 || sweet_gpu_fence_done(fence)) {
+ 		return true;
+@@ -278,6 +340,9 @@ SweetAdrenoUserClient::waitFence(uint32_t fence, uint64_t ns)
+ 		if (sweet_gpu_fence_done(fence)) {
+ 			return true;
+ 		}
++		if (epoch != sweet_gpu_epoch()) {
++			return false;                   /* the GPU was reset under this wait: the work is void */
++		}
+ 		if (sweet_gpu_check_fault() || !sweet_gpu_ready()) {
+ 			return false;                   /* the CP faulted: fail now instead of waiting for the timeout */
+ 		}
+@@ -292,13 +357,13 @@ SweetAdrenoUserClient::waitFence(uint32_t fence, uint64_t ns)
+ 			}
+ 			return false;
+ 		}
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		if (waited < early) {           /* short jobs: spin; longer ones: sleep a millisecond at a time */
+ 			delay_for_interval(100, NSEC_PER_USEC);
+ 		} else {
+ 			IOSleep(1);
+ 		}
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 	}
+ }
+ 
+@@ -399,7 +464,7 @@ SweetAdrenoUserClient::gemNew(struct sweet_msm_gem_new *r)
+ 	bzero(kva, (size_t)size);
+ 	sweet_gpu_cache_sync(kva, (size_t)size);
+ 
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	IOReturn ret = kIOReturnNoResources;
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+@@ -423,7 +488,7 @@ SweetAdrenoUserClient::gemNew(struct sweet_msm_gem_new *r)
+ 			}
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	if (ret != kIOReturnSuccess) {
+ 		buf->release();
+ 	}
+@@ -433,7 +498,7 @@ SweetAdrenoUserClient::gemNew(struct sweet_msm_gem_new *r)
+ IOReturn
+ SweetAdrenoUserClient::gemInfo(struct sweet_msm_gem_info *r)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	struct sweet_gem *g = gem(r->handle);
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+@@ -484,14 +549,14 @@ SweetAdrenoUserClient::gemInfo(struct sweet_msm_gem_info *r)
+ 			break;
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+ IOReturn
+ SweetAdrenoUserClient::cpuPrep(struct sweet_msm_gem_cpu_prep *r)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	struct sweet_gem *g = gem(r->handle);
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+@@ -510,7 +575,7 @@ SweetAdrenoUserClient::cpuPrep(struct sweet_msm_gem_cpu_prep *r)
+ 			ret = kIOReturnBusy;
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+@@ -576,7 +641,7 @@ SweetAdrenoUserClient::submit(struct sweet_msm_gem_submit *r)
+ 		}
+ 	}
+ 
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+ 		goto unlock;
+@@ -646,7 +711,7 @@ SweetAdrenoUserClient::submit(struct sweet_msm_gem_submit *r)
+ 		ret = kIOReturnSuccess;
+ 	}
+ unlock:
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ out:
+ 	if (bos != NULL) {
+ 		IOFreeData(bos, bosSize);
+@@ -666,7 +731,7 @@ out:
+ IOReturn
+ SweetAdrenoUserClient::waitFenceCall(struct sweet_msm_wait_fence *r)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	IOReturn ret;
+ 
+ 	if (r->queueid >= QUEUE_IDS || (r->queueid != 0 && !(fQueues & (1ull << r->queueid)))) {
+@@ -676,9 +741,11 @@ SweetAdrenoUserClient::waitFenceCall(struct sweet_msm_wait_fence *r)
+ 	} else {
+ 		uint64_t ns = (r->timeout.tv_sec < 0 || r->timeout.tv_nsec < 0) ? 0 :
+ 		    (uint64_t)r->timeout.tv_sec * NSEC_PER_SEC + (uint64_t)r->timeout.tv_nsec;
+-		ret = waitFence(r->fence, ns) ? kIOReturnSuccess : (sweet_gpu_ready() ? kIOReturnTimeout : kIOReturnIOError);
++		uint32_t epoch = sweet_gpu_epoch();
++		ret = waitFence(r->fence, ns) && epoch == sweet_gpu_epoch() ? kIOReturnSuccess :
++		    ((sweet_gpu_ready() && epoch == sweet_gpu_epoch()) ? kIOReturnTimeout : kIOReturnIOError);
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+@@ -691,13 +758,47 @@ SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+-	if (s->memory == NULL || s->wrapped) {
++	if (s->memory == NULL) {
+ 		s->release();
+-		return kIOReturnUnsupported;       /* wrapped client memory is pageable: never entered into the GPU */
++		return kIOReturnUnsupported;
+ 	}
++	/*
++	 * Client-memory (wrapped) surfaces: the memory is another task's, wired by IOMemoryDescriptor::prepare() for as long
++	 * as the SweetSurface lives (sweet_surface_use_task_memory); this BO holds a reference to the surface, so the pages
++	 * stay wired until GEM_CLOSE / connection close, whichever the owner does. The pixels start `wrapDelta` bytes into the
++	 * first page. Such pages are entered READ-ONLY into the GPU: if the owner dies its address space is torn down and
++	 * wired pages are freed, and a GPU that could still write them would corrupt whatever the page becomes. The CPU maps
++	 * them cacheable: BO_SYNC (or SBO_IN_SYNC) after CPU writes.
++	 */
++	const bool wrapped = s->wrapped;
+ 	uint64_t size = round_page_64(s->memory->getLength());
+ 	r->size = size;
+-	r->offset = s->offset;
++	r->offset = s->offset + (wrapped ? s->wrapDelta : 0);
++	r->tiling = 0;
++	r->ubwc = 0;
++	{
++		uint32_t f = 0;
++		if (wrapped) {
++			f |= SWEET_GPU_SBO_READONLY | SWEET_GPU_SBO_CPU_CACHEABLE | SWEET_GPU_SBO_WRAPPED;
++		} else if (s->pooled && sweet_lowpool_cacheable()) {
++			f |= SWEET_GPU_SBO_CPU_CACHEABLE;
++		}
++		r->flags = (r->flags & SWEET_GPU_SBO_IN_SYNC) | f;      /* keep the input bit for below */
++	}
++	bzero(r->plane, sizeof(r->plane));
++	if (s->planeCount == 0) {
++		r->plane[0].offset = r->offset;
++		r->plane[0].stride = s->bytesPerRow;
++		r->plane[0].width = s->width;
++		r->plane[0].height = s->height;
++	} else {
++		for (uint32_t i = 0; i < s->planeCount && i < 3; i++) {
++			r->plane[i].offset = s->planes[i].offset + (wrapped ? s->wrapDelta : 0);
++			r->plane[i].stride = s->planes[i].bytesPerRow;
++			r->plane[i].width = s->planes[i].width;
++			r->plane[i].height = s->planes[i].height;
++		}
++	}
+ 	r->bytes_per_row = s->bytesPerRow;
+ 	r->width = s->width;
+ 	r->height = s->height;
+@@ -713,11 +814,26 @@ SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
+ 		s->release();
+ 		return kIOReturnBadArgument;
+ 	}
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	ret = kIOReturnNoResources;
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+ 	} else {
++		/* Idempotent: the same surface in the same connection is the same BO (one mapping per surface, not per frame). */
++		for (uint32_t i = 0; i < GEM_MAX; i++) {
++			if (fGems[i].md != NULL && fGems[i].surface == s) {
++				r->handle = i + 1;
++				r->iova = fGems[i].iova;
++				r->flags |= SWEET_GPU_SBO_EXISTING;
++				if ((r->flags & SWEET_GPU_SBO_IN_SYNC) && fGems[i].kva != NULL) {
++					sweet_gpu_cache_sync(fGems[i].kva, (size_t)fGems[i].size);
++				}
++				r->flags &= ~(uint32_t)SWEET_GPU_SBO_IN_SYNC;
++				sweet_gpu_unlock();
++				s->release();
++				return kIOReturnSuccess;
++			}
++		}
+ 		for (uint32_t n = 0; n < GEM_MAX; n++) {
+ 			uint32_t i = (fNextGem + n) % GEM_MAX;
+ 			if (fGems[i].md == NULL) {
+@@ -726,22 +842,27 @@ SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
+ 				s->memory->retain();
+ 				g->md = s->memory;
+ 				g->surface = s;         /* our reference moves into the slot on success */
+-				g->kva = (uint8_t *)s->kernelAddress();
++				uintptr_t ka = s->kernelAddress();      /* of the first pixel (+wrapDelta): the BO starts at the page */
++				g->kva = ka != 0 ? (uint8_t *)(ka - (wrapped ? s->wrapDelta : 0)) : NULL;
+ 				g->size = size;
+-				ret = mapGem(g, 0, &r->handle, 0);
++				ret = mapGem(g, wrapped ? SWEET_MSM_BO_GPU_READONLY : 0, &r->handle, 0);
+ 				if (ret != kIOReturnSuccess) {
+ 					g->md->release();
+ 					bzero(g, sizeof(*g));
+ 				} else {
+ 					fNextGem = i + 1;
+ 					r->iova = g->iova;
++					if ((r->flags & SWEET_GPU_SBO_IN_SYNC) && g->kva != NULL) {
++						sweet_gpu_cache_sync(g->kva, (size_t)g->size);
++					}
++					r->flags &= ~(uint32_t)SWEET_GPU_SBO_IN_SYNC;
+ 					s = NULL;
+ 				}
+ 				break;
+ 			}
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	if (s != NULL) {
+ 		s->release();
+ 	}
+@@ -751,7 +872,7 @@ SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
+ IOReturn
+ SweetAdrenoUserClient::boSync(struct sweet_gpu_bo_sync *r)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	struct sweet_gem *g = gem(r->handle);
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+@@ -766,7 +887,7 @@ SweetAdrenoUserClient::boSync(struct sweet_gpu_bo_sync *r)
+ 			ret = kIOReturnSuccess;
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+@@ -775,7 +896,7 @@ SweetAdrenoUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, I
+ {
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	struct sweet_gem *g = gem(type);
+ 	if (g != NULL) {
+ 		g->md->retain();
+@@ -783,7 +904,7 @@ SweetAdrenoUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, I
+ 		*options = 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+@@ -842,9 +963,9 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 	switch (selector) {
+ 	case SWEET_GPU_SEL_GET_PARAM:
+ 		NEED(struct sweet_msm_param);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		ret = sweet_gpu_param(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnUnsupported;
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		outLen = sizeof(r.param);
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_NEW:
+@@ -863,9 +984,9 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_CPU_FINI:
+ 		NEED(struct sweet_msm_gem_cpu_fini);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		ret = gem(r.cpuFini.handle) != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		__asm__ volatile ("dsb sy" ::: "memory");       /* CPU stores through the WC mapping reach memory */
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_SUBMIT:
+@@ -879,15 +1000,15 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_MADVISE:
+ 		NEED(struct sweet_msm_gem_madvise);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		ret = gem(r.madvise.handle) != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		r.madvise.retained = 1;
+ 		outLen = sizeof(r.madvise);
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_CLOSE:
+ 		NEED(struct sweet_gem_close);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		{
+ 			struct sweet_gem *g = gem(r.close.handle);
+ 			if (g == NULL) {
+@@ -896,11 +1017,11 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 				releaseGem(g);
+ 			}
+ 		}
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		break;
+ 	case SWEET_GPU_SEL_SUBMITQUEUE_NEW:
+ 		NEED(struct sweet_msm_submitqueue);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		ret = kIOReturnNoResources;
+ 		if (r.queue.prio != 0 || r.queue.flags != 0) {
+ 			ret = kIOReturnBadArgument;
+@@ -914,22 +1035,22 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 				}
+ 			}
+ 		}
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		outLen = sizeof(r.queue);
+ 		break;
+ 	case SWEET_GPU_SEL_SUBMITQUEUE_CLOSE:
+ 		NEED(uint32_t);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		if (r.queueId == 0 || r.queueId >= QUEUE_IDS || !(fQueues & (1ull << r.queueId))) {
+ 			ret = kIOReturnBadArgument;
+ 		} else {
+ 			fQueues &= ~(1ull << r.queueId);
+ 		}
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		break;
+ 	case SWEET_GPU_SEL_INFO: {
+ 		uint64_t v = 0;
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		r.info.abi_version = SWEET_GPU_ABI_VERSION;
+ 		r.info.flags = sweet_gpu_ready() ? 1u : 2u;
+ 		r.info.gpu_id = 630;
+@@ -941,19 +1062,22 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		r.info.va_start = sweet_gpu_param(SWEET_MSM_PARAM_VA_START, &v) ? v : 0;
+ 		r.info.va_size = sweet_gpu_param(SWEET_MSM_PARAM_VA_SIZE, &v) ? v : 0;
+ 		r.info.last_fence = sweet_gpu_ready() ? sweet_gpu_fence_last() : 0;
+-		IOLockUnlock(gAdrenoLock);
++		r.info.abi_minor = 1;
++		sweet_gpu_unlock();
+ 		outLen = sizeof(r.info);
+ 		break;
+ 	}
+ 	case SWEET_GPU_SEL_SURFACE_BO:
+-		NEED(struct sweet_gpu_surface_bo);
++		if (in < SWEET_GPU_SURFACE_BO_V1_SIZE) {
++			return kIOReturnBadArgument;
++		}
+ 		ret = surfaceBo(&r.surface);
+-		outLen = sizeof(r.surface);
++		outLen = args->structureOutputSize >= sizeof(r.surface) ? (uint32_t)sizeof(r.surface) : SWEET_GPU_SURFACE_BO_V1_SIZE;
+ 		break;
+ 	case SWEET_GPU_SEL_DEBUG:
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		sweet_gpu_debug(r.debug.w);
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		outLen = sizeof(r.debug);
+ 		break;
+ 	case SWEET_GPU_SEL_BO_SYNC:
+diff --git a/iokit/Kernel/arm/SweetAdrenoABI.h b/iokit/Kernel/arm/SweetAdrenoABI.h
+index 68fe41a67..a7ae2f7f5 100644
+--- a/iokit/Kernel/arm/SweetAdrenoABI.h
++++ b/iokit/Kernel/arm/SweetAdrenoABI.h
+@@ -166,16 +166,30 @@ struct sweet_gpu_info {
+ 	uint64_t va_start;      /* GPU address range the kernel places BOs in */
+ 	uint64_t va_size;
+ 	uint32_t last_fence;    /* last submitted sequence number */
+-	uint32_t reserved;
++	uint32_t abi_minor;     /* 1: SURFACE_BO accepts client-memory surfaces (read-only mappings), is idempotent, returns planes */
+ };
+ 
+ /* IOSurface memory as a BO: the pages of the surface (pixels from byte 0 of its memory) are entered into the
+  * GPU address space. On input handle = SWEET_GPU_DESCRIBE_ONLY asks only for the geometry (no BO is made). */
+ #define SWEET_GPU_DESCRIBE_ONLY         0xffffffffu
++/* Minor 1 (INFO.abi_minor >= 1) added everything after `planes`; a caller may pass/accept only the first
++ * SWEET_GPU_SURFACE_BO_V1_SIZE bytes (minor 0 layout). */
++#define SWEET_GPU_SURFACE_BO_V1_SIZE    48
++#define SWEET_GPU_SBO_IN_SYNC           0x1     /* in flags: clean+invalidate the CPU alias of the whole BO before returning */
++#define SWEET_GPU_SBO_READONLY          0x1     /* out flags: GPU mapping is read-only (client-memory surface) */
++#define SWEET_GPU_SBO_CPU_CACHEABLE     0x2     /* out: the CPU maps it cacheable: BO_SYNC after CPU writes / before CPU reads */
++#define SWEET_GPU_SBO_WRAPPED           0x4     /* out: the surface is client (another process') memory, pinned */
++#define SWEET_GPU_SBO_EXISTING          0x8     /* out: this surface already had a BO for this connection: same handle returned */
++struct sweet_gpu_surface_plane {
++	uint32_t offset;        /* byte offset of the plane in the BO (includes the client-memory start delta) */
++	uint32_t stride;        /* bytes per row of the plane */
++	uint32_t width;
++	uint32_t height;
++};
+ struct sweet_gpu_surface_bo {
+ 	uint32_t surface_id;    /* in: IOSurfaceGetID() */
+ 	uint32_t handle;        /* in: DESCRIBE_ONLY or 0; out: BO handle (0 when describing) */
+-	uint64_t size;          /* out: bytes mapped (whole pages) */
++	uint64_t size;          /* out: bytes mapped (whole 4 KiB pages) */
+ 	uint64_t iova;          /* out: GPU address of byte 0 of the surface memory (0 when describing) */
+ 	uint32_t offset;        /* out: byte offset of pixel (0,0) in the BO */
+ 	uint32_t bytes_per_row;
+@@ -183,6 +197,12 @@ struct sweet_gpu_surface_bo {
+ 	uint32_t height;
+ 	uint32_t pixel_format;
+ 	uint32_t planes;
++	/* ---- minor 1 ---- */
++	uint32_t flags;         /* in: SWEET_GPU_SBO_IN_*; out: SWEET_GPU_SBO_* */
++	uint32_t tiling;        /* out: 0 = linear (IOSurfaces here are never tiled) */
++	uint32_t ubwc;          /* out: 0 = no UBWC (IOSurfaces here are never compressed) */
++	uint32_t reserved;
++	struct sweet_gpu_surface_plane plane[3];        /* out: first three planes (planes == 0: plane 0 describes the surface) */
+ };
+ 
+ struct sweet_gpu_bo_sync {
+-- 
+2.56.0
+
