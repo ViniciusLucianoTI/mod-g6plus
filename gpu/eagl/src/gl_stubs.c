@@ -942,6 +942,13 @@ GL_STUB(glWeightPointerOES, 456)
 
 #define GL_MSTUB(name, idx) \
     __attribute__((visibility("hidden"), naked, used)) void ms_##name(void) { __asm__ volatile( \
+        "stp x29, x30, [sp, #-16]!\n mov x29, sp\n sub sp, sp, #192\n" \
+        "stp x0, x1, [sp, #0]\n stp x2, x3, [sp, #16]\n stp x4, x5, [sp, #32]\n stp x6, x7, [sp, #48]\n" \
+        "stp q0, q1, [sp, #64]\n stp q2, q3, [sp, #96]\n stp q4, q5, [sp, #128]\n stp q6, q7, [sp, #160]\n" \
+        "bl _eagl_macro_enter\n" \
+        "ldp x0, x1, [sp, #0]\n ldp x2, x3, [sp, #16]\n ldp x4, x5, [sp, #32]\n ldp x6, x7, [sp, #48]\n" \
+        "ldp q0, q1, [sp, #64]\n ldp q2, q3, [sp, #96]\n ldp q4, q5, [sp, #128]\n ldp q6, q7, [sp, #160]\n" \
+        "add sp, sp, #192\n ldp x29, x30, [sp], #16\n" \
         "adrp x16, _gl_tab@PAGE\n" \
         "add x16, x16, _gl_tab@PAGEOFF\n" \
         "ldr x16, [x16, #" #idx "*8]\n" \
@@ -953,6 +960,7 @@ GL_STUB(glWeightPointerOES, 456)
         "stp x29, x30, [sp, #-16]!\n mov x29, sp\n sub sp, sp, #144\n" \
         "stp x0, x1, [sp, #0]\n stp x2, x3, [sp, #16]\n stp x4, x5, [sp, #32]\n stp x6, x7, [sp, #48]\n" \
         "stp q0, q1, [sp, #64]\n stp q2, q3, [sp, #96]\n" \
+        "bl _eagl_macro_enter\n" \
         "mov x0, #" #idx "\n ldp x1, x2, [sp, #8]\n ldp x3, x4, [sp, #24]\n bl _gl_trace_hook\n" \
         "ldp x0, x1, [sp, #0]\n ldp x2, x3, [sp, #16]\n ldp x4, x5, [sp, #32]\n ldp x6, x7, [sp, #48]\n" \
         "ldp q0, q1, [sp, #64]\n ldp q2, q3, [sp, #96]\n add sp, sp, #144\n ldp x29, x30, [sp], #16\n" \
@@ -960,6 +968,7 @@ GL_STUB(glWeightPointerOES, 456)
         "mov x0, x1\n mov x1, x2\n mov x2, x3\n mov x3, x4\n mov x4, x5\n mov x5, x6\n mov x6, x7\n" \
         GL_BR); }
 extern void gl_trace_hook(int idx, long a, long b, long c, long d);
+extern void eagl_macro_enter(void *rend);
 
 GL_MSTUB(glActiveShaderProgramEXT, 0)
 GL_TSTUB(glActiveShaderProgramEXT, 0)

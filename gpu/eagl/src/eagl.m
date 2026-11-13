@@ -130,6 +130,7 @@ struct _EAGLContextPrivate {
     int cur_att;                    // index of the attachment the bound draw framebuffer renders into (colour 0), -1 = none
     GLuint tmpfbo;
     EAGLMacroContext *macro;
+    EAGLContext *owner;             // not retained: the context this block belongs to (eagl_macro_enter)
 };
 
 static pthread_key_t g_tls;
@@ -153,6 +154,8 @@ static IOSurfaceRef make_surface(uint32_t w, uint32_t h) {
     return s;
 }
 
+// The private block of the context current on this thread (NULL = none): the fast test of eagl_macro_enter.
+static __thread void *t_cur_priv;
 static EAGLContext *cur_ctx(void) {
     pthread_once(&g_tls_once, tls_init);
     return (EAGLContext *)pthread_getspecific(g_tls);
@@ -641,6 +644,16 @@ static void eagl_install_hooks(void) {
 @end
 
 // --- EAGLContext -----------------------------------------------------------------------------------------
+// Called by every EAGLMacroContext forwarder with the caller's `rend` (= the private block, macro_ctx_new) and by the methods
+// below that issue GL: make that context current on this thread when it is not. iOS 16.7's CoreAnimation hands the context
+// to CA::OGL::GLESContext and calls GL through the macro context from its render thread without +setCurrentContext:, so Mesa
+// (which only knows the thread's current context) dropped every call ("function is no-op", black screen on the Moto G6 Plus).
+void eagl_macro_enter(void *rend) {
+    if (rend == t_cur_priv || !rend) return;
+    struct _EAGLContextPrivate *p = rend;
+    static int n; if (g_debug && n++ < 8) fprintf(stderr, "EAGL(shim): context %p made current on thread %p by a GL call\n", p->owner, (void *)pthread_self());
+    if (p->owner) [EAGLContext setCurrentContext:p->owner];
+}
 @implementation EAGLContext
 
 - (instancetype)initWithAPI:(EAGLRenderingAPI)api { return [self initWithAPI:api properties:nil]; }
@@ -658,6 +671,7 @@ static void eagl_install_hooks(void) {
     if ((self = [super init])) {
         struct _EAGLContextPrivate *p = calloc(1, sizeof *p);
         _private = p;
+        p->owner = self;
         p->api = api;
         p->dummy = calloc(DUMMY_W * DUMMY_H, 4);
         EAGLSharegroup *sg = props[kEAGLContextPropertySharegroup];
@@ -715,6 +729,7 @@ static void eagl_install_hooks(void) {
         osm_make_current(NULL, NULL, 0, 0);
     }
     pthread_setspecific(g_tls, ctx);
+    t_cur_priv = ctx ? ctx->_private : NULL;
     [old release];
     return YES;
 }
@@ -749,6 +764,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 }
 
 - (BOOL)renderbufferStorage:(NSUInteger)target fromDrawable:(id<EAGLDrawable>)drawable {
+    eagl_macro_enter(_private);
     struct _EAGLContextPrivate *p = _private;
     if (cur_ctx() != self || target != GL_RENDERBUFFER) return NO;
     GLint rb = 0;
@@ -794,6 +810,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 }
 
 - (BOOL)presentRenderbuffer:(NSUInteger)target {
+    eagl_macro_enter(_private);
     struct _EAGLContextPrivate *p = _private;
     if (cur_ctx() != self || target != GL_RENDERBUFFER) return NO;
     GLint rb = 0;
@@ -822,6 +839,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 
 // --- IOSurface ---
 - (BOOL)attachImage:(NSUInteger)image toCoreSurface:(IOSurfaceRef)surface invertedRender:(BOOL)inverted {
+    eagl_macro_enter(_private);
     // `image` is a GL TARGET (CoreAnimation passes GL_TEXTURE_2D = 3553, found by dumping the server's calls on the phone): the image
     // currently bound at that target gets the IOSurface as its storage. A plain object name (our own tests) is still accepted.
     struct _EAGLContextPrivate *p = _private;
@@ -891,6 +909,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 - (BOOL)texImageIOSurface:(IOSurfaceRef)ioSurface target:(NSUInteger)target internalFormat:(NSUInteger)internalFormat
                     width:(uint32_t)width height:(uint32_t)height format:(NSUInteger)format type:(NSUInteger)type
                     plane:(uint32_t)plane invert:(BOOL)invert {
+    eagl_macro_enter(_private);
     if (ioSurface) EAGL_DEBUG("texImageIOSurface source: surface %u fourcc %08x planes %zu %zux%zu bpr %zu\n", IOSurfaceGetID(ioSurface), (unsigned)IOSurfaceGetPixelFormat(ioSurface), IOSurfaceGetPlaneCount(ioSurface), IOSurfaceGetWidth(ioSurface), IOSurfaceGetHeight(ioSurface), IOSurfaceGetBytesPerRow(ioSurface));
     if (g_debug && ioSurface && IOSurfaceGetWidth(ioSurface) * IOSurfaceGetHeight(ioSurface) >= 400000 && IOSurfaceLock(ioSurface, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
         const uint8_t *q = IOSurfaceGetBaseAddress(ioSurface); size_t qb = IOSurfaceGetBytesPerRow(ioSurface), qh = IOSurfaceGetHeight(ioSurface), qw = IOSurfaceGetWidth(ioSurface), nz = 0, tot = 0;
