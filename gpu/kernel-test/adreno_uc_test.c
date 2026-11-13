@@ -340,7 +340,7 @@ main(int argc, char **argv)
 			memset(&sb3, 0, sizeof(sb3));
 			sb3.surface_id = IOSurfaceGetID(surf);
 			kr = call(SWEET_GPU_SEL_SURFACE_BO, &sb3, sizeof(sb3), sizeof(sb3));
-			CHECK(kr == 0 && sb3.handle != 0 && sb3.iova >= 0x80000000ull && sb3.bytes_per_row == (uint32_t)bpr && sb3.tiling == 0 && sb3.ubwc == 0,
+			CHECK(kr == 0 && sb3.handle != 0 && sb3.iova >= va_start && sb3.bytes_per_row == (uint32_t)bpr && sb3.tiling == 0 && sb3.ubwc == 0,
 			    "SURFACE_BO kernel surface: handle %u iova %#llx size %llu stride %u offset %u flags %#x plane0 {off %u stride %u %ux%u} kr %#x",
 			    sb3.handle, sb3.iova, sb3.size, sb3.bytes_per_row, sb3.offset, sb3.flags, sb3.plane[0].offset, sb3.plane[0].stride,
 			    sb3.plane[0].width, sb3.plane[0].height, kr);
@@ -413,8 +413,16 @@ main(int argc, char **argv)
 				kr = call(SWEET_GPU_SEL_SURFACE_BO, &wb, sizeof(wb), sizeof(wb));
 				CHECK(kr == 0 && wb.handle != 0, "SURFACE_BO wrapped surface: handle %u iova %#llx size %llu offset %u flags %#x kr %#x", wb.handle, wb.iova, wb.size, wb.offset, wb.flags, kr);
 				if (kr == 0) {
-					CHECK((wb.flags & SWEET_GPU_SBO_WRAPPED) && (wb.flags & SWEET_GPU_SBO_READONLY) && (wb.flags & SWEET_GPU_SBO_CPU_CACHEABLE),
-					    "wrapped flags WRAPPED|READONLY|CPU_CACHEABLE (%#x)", wb.flags);
+					/*
+					 * At abi_minor 1 (the kernel of 11215's 0187, which the G6 runs) the READONLY out bit is the same
+					 * bit 0 as the IN_SYNC in flag and the kernel clears it after the sync: only WRAPPED can be checked.
+					 */
+					if (inf2.abi_minor < 2) {
+						CHECK((wb.flags & SWEET_GPU_SBO_WRAPPED) != 0, "wrapped flags: WRAPPED set (%#x; READONLY is not reported at abi_minor 1 with IN_SYNC)", wb.flags);
+					} else {
+						CHECK((wb.flags & SWEET_GPU_SBO_WRAPPED) && (wb.flags & SWEET_GPU_SBO_READONLY) && (wb.flags & SWEET_GPU_SBO_CPU_CACHEABLE),
+						    "wrapped flags WRAPPED|READONLY|CPU_CACHEABLE (%#x)", wb.flags);
+					}
 					CHECK(wb.offset == 16, "pixel (0,0) is %u bytes into the first page (client address +16)", wb.offset);
 					/* minor 2: writable CPU alias (the owner's memory here is RW, so the alias must show through the owner's mapping) */
 					if (inf2.abi_minor >= 2 && (inf2.flags & SWEET_GPU_INFO_CAP_SBO_ALIAS)) {
