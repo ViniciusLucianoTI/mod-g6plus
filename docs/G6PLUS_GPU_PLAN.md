@@ -81,6 +81,10 @@ Each phase ends in something observable in the USB log or on the panel. Kernel w
   processor. Risk 2 below did not materialise either, with one rule learnt the hard way: on this phone a write
   to the SMMU's global TLBIALLNSNH (and a read of context bank 2) never returns and takes a CPU with it.
 
+* 2026-11-13: phase 3 done (`xnu/patches/1049`, `1050`, `sweetgpu=4 sweetgpumhz=240`): 240 MHz core clock from
+  GPLL0, the `sweet_gpu_*` interface for the 508 and the SweetAdreno630 user client; `gpu/kernel-test/adreno_uc_test`
+  passes on the device (buffers, relocations, fences, 1 MiB buffer in 4 KiB GPU pages).
+
 ## Risks, in the order they can stop the work
 
 1. Zap shader / TrustZone (phase 2). 2. SMMU global registers being owned by the hypervisor/TZ (phase 3).
