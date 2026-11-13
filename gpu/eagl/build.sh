@@ -10,7 +10,8 @@ MESA_SRC="$WORK/mesa"
 MESA_BLD="${MESA_BLD:-$WORK/build-${ARCH/arm64e/a64e}}"      # MESA_BLD=$WORK/build-hw: freedreno + softpipe build (mesa/build-mesa.sh with GPU_EAGL_HW=1)
 OUT="${1:-$WORK/out-$ARCH}"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-CC="xcrun --sdk iphoneos clang -arch $ARCH -miphoneos-version-min=18.0 -isysroot $SDK"
+MINOS="${MINOS:-18.0}"      # Moto G6 Plus (iOS 16.7, plain arm64): ARCH=arm64 MINOS=16.0 MESA_BLD=$GPU_EAGL_WORK/build-hw
+CC="xcrun --sdk iphoneos clang -arch $ARCH -miphoneos-version-min=$MINOS -isysroot $SDK"
 OSMESA="$MESA_BLD/src/gallium/targets/osmesa/libOSMesa.8.dylib"
 # Install name of the shim: @rpath for side-by-side tests; set SHIM_INSTALL_NAME=/System/Library/Frameworks/OpenGLES.framework/OpenGLES
 # only for an image that really replaces the system library.
@@ -47,4 +48,17 @@ done
 # SHIM_INSTALL_NAME=/System/Library/Frameworks/OpenGLES.framework/OpenGLES (see docs/GPU_EAGL.md).
 $CC -O1 -g -Wno-deprecated-declarations -fno-objc-arc -I$HERE/src "$HERE/test/eagl_ca_test.m" -o "$OUT/eagl_ca_test" \
     -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework IOSurface -framework QuartzCore -framework OpenGLES
+# ABS_DIR=/usr/local/lib/bergamota-gl: absolute install names instead of @rpath/@loader_path (iOS 16 on the Moto G6 Plus
+# refused @ paths: "security policy does not allow @ path expansion"), and ad-hoc signatures (no PAC to strip on arm64).
+if [ -n "${ABS_DIR:-}" ]; then
+  install_name_tool -id "$ABS_DIR/libdrm.2.dylib" "$OUT/libdrm.2.dylib"
+  install_name_tool -id "$ABS_DIR/libOSMesa.8.dylib" -change @rpath/libdrm.2.dylib "$ABS_DIR/libdrm.2.dylib" "$OUT/libOSMesa.8.dylib"
+  install_name_tool -id "$ABS_DIR/OpenGLES.framework/OpenGLES" -change @rpath/libOSMesa.8.dylib "$ABS_DIR/libOSMesa.8.dylib" "$OUT/OpenGLES.framework/OpenGLES"
+  for t in eagl_test eagl_ca_test; do
+    [ -f "$OUT/$t" ] || continue
+    install_name_tool -change @rpath/OpenGLES.framework/OpenGLES "$ABS_DIR/OpenGLES.framework/OpenGLES" "$OUT/$t" 2>/dev/null || true
+    codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$OUT/$t"
+  done
+  for f in libdrm.2.dylib libOSMesa.8.dylib OpenGLES.framework/OpenGLES; do codesign --force -s - "$OUT/$f"; done
+fi
 ls -l "$OUT" "$OUT/OpenGLES.framework"

@@ -1,0 +1,109 @@
+From 94f031fec366222de7d0c354a72079ad8cf98b46 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Fri, 13 Nov 2026 01:01:46 -0300
+Subject: [PATCH] sweet g6: Adreno 508 clock gating setup as Linux
+ a5xx_pm_resume/set_hwcg (a50x table)
+
+---
+ bsd/dev/sweet_a508.c | 75 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index 7aad3666e..bd48f770f 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -485,9 +485,80 @@ a5_load_ucode(const char *prop, const char *file, uint32_t gpu_va, uint32_t max)
+ 	return true;
+ }
+ 
++static const struct { uint32_t reg, val; } a50x_hwcg[] = {    /* Linux v6.6 a5xx_gpu.c a50x_hwcg[] (A506/A508) */
++	{ 0x00000068, 0x02222222 },	/* RBBM_CLOCK_CNTL_SP0 */
++	{ 0x0000006c, 0x02222220 },	/* RBBM_CLOCK_CNTL2_SP0 */
++	{ 0x00000070, 0x0000F3CF },	/* RBBM_CLOCK_HYST_SP0 */
++	{ 0x00000074, 0x00000080 },	/* RBBM_CLOCK_DELAY_SP0 */
++	{ 0x0000004a, 0x22222222 },	/* RBBM_CLOCK_CNTL_TP0 */
++	{ 0x0000004e, 0x22222222 },	/* RBBM_CLOCK_CNTL2_TP0 */
++	{ 0x00000052, 0x00002222 },	/* RBBM_CLOCK_CNTL3_TP0 */
++	{ 0x000000b0, 0x77777777 },	/* RBBM_CLOCK_HYST_TP0 */
++	{ 0x000000b4, 0x77777777 },	/* RBBM_CLOCK_HYST2_TP0 */
++	{ 0x000000b8, 0x00007777 },	/* RBBM_CLOCK_HYST3_TP0 */
++	{ 0x000000a4, 0x11111111 },	/* RBBM_CLOCK_DELAY_TP0 */
++	{ 0x000000a8, 0x11111111 },	/* RBBM_CLOCK_DELAY2_TP0 */
++	{ 0x000000ac, 0x00001111 },	/* RBBM_CLOCK_DELAY3_TP0 */
++	{ 0x0000005b, 0x22222222 },	/* RBBM_CLOCK_CNTL2_UCHE */
++	{ 0x0000005c, 0x22222222 },	/* RBBM_CLOCK_CNTL3_UCHE */
++	{ 0x0000005d, 0x00222222 },	/* RBBM_CLOCK_CNTL4_UCHE */
++	{ 0x0000005a, 0x22222222 },	/* RBBM_CLOCK_CNTL_UCHE */
++	{ 0x0000005e, 0x00FFFFF4 },	/* RBBM_CLOCK_HYST_UCHE */
++	{ 0x0000005f, 0x00000002 },	/* RBBM_CLOCK_DELAY_UCHE */
++	{ 0x00000078, 0x22222222 },	/* RBBM_CLOCK_CNTL_RB0 */
++	{ 0x0000007c, 0x00222222 },	/* RBBM_CLOCK_CNTL2_RB0 */
++	{ 0x00000082, 0x00022220 },	/* RBBM_CLOCK_CNTL_CCU0 */
++	{ 0x0000008a, 0x05522222 },	/* RBBM_CLOCK_CNTL_RAC */
++	{ 0x0000008b, 0x00505555 },	/* RBBM_CLOCK_CNTL2_RAC */
++	{ 0x00000086, 0x04040404 },	/* RBBM_CLOCK_HYST_RB_CCU0 */
++	{ 0x00000080, 0x07444044 },	/* RBBM_CLOCK_HYST_RAC */
++	{ 0x0000008c, 0x00000002 },	/* RBBM_CLOCK_DELAY_RB_CCU_L1_0 */
++	{ 0x00000081, 0x00010011 },	/* RBBM_CLOCK_DELAY_RAC */
++	{ 0x00000063, 0x04222222 },	/* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
++	{ 0x00000060, 0x02222222 },	/* RBBM_CLOCK_MODE_GPC */
++	{ 0x00000091, 0x00002222 },	/* RBBM_CLOCK_MODE_VFD */
++	{ 0x00000064, 0x00000000 },	/* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
++	{ 0x00000062, 0x04104004 },	/* RBBM_CLOCK_HYST_GPC */
++	{ 0x00000090, 0x00000000 },	/* RBBM_CLOCK_HYST_VFD */
++	{ 0x00000066, 0x00000000 },	/* RBBM_CLOCK_DELAY_HLSQ */
++	{ 0x00000065, 0x00004000 },	/* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
++	{ 0x00000061, 0x00000200 },	/* RBBM_CLOCK_DELAY_GPC */
++	{ 0x00000092, 0x00002222 },	/* RBBM_CLOCK_DELAY_VFD */
++};
++
++#define A5_RBBM_ISDB_CNT        0x533u
++
++/* Linux a5xx_set_hwcg(gpu, true) for the A506/A508. */
++static void
++a5_set_hwcg(void)
++{
++	for (unsigned i = 0; i < sizeof(a50x_hwcg) / sizeof(a50x_hwcg[0]); i++) {
++		gw(a50x_hwcg[i].reg, a50x_hwcg[i].val);
++	}
++	gw(A5_RBBM_CLOCK_CNTL, 0xaaa8aa00);
++	gw(A5_RBBM_ISDB_CNT, 0x182);
++}
++
+ static void
+ a5_hw_init_regs(void)
+ {
++	/*
++	 * Linux a5xx_pm_resume(): "Adreno 506, 508, 509, 510, 512 needs manual RBBM sus/res control": halt
++	 * sp_input_clk at HM level, load the clock gating table, turn sp_input_clk back on. Left out at first
++	 * (clock gating looked optional); with the per-block clock registers at their reset values every draw
++	 * that SAMPLED a texture wrote 64x4-pixel blocks of noise into part of its target (2026-11-13,
++	 * gpu/kernel-test/osmesa_blit: 5120 of 16384 pixels right), while clears and untextured draws were fine.
++	 * sweetgpuhwcg=0 skips it.
++	 */
++	uint32_t hwcg = 1;
++	PE_parse_boot_argn("sweetgpuhwcg", &hwcg, sizeof(hwcg));
++	if (hwcg) {
++		gw(A5_RBBM_CLOCK_CNTL, 0x00000055);
++		a5_set_hwcg();
++		gw(A5_RBBM_CLOCK_CNTL, gr(A5_RBBM_CLOCK_CNTL) & ~0xffu);
++	}
++	printf("SWEET GPU: clock gating %s: RBBM_CLOCK_CNTL 0x%08x ISDB_CNT 0x%08x CLOCK_CNTL_SP0 0x%08x\n", hwcg ? "programmed (a50x table)" : "left at reset",
++	    gr(A5_RBBM_CLOCK_CNTL), gr(A5_RBBM_ISDB_CNT), gr(0x68));
+ 	gw(A5_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003);
+ 	gw(A5_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+ 	gw(A5_RBBM_AHB_CNTL0, 0x00000001);
+@@ -514,7 +585,9 @@ a5_hw_init_regs(void)
+ 	gw(A5_UCHE_MODE_CNTL, 1u << 29);
+ 	gw(A5_CP_CHICKEN_DBG, 0x02000000);
+ 	gw(A5_RBBM_AHB_CNTL1, 0xa6ffffff);
+-	/* hardware clock gating (a50x_hwcg) is left off for the bring-up */
++	if (hwcg) {
++		a5_set_hwcg();          /* "Enable HWCG" at this point of a5xx_hw_init() */
++	}
+ 	gw(A5_RBBM_AHB_CNTL2, 0x0000003f);
+ 	gw(A5_TPL1_MODE_CNTL, 1u << 7);         /* highest bank bit */
+ 	gw(A5_RB_MODE_CNTL, 1u << 1);
+-- 
+2.56.0
+

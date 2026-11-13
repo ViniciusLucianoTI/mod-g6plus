@@ -31,6 +31,11 @@ if [ "${TARGET:-}" = ios16-arm64 ]; then
 		install_name_tool -id "$D/libdrm.2.dylib" "$M/libdrm.2.dylib"
 		install_name_tool -id "$D/libOSMesa.8.dylib" -change @rpath/libdrm.2.dylib "$D/libdrm.2.dylib" "$M/libOSMesa.8.dylib"
 		install_name_tool -change @rpath/libOSMesa.8.dylib "$D/libOSMesa.8.dylib" "$M/osmesa_tri"
+		xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" -O1 -g -Wall -Wextra -Wno-four-char-constants \
+		    -I"$GPU_EAGL_WORK/mesa/include" "$HERE/osmesa_blit.c" -o "$M/osmesa_blit" "$M/libOSMesa.8.dylib" \
+		    -framework CoreFoundation -framework IOSurface
+		install_name_tool -change @rpath/libOSMesa.8.dylib "$D/libOSMesa.8.dylib" "$M/osmesa_blit" 2>/dev/null || true
+		codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$M/osmesa_blit"
 		for f in libdrm.2.dylib libOSMesa.8.dylib osmesa_tri; do
 			codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$M/$f"
 		done

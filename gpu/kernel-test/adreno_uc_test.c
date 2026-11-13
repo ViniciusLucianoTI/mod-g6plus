@@ -381,6 +381,51 @@ main(int argc, char **argv)
 					uint32_t got = ((volatile uint32_t *)((uint8_t *)IOSurfaceGetBaseAddress(surf) + 2 * bpr))[3];
 					IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
 					CHECK(kr == 0 && got == 0xa11ce001u, "GPU wrote pixel (3,2) of the kernel surface: %#x (want 0xa11ce001) kr %#x", got, kr);
+					/*
+					 * Every 4 KiB GPU page of the surface (16 KiB xnu pages underneath): the CPU marks each page, the GPU
+					 * writes one dword 8 bytes into each, the CPU checks both. Found on the Moto G6 Plus (2026-11-13): a
+					 * rendered picture arrived with only some 4 KiB pages right.
+					 */
+					{
+						unsigned npages = (unsigned)(sb3.size / 4096), n = 0, ok = 0, marks = 0;
+						if (npages > 60) {
+							npages = 60;
+						}
+						IOSurfaceLock(surf, 0, NULL);
+						uint8_t *base = IOSurfaceGetBaseAddress(surf);
+						for (unsigned k = 0; k < npages; k++) {
+							((volatile uint32_t *)(base + 4096ull * k))[0] = 0xc0de0000u | k;
+						}
+						IOSurfaceUnlock(surf, 0, NULL);
+						(void)call(SWEET_GPU_SEL_BO_SYNC, &sy, sizeof(sy), 0);
+						for (unsigned k = 0; k < npages; k++) {
+							uint64_t a = sb3.iova + sb3.offset + 4096ull * k + 8;
+							c[n++] = pkt7(61, 3);
+							c[n++] = (uint32_t)a;
+							c[n++] = (uint32_t)(a >> 32);
+							c[n++] = 0xfeed0000u | k;
+						}
+						c4.size = n * 4;
+						kr = call(SWEET_GPU_SEL_GEM_SUBMIT, &s4, sizeof(s4), sizeof(s4));
+						if (kr == 0) {
+							g_last_fence = s4.fence;
+						}
+						struct sweet_msm_wait_fence w5 = { .fence = s4.fence, .timeout = rel(2, 0) };
+						kr |= call(SWEET_GPU_SEL_WAIT_FENCE, &w5, sizeof(w5), 0);
+						(void)call(SWEET_GPU_SEL_BO_SYNC, &sy, sizeof(sy), 0);
+						IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+						base = IOSurfaceGetBaseAddress(surf);
+						for (unsigned k = 0; k < npages; k++) {
+							uint32_t m = ((volatile uint32_t *)(base + 4096ull * k))[0], g = ((volatile uint32_t *)(base + 4096ull * k))[2];
+							marks += m == (0xc0de0000u | k);
+							ok += g == (0xfeed0000u | k);
+							if (g_verbose || g != (0xfeed0000u | k)) {
+								printf("      surface page %2u: CPU mark %#x, GPU word %#x%s\n", k, m, g, g == (0xfeed0000u | k) ? "" : "   <-- not the GPU's value");
+							}
+						}
+						IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+						CHECK(kr == 0 && ok == npages && marks == npages, "GPU wrote into %u of %u 4 KiB pages of the kernel surface (CPU marks intact in %u) kr %#x", ok, npages, marks, kr);
+					}
 					IOConnectUnmapMemory64(g_conn, (uint32_t)co.value, mach_task_self(), ca);
 				}
 				struct sweet_gem_close cc2 = { .handle = cb.handle };
