@@ -461,9 +461,33 @@ static void update_cur_target(EAGLContext *c) {
 }
 static inline void mark_cur_dirty(void) { EAGLContext *c = cur_ctx(); if (c && c->_private->cur_att >= 0 && c->_private->cur_att < c->_private->natt) { c->_private->att[c->_private->cur_att].dirty = 1; g_mark_hit++; } else g_mark_miss++; g_draw_seen++; }
 static void (*o_DrawArrays)(GLenum, GLint, GLsizei);
-static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); o_DrawArrays(a, b, c); }
+// Debug of the rewritten rect-sampler programs (h_ShaderSource): what is bound and which texture matrices they are drawn with.
+extern void glGetTexLevelParameteriv(GLenum, GLint, GLenum, GLint *);
+static GLuint g_rect_sh[32], g_rect_prog[32]; static int g_rect_nsh, g_rect_nprog;
+static void diag_rect(void) {
+    static int n; if (!g_debug || !g_rect_nprog || n >= 12) return;
+    GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    int hit = 0; for (int i = 0; i < g_rect_nprog; i++) if (g_rect_prog[i] == (GLuint)prog) hit = 1;
+    if (!hit) return;
+    n++;
+    GLint act = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
+    fprintf(stderr, "EAGL(shim): RECT draw program %d:", prog);
+    for (int u = 0; u < 3; u++) {
+        char nm[16]; snprintf(nm, sizeof nm, "texmat%d", u);
+        GLfloat m[4] = { 0 }; GLint loc = glGetUniformLocation(prog, nm); if (loc >= 0) glGetUniformfv(prog, loc, m);
+        GLint tex = 0, w = 0, h = 0, ws = 0, ifmt = 0, su = -1; snprintf(nm, sizeof nm, "texture%d", u);
+        GLint sl = glGetUniformLocation(prog, nm); if (sl >= 0) glGetUniformiv(prog, sl, &su);
+        glActiveTexture(GL_TEXTURE0 + u); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &w); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &h); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1003, &ifmt);
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws);
+        fprintf(stderr, " | unit %d sampler-unit %d tex %d %dx%d ifmt 0x%x wrap 0x%x texmat (%g %g %g %g)", u, su, tex, w, h, ifmt, ws, m[0], m[1], m[2], m[3]);
+    }
+    fprintf(stderr, "\n");
+    glActiveTexture((GLenum)act);
+}
+static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); o_DrawArrays(a, b, c); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
-static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); o_DrawElements(a, b, c, d); }
+static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); o_DrawElements(a, b, c, d); }
 static void (*o_DrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
 static void h_DrawArraysInstanced(GLenum a, GLint b, GLsizei c, GLsizei d) { mark_cur_dirty(); o_DrawArraysInstanced(a, b, c, d); }
 static void (*o_DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void *, GLsizei);
@@ -595,6 +619,7 @@ static void h_ShaderSource(GLuint sh, GLsizei count, const GLchar *const *str, c
     *q = 0;
     for (char *r = buf; (r = strstr(r, "2DRect")); ) memmove(r + 2, r + 6, strlen(r + 6) + 1);
     static int n; if (g_debug && n++ < 8) fprintf(stderr, "EAGL(shim): shader %u: sampler2DRect rewritten to sampler2D\n", sh);
+    if (g_rect_nsh < 32) g_rect_sh[g_rect_nsh++] = sh;
     const GLchar *one = buf; o_ShaderSource(sh, 1, &one, NULL);
     free(buf);
 }
@@ -603,6 +628,8 @@ static void (*o_LinkProgram)(GLuint);
 static void h_LinkProgram(GLuint prog) {
     o_LinkProgram(prog);
     if (!g_debug) return;
+    { GLuint as[4]; GLsizei an = 0; glGetAttachedShaders(prog, 4, &an, as);
+      for (GLsizei i = 0; i < an; i++) for (int j = 0; j < g_rect_nsh; j++) if (as[i] == g_rect_sh[j] && g_rect_nprog < 32) g_rect_prog[g_rect_nprog++] = prog; }
     GLint ok = 1; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
     if (ok) return;
     static int n; if (n++ >= 6) return;
