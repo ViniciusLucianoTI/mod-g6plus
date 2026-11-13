@@ -38,6 +38,14 @@ if [ "${TARGET:-}" = ios16-arm64 ]; then
 		    -framework CoreFoundation -framework IOSurface
 		install_name_tool -change @rpath/libOSMesa.8.dylib "$D/libOSMesa.8.dylib" "$M/osmesa_blit" 2>/dev/null || true
 		codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$M/osmesa_blit"
+		xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" -O1 -g -Wall -Wextra \
+		    -I"$GPU_EAGL_WORK/mesa/include" "$HERE/osmesa_lines.c" -o "$M/osmesa_lines" "$M/libOSMesa.8.dylib"
+		install_name_tool -change @rpath/libOSMesa.8.dylib "$D/libOSMesa.8.dylib" "$M/osmesa_lines" 2>/dev/null || true
+		codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$M/osmesa_lines"
+		xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" -O1 -g -Wall -Wextra -Wno-unused-function \
+		    -I"$GPU_EAGL_WORK/mesa/include" "$HERE/osmesa_rtt.c" -o "$M/osmesa_rtt" "$M/libOSMesa.8.dylib"
+		install_name_tool -change @rpath/libOSMesa.8.dylib "$D/libOSMesa.8.dylib" "$M/osmesa_rtt" 2>/dev/null || true
+		codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$M/osmesa_rtt"
 		for f in libdrm.2.dylib libOSMesa.8.dylib osmesa_tri; do
 			codesign --force -s - --entitlements "$HERE/../../tools/ssh/entitlements.plist" "$M/$f"
 		done

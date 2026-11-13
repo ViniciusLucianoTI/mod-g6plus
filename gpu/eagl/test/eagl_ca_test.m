@@ -271,6 +271,24 @@ int main(void) {
             CHECK(abs(a[0] - a[2]) < 40 && abs(a[1] - a[2]) < 40, "colorSaturate 0 desaturates the red layer");
             printf("TIME  colorSaturate filter: %.1f ms/frame\n", ms);
         dump(surf, "saturate");
+            // text (alpha-only glyph backing stores) and a mask layer: count the dark samples in the layer's box, compare softpipe with the GPU
+            {
+                CATextLayer *tx = [CATextLayer layer];
+                tx.frame = CGRectMake(150, 10, 100, 60);
+                tx.string = @"88:88"; tx.fontSize = 34; tx.foregroundColor = rgb(0, 0, 0); tx.contentsScale = 1;
+                [root addSublayer:tx];
+                CALayer *mk = [CALayer layer]; mk.frame = CGRectMake(150, 180, 60, 60); mk.backgroundColor = rgb(1, 0, 0);
+                CATextLayer *mm = [CATextLayer layer]; mm.frame = CGRectMake(0, 0, 60, 60); mm.string = @"W"; mm.fontSize = 50; mm.foregroundColor = rgb(0, 0, 0);
+                mk.mask = mm;
+                [root addSublayer:mk];
+                render(r, root, W, H, 1, ^{}); usleep(600000); ms = render(r, root, W, H, 2, ^{});
+                int dark = 0, red = 0; uint8_t q[4];
+                for (int y = 10; y < 70; y += 2) for (int x = 150; x < 250; x += 2) { px(surf, x, y, q); if (q[0] < 90 && q[1] < 90 && q[2] < 90) dark++; }
+                for (int y = 180; y < 240; y += 2) for (int x = 150; x < 210; x += 2) { px(surf, x, y, q); if (q[2] > 180 && q[1] < 90 && q[0] < 90) red++; }
+                printf("TEXT  CATextLayer dark samples %d of 1500, masked red samples %d of 900, %.1f ms/frame, GL error 0x%x\n", dark, red, ms, glGetError());
+                dump(surf, "text");
+                [tx removeFromSuperlayer]; [mk removeFromSuperlayer];
+            }
             // compositing filters (blend modes that read the destination): what vibrancy on tab bar glyphs and the lock screen clock use.
             // No expected values: compare the softpipe and GPU runs. "spread" = largest channel difference between 5 points inside the layer.
             for (NSString *mode in @[ @"plusL", @"plusD", @"multiplyBlendMode", @"screenBlendMode", @"destOut", @"vibrantDark", @"vibrantLight" ]) {
@@ -279,6 +297,8 @@ int main(void) {
                 bl.backgroundColor = rgb(0.5, 0.25, 0.75);
                 bl.compositingFilter = mode;
                 [root addSublayer:bl];
+                render(r, root, W, H, 1, ^{});
+                usleep(600000);          // let implicit animations end: softpipe's frames take that long anyway, the GPU's do not
                 ms = render(r, root, W, H, 3, ^{});
                 uint8_t c[5][4]; int pts[5][2] = { {52, 52}, {26, 26}, {78, 26}, {26, 78}, {78, 78} }, spread = 0;
                 for (int i = 0; i < 5; i++) { px(surf, pts[i][0], pts[i][1], c[i]); for (int k = 0; k < 3; k++) if (abs(c[i][k] - c[0][k]) > spread) spread = abs(c[i][k] - c[0][k]); }

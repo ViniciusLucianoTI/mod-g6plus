@@ -394,6 +394,20 @@ static void sync_att(EAGLContext *c, int i) {
         if (a->direct) {
             double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
             if (g_debug_frames) verify_direct(c, a);
+            // screenshot on demand: `touch /private/var/tmp/bgl-shot` -> /private/var/tmp/bgl-shot-<surface>.ppm (1/3 size) at the next sync of each display surface
+            if (g_debug && IOSurfaceGetWidth(a->surf) >= 1000 && access("/private/var/tmp/bgl-shot", F_OK) == 0) {
+                static uint32_t done[2]; uint32_t sid = IOSurfaceGetID(a->surf);
+                if (done[0] != sid && IOSurfaceLock(a->surf, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
+                    char path[96]; snprintf(path, sizeof path, "/private/var/tmp/bgl-shot-%u.ppm", sid);
+                    const uint8_t *b = IOSurfaceGetBaseAddress(a->surf); size_t w = IOSurfaceGetWidth(a->surf) / 3, h = IOSurfaceGetHeight(a->surf) / 3, bpr = IOSurfaceGetBytesPerRow(a->surf);
+                    FILE *f = b ? fopen(path, "wb") : NULL;
+                    if (f) { fprintf(f, "P6\n%zu %zu\n255\n", w, h);
+                        for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) { const uint8_t *q = b + y * 3 * bpr + x * 12; fputc(q[2], f); fputc(q[1], f); fputc(q[0], f); }
+                        fclose(f); }
+                    IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL);
+                    done[0] = sid; unlink("/private/var/tmp/bgl-shot");
+                }
+            }
             return;
         }
         BOOL isTex = a->kind ? (a->kind == 1) : (glIsTexture(a->name) && !glIsRenderbuffer(a->name));
@@ -485,9 +499,39 @@ static void diag_rect(void) {
     fprintf(stderr, "\n");
     glActiveTexture((GLenum)act);
 }
+// Debug: `touch /private/var/tmp/bgl-maskdraw` -> the state of the next 40 draws with a program that has a `texture1` sampler (CoreAnimation's
+// "content * mask alpha" programs: vibrant text such as the lock screen clock).
+static void diag_maskdraw(const void *indices) {
+    static int left, tick; (void)indices;
+    if (!g_debug) return;
+    if (!left) { if ((++tick & 31) || access("/private/var/tmp/bgl-maskdraw", F_OK)) return; unlink("/private/var/tmp/bgl-maskdraw"); left = 40; }
+    GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog); if (!prog) return;
+    GLint l1 = glGetUniformLocation(prog, "texture1"); if (l1 < 0) return;
+    left--;
+    GLint fb = 0, vp[4] = { 0 }, bl = 0, sr = 0, dr = 0, sa = 0, da = 0, act = 0, ab = 0, sc = 0, sb[4] = { 0 };
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); glGetIntegerv(GL_VIEWPORT, vp); bl = glIsEnabled(GL_BLEND); sc = glIsEnabled(GL_SCISSOR_TEST); glGetIntegerv(GL_SCISSOR_BOX, sb);
+    glGetIntegerv(0x80c9, &sr); glGetIntegerv(0x80c8, &dr); glGetIntegerv(0x80cb, &sa); glGetIntegerv(0x80ca, &da); glGetIntegerv(GL_ACTIVE_TEXTURE, &act); glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &ab);
+    fprintf(stderr, "EAGL(shim): MASKDRAW prog %d fbo %d vp %dx%d blend %d (%x %x / %x %x) scissor %d (%d %d %d %d) array-buffer %d\n", prog, fb, vp[2], vp[3], bl, sr, dr, sa, da, sc, sb[0], sb[1], sb[2], sb[3], ab);
+    for (int u = 0; u < 2; u++) {
+        char nm[16]; snprintf(nm, sizeof nm, "texmat%d", u); GLfloat m[4] = { 0 }; GLint loc = glGetUniformLocation(prog, nm); if (loc >= 0) glGetUniformfv(prog, loc, m);
+        GLint tex = 0, w = 0, h = 0, ifmt = 0, mn = 0; glActiveTexture(GL_TEXTURE0 + u); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &w); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &h); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1003, &ifmt); glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &mn);
+        fprintf(stderr, "    unit %d tex %d %dx%d ifmt 0x%x minfilter 0x%x texmat (%g %g %g %g)\n", u, tex, w, h, ifmt, mn, m[0], m[1], m[2], m[3]);
+    }
+    glActiveTexture((GLenum)act);
+    for (int at = 0; at < 4; at++) {
+        GLint en = 0, sz = 0, ty = 0, no = 0, st = 0, bb = 0; void *ptr = NULL; GLfloat cur[4] = { 0 };
+        glGetVertexAttribiv(at, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en); glGetVertexAttribiv(at, GL_VERTEX_ATTRIB_ARRAY_SIZE, &sz); glGetVertexAttribiv(at, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty);
+        glGetVertexAttribiv(at, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &no); glGetVertexAttribiv(at, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st); glGetVertexAttribiv(at, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &bb);
+        glGetVertexAttribPointerv(at, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr); glGetVertexAttribfv(at, GL_CURRENT_VERTEX_ATTRIB, cur);
+        fprintf(stderr, "    attrib %d enabled %d size %d type 0x%x norm %d stride %d buffer %d ptr %p current (%g %g %g %g)", at, en, sz, ty, no, st, bb, ptr, cur[0], cur[1], cur[2], cur[3]);
+        if (en && !bb && ptr) { const uint8_t *q = ptr; fprintf(stderr, " data"); for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", q[i]); }
+        fprintf(stderr, "\n");
+    }
+}
 static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); o_DrawArrays(a, b, c); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
-static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); o_DrawElements(a, b, c, d); }
+static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); o_DrawElements(a, b, c, d); }
 static void (*o_DrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
 static void h_DrawArraysInstanced(GLenum a, GLint b, GLsizei c, GLsizei d) { mark_cur_dirty(); o_DrawArraysInstanced(a, b, c, d); }
 static void (*o_DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void *, GLsizei);
@@ -531,11 +575,19 @@ static void h_ClearBufferuiv(GLenum a, GLint b, const GLuint *c) { mark_cur_dirt
 static void (*o_ClearBufferfi)(GLenum, GLint, GLfloat, GLint);
 static void h_ClearBufferfi(GLenum a, GLint b, GLfloat c, GLint d) { mark_cur_dirty(); o_ClearBufferfi(a, b, c, d); }
 static void (*o_BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
-static void h_BlitFramebuffer(GLint a, GLint b, GLint c, GLint d, GLint e, GLint f, GLint g, GLint h, GLbitfield i, GLenum j) { mark_cur_dirty(); o_BlitFramebuffer(a, b, c, d, e, f, g, h, i, j); }
+// Destination copies (CoreAnimation reads back what it has drawn for blend modes and backdrops). BGL_COPYDBG=1 logs them,
+// BGL_COPY_FINISH=1 finishes the pending rendering first (experiment for the Adreno 508, NOTES.md 2026-11-13).
+static void copy_pre(const char *what, int x, int y, int w, int h) {
+    static int dbg = -1, fin, n; if (dbg < 0) { dbg = getenv("BGL_COPYDBG") != NULL; fin = getenv("BGL_COPY_FINISH") != NULL; }
+    if (dbg && n++ < 60) { GLint rf = 0, df = 0, tex = 0; glGetIntegerv(0x8caa, &rf); glGetIntegerv(0x8ca6, &df); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+        fprintf(stderr, "EAGL(shim): COPY %s %d,%d %dx%d read-fbo %d draw-fbo %d bound-tex %d\n", what, x, y, w, h, rf, df, tex); }
+    if (fin && mesa_glFinish) mesa_glFinish();
+}
+static void h_BlitFramebuffer(GLint a, GLint b, GLint c, GLint d, GLint e, GLint f, GLint g, GLint h, GLbitfield i, GLenum j) { mark_cur_dirty(); copy_pre("blit", a, b, c - a, d - b); o_BlitFramebuffer(a, b, c, d, e, f, g, h, i, j); }
 static void (*o_CopyTexImage2D)(GLenum, GLint, GLenum, GLint, GLint, GLsizei, GLsizei, GLint);
-static void h_CopyTexImage2D(GLenum a, GLint b, GLenum c, GLint d, GLint e, GLsizei f, GLsizei g, GLint h) { o_CopyTexImage2D(a, b, c, d, e, f, g, h); mark_bound_texture_dirty(); }
+static void h_CopyTexImage2D(GLenum a, GLint b, GLenum c, GLint d, GLint e, GLsizei f, GLsizei g, GLint h) { copy_pre("CopyTexImage2D", d, e, f, g); o_CopyTexImage2D(a, b, c, d, e, f, g, h); mark_bound_texture_dirty(); }
 static void (*o_CopyTexSubImage2D)(GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei);
-static void h_CopyTexSubImage2D(GLenum a, GLint b, GLint c, GLint d, GLint e, GLint f, GLsizei g, GLsizei h) { o_CopyTexSubImage2D(a, b, c, d, e, f, g, h); mark_bound_texture_dirty(); }
+static void h_CopyTexSubImage2D(GLenum a, GLint b, GLint c, GLint d, GLint e, GLint f, GLsizei g, GLsizei h) { copy_pre("CopyTexSubImage2D", e, f, g, h); o_CopyTexSubImage2D(a, b, c, d, e, f, g, h); mark_bound_texture_dirty(); }
 static void (*o_TexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
 static void unwrap_bound_texture(void) {      // a write into a texture that samples client memory in place must not reach that (read-only) memory: give it private storage first
     EAGLContext *c = cur_ctx(); if (!c || !g_nlive) return;
@@ -597,7 +649,29 @@ static void h_DeleteTextures(GLsizei n, const GLuint *t) {
     if (c) update_cur_target(c);
 }
 static void (*o_BindFramebuffer)(GLenum, GLuint);
-static void h_BindFramebuffer(GLenum t, GLuint f) { o_BindFramebuffer(t, f); EAGLContext *c = cur_ctx(); if (c) update_cur_target(c); }
+// Debug: `touch /private/var/tmp/bgl-fbodump` -> the contents of the next 40 framebuffers the render server leaves (glReadPixels at the moment
+// it binds another one) as /private/var/tmp/bgl-fbo/NN-fboF-WxH.ppm (half size, alpha as a second picture "-a"). Shows every intermediate of a frame.
+static void fbo_dump_leave(void) {
+    static int left, seq, tick;
+    if (!g_debug) return;
+    if (!left) { if ((++tick & 15) || access("/private/var/tmp/bgl-fbodump", F_OK)) return; unlink("/private/var/tmp/bgl-fbodump"); mkdir("/private/var/tmp/bgl-fbo", 0777); left = 40; seq = 0; }
+    GLint fb = 0, vp[4] = { 0 }; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); glGetIntegerv(GL_VIEWPORT, vp);
+    int w = vp[2], h = vp[3]; if (!fb || w <= 0 || h <= 0 || w > 2048 || h > 4096) return;
+    left--;
+    uint8_t *b = malloc((size_t)w * h * 4); if (!b) return;
+    GLint oa = 4; glGetIntegerv(GL_PACK_ALIGNMENT, &oa); glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, b); glPixelStorei(GL_PACK_ALIGNMENT, oa);
+    for (int k = 0; k < 2; k++) {
+        char path[128]; snprintf(path, sizeof path, "/private/var/tmp/bgl-fbo/%02d-fbo%d-%dx%d%s.ppm", seq, fb, w, h, k ? "-a" : "");
+        FILE *f = fopen(path, "wb"); if (!f) continue;
+        fprintf(f, "P6\n%d %d\n255\n", w / 2, h / 2);
+        for (int y = 0; y < h / 2; y++) for (int x = 0; x < w / 2; x++) { const uint8_t *q = b + ((size_t)(y * 2) * w + x * 2) * 4; if (k) { fputc(q[3], f); fputc(q[3], f); fputc(q[3], f); } else fwrite(q, 1, 3, f); }
+        fclose(f);
+    }
+    seq++; free(b);
+    fprintf(stderr, "EAGL(shim): fbo dump %d: fbo %d %dx%d error 0x%x\n", seq - 1, fb, w, h, glGetError());
+}
+static void h_BindFramebuffer(GLenum t, GLuint f) { fbo_dump_leave(); o_BindFramebuffer(t, f); EAGLContext *c = cur_ctx(); if (c) update_cur_target(c); }
 static void (*o_FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
 static void h_FramebufferTexture2D(GLenum a, GLenum b, GLenum c, GLuint d, GLint e) { o_FramebufferTexture2D(a, b, c, d, e); EAGLContext *x = cur_ctx(); if (x) update_cur_target(x); }
 static void (*o_FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);

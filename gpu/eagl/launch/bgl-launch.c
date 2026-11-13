@@ -114,6 +114,7 @@ static int marker_mode(char *val, size_t vlen)
 		while (w) {
 			if (!strcmp(w, "nohook")) g_marker_nohook = 1;
 			else if (!strcmp(w, "debug")) debug = 1;
+			else if (!strcmp(w, "trace")) { debug = 1; setenv("EAGL_TRACE", "1", 1); setenv("EAGL_TRACE_FIRST", "400000", 1); setenv("EAGL_TRACE_SHADERS", "1", 1); }   /* GL call trace of the render server, see gl_trace_hook */
 			else if (!strcmp(w, "frames")) { debug = 1; g_marker_frames = 1; }
 			else if (!strcmp(w, "dirty")) g_marker_dirty = 1;
 			else if (!strcmp(w, "syncall")) g_marker_syncall = 1;

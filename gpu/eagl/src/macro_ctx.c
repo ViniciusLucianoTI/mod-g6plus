@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 #include "gl_tab.h"
 #include "macro_ctx.h"
 #include "osm.h"
@@ -16,6 +17,12 @@ extern void *const mt_thunks[];
 static volatile int g_trace_on;
 __attribute__((visibility("default"))) void EAGLShimSetTrace(int on) { g_trace_on = on; }
 void gl_trace_hook(int idx, long a, long b, long c, long d) {
+    // EAGL_TRACE_FIRST=N (the launcher's marker word "trace" sets 400000): print the first N calls; later
+    // `touch /private/var/tmp/bgl-trace` prints the next 30000 (checked every 512 calls).
+    static long budget = -1, calls;
+    if (budget < 0) budget = getenv("EAGL_TRACE_FIRST") ? atol(getenv("EAGL_TRACE_FIRST")) : 0;
+    if (!(++calls & 511) && access("/private/var/tmp/bgl-trace", F_OK) == 0) { unlink("/private/var/tmp/bgl-trace"); budget = 30000; }
+    if (budget > 0) budget--; else
     if (!g_trace_on) return;
     fprintf(stderr, "GL %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", gl_names[idx], a, b, c, d);
     if (!strcmp(gl_names[idx], "glShaderSource") && c && getenv("EAGL_TRACE_SHADERS")) {
@@ -26,6 +33,7 @@ void gl_trace_hook(int idx, long a, long b, long c, long d) {
 
 void *macro_ctx_new(void *rend) {
     void *const *thunks = getenv("EAGL_TRACE") ? mt_thunks : ms_thunks;
+    if (getenv("EAGL_TRACE") && !strcmp(getenv("EAGL_TRACE"), "2")) g_trace_on = 1;   // =2: print from the start
     void **m = calloc(1, MACRO_CTX_SIZE);
     if (!m) return NULL;
     m[0] = rend;
