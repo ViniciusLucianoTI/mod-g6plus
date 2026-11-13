@@ -527,6 +527,8 @@ static void unwrap_bound_texture(void) {      // a write into a texture that sam
 static void h_TexSubImage2D(GLenum a, GLint b, GLint c, GLint d, GLsizei e, GLsizei f, GLenum g, GLenum h, const void *i) { if (a == GL_TEXTURE_2D) unwrap_bound_texture(); o_TexSubImage2D(a, b, c, d, e, f, g, h, i); mark_bound_texture_dirty(); }
 static void (*o_BindTexture)(GLenum, GLuint);
 static void h_BindTexture(GLenum target, GLuint name) {
+    if (target != GL_TEXTURE_2D && g_debug) { static int n; if (n++ < 12) fprintf(stderr, "EAGL(shim): glBindTexture target 0x%x name %u\n", target, name); }
+    if (target == 0x84f5) target = GL_TEXTURE_2D;   // rectangle textures do not exist in Mesa's ES: see h_ShaderSource
     o_BindTexture(target, name);
     if (target != GL_TEXTURE_2D || !name || !g_nlive) return;
     EAGLContext *c = cur_ctx(); if (!c) return;
@@ -578,6 +580,24 @@ static void (*o_FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
 static void h_FramebufferRenderbuffer(GLenum a, GLenum b, GLenum c, GLuint d) { o_FramebufferRenderbuffer(a, b, c, d); EAGLContext *x = cur_ctx(); if (x) update_cur_target(x); }
 static void (*o_DeleteFramebuffers)(GLsizei, const GLuint *);
 static void h_DeleteFramebuffers(GLsizei n, const GLuint *f) { o_DeleteFramebuffers(n, f); EAGLContext *x = cur_ctx(); if (x) update_cur_target(x); }
+// CoreAnimation's shader generator (CA::OGL::GLContext::create_shader, iOS 16.7) names the sampler of a texture unit by the unit's
+// target: 0xde1 -> "2D", 0x806f -> "3D", anything else -> "2DRect". Mesa's GLSL ES has no sampler2DRect ("illegal use of reserved
+// word"), the program did not link and what used it was not drawn (tab bar glyphs, lock screen clock on the Moto G6 Plus).
+// Rewrite those shaders to plain 2D samplers. ASSUMPTION, not verified: the coordinates CA feeds them are normalised.
+static void (*o_ShaderSource)(GLuint, GLsizei, const GLchar *const *, const GLint *);
+static void h_ShaderSource(GLuint sh, GLsizei count, const GLchar *const *str, const GLint *len) {
+    int hit = 0;
+    for (GLsizei i = 0; i < count && !hit; i++) if (str[i] && (len && len[i] >= 0 ? memmem(str[i], (size_t)len[i], "2DRect", 6) : strstr(str[i], "2DRect"))) hit = 1;
+    if (!hit) { o_ShaderSource(sh, count, str, len); return; }
+    size_t tot = 0; for (GLsizei i = 0; i < count; i++) if (str[i]) tot += len && len[i] >= 0 ? (size_t)len[i] : strlen(str[i]);
+    char *buf = malloc(tot + 1), *q = buf;
+    for (GLsizei i = 0; i < count; i++) if (str[i]) { size_t l = len && len[i] >= 0 ? (size_t)len[i] : strlen(str[i]); memcpy(q, str[i], l); q += l; }
+    *q = 0;
+    for (char *r = buf; (r = strstr(r, "2DRect")); ) memmove(r + 2, r + 6, strlen(r + 6) + 1);
+    static int n; if (g_debug && n++ < 8) fprintf(stderr, "EAGL(shim): shader %u: sampler2DRect rewritten to sampler2D\n", sh);
+    const GLchar *one = buf; o_ShaderSource(sh, 1, &one, NULL);
+    free(buf);
+}
 // Debug: say why a program the render server links does not link (info log + the sources of its shaders).
 static void (*o_LinkProgram)(GLuint);
 static void h_LinkProgram(GLuint prog) {
@@ -598,6 +618,7 @@ static void h_LinkProgram(GLuint prog) {
 }
 static const struct { const char *name; void **orig; void *hook; } g_dirty_hooks[] = {
     { "glLinkProgram", (void **)&o_LinkProgram, h_LinkProgram },
+    { "glShaderSource", (void **)&o_ShaderSource, h_ShaderSource },
     { "glDrawArrays", (void **)&o_DrawArrays, h_DrawArrays }, { "glDrawElements", (void **)&o_DrawElements, h_DrawElements },
     { "glDrawArraysInstanced", (void **)&o_DrawArraysInstanced, h_DrawArraysInstanced }, { "glDrawElementsInstanced", (void **)&o_DrawElementsInstanced, h_DrawElementsInstanced },
     { "glDrawRangeElements", (void **)&o_DrawRangeElements, h_DrawRangeElements }, { "glClear", (void **)&o_Clear, h_Clear }, { "glClearBufferfv", (void **)&o_ClearBufferfv, h_ClearBufferfv },
