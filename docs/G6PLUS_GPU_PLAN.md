@@ -85,6 +85,10 @@ Each phase ends in something observable in the USB log or on the panel. Kernel w
   GPLL0, the `sweet_gpu_*` interface for the 508 and the SweetAdreno630 user client; `gpu/kernel-test/adreno_uc_test`
   passes on the device (buffers, relocations, fences, 1 MiB buffer in 4 KiB GPU pages).
 
+* 2026-11-13: phase 4, first half: Mesa 25.0.7 freedreno (a5xx) built for iOS 16 arm64 with the project's patch
+  unchanged; `gpu/kernel-test/osmesa_tri` renders an offscreen triangle on the 508 (`GL_RENDERER FD508`, OpenGL ES 3.1)
+  with the same pixels as softpipe. Presenting to the panel is still to do.
+
 ## Risks, in the order they can stop the work
 
 1. Zap shader / TrustZone (phase 2). 2. SMMU global registers being owned by the hypervisor/TZ (phase 3).
