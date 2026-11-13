@@ -1,0 +1,38 @@
+From b5744721833f15415669c4ad70d2d0d98be171b2 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Fri, 13 Nov 2026 01:54:10 -0300
+Subject: [PATCH] sweet: sweetdyldenv=1 grants the dyld policy (DYLD_*
+ variables, @ paths) to every process
+
+---
+ bsd/kern/sweet_amfi.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index c028ea869..ae2b88b43 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -527,7 +527,19 @@ sweet_amfi_name_syscall(struct proc *p, int call, user_addr_t arg)
+ 		uint64_t state = 0x86;
+ 		return copyout(&state, arg, sizeof(state));
+ 	}
+-	if (call == SWEET_AMFI_OP_DYLD_POLICY && sweet_arm64e_enabled() && sweet_proc_is_arm64e(p)) {
++	/*
++	 * sweetdyldenv=1: the same grant for every process. iOS 16.7's dyld (plain arm64) asks the same op 0x5a
++	 * (kernel log on the Moto G6 Plus: `__mac_syscall(381) e=103 "AMFI" op=90` from every process); with
++	 * ENOPOLICY it ignored DYLD_INSERT_LIBRARIES (the EAGL shim was not injected into a test process) and
++	 * refused @rpath ("security policy does not allow @ path expansion").
++	 */
++	static int dyld_env = -1;
++	if (dyld_env < 0) {
++		uint32_t v = 0;
++		PE_parse_boot_argn("sweetdyldenv", &v, sizeof(v));
++		dyld_env = v != 0;
++	}
++	if (call == SWEET_AMFI_OP_DYLD_POLICY && (dyld_env || (sweet_arm64e_enabled() && sweet_proc_is_arm64e(p)))) {
+ 		struct sweet_amfi_dyld_policy_req req;
+ 		uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
+ 		int error = copyin(arg, &req, sizeof(req));
+-- 
+2.56.0
+

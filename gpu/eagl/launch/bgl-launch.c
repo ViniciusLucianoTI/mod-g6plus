@@ -300,6 +300,22 @@ int main(int argc, char **argv)
 		setenv("DYLD_INSERT_LIBRARIES", lib, 1);
 		if (!strcmp(mode, "soft"))
 			setenv("SWEET_GPU", "0", 1);
+#ifdef BGL_FD_DEBUG
+		/*
+		 * Freedreno switches this GPU needs to draw correctly, fixed at build time. Moto G6 Plus (Adreno 508):
+		 * "gmem,noblit": bypass rendering and the a5xx 2D blitter both produce wrong pixels there (NOTES.md,
+		 * 2026-11-13). Boot-arg bglfd=VALUE replaces it (bglfd=- for none).
+		 */
+		{
+			char fdv[64] = "";
+			if (has_arg(args, "bglfd", fdv, sizeof fdv)) {
+				if (strcmp(fdv, "-"))
+					setenv("FD_MESA_DEBUG", fdv, 1);
+			} else {
+				setenv("FD_MESA_DEBUG", BGL_FD_DEBUG, 1);
+			}
+		}
+#endif
 		{   /* the render-server hook of the shim (ca_server_hook.m): on unless bglhook=0 (boot-arg) or "nohook" in the marker */
 			char hv[16] = "";
 			if (!g_marker_nohook && !(has_arg(args, "bglhook", hv, sizeof hv) && !strcmp(hv, "0")))

@@ -14,6 +14,19 @@ WORK="${GPU_EAGL_WORK:?set GPU_EAGL_WORK}"
 OUT="${1:-$REPO/research/bergamota-gl}"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 TMP="$WORK/payload-build"
+# TARGET=ios16-arm64 (Moto G6 Plus, iOS 16.7 plain arm64, Adreno 508): no PAC to strip, ad-hoc signatures, absolute install
+# names (/usr/local/lib/bergamota-gl), launcher built with the freedreno switches the 508 needs.
+if [ "${TARGET:-}" = ios16-arm64 ]; then
+  rm -rf "$TMP" "$OUT"; mkdir -p "$TMP" "$OUT/OpenGLES.framework"
+  ARCH=arm64 MINOS=16.0 EAGL_DEFS=-DEAGL_INJECT MESA_BLD="$WORK/build-hw" ABS_DIR=/usr/local/lib/bergamota-gl "$HERE/build.sh" "$TMP/inj" >/dev/null
+  xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" -O2 -Wall -Wextra \
+      -DBGL_FD_DEBUG='"gmem,noblit"' "$HERE/launch/bgl-launch.c" -o "$OUT/bgl-launch"
+  codesign --force -s - --entitlements "$REPO/tools/ssh/entitlements.plist" "$OUT/bgl-launch"
+  cp "$TMP/inj/OpenGLES.framework/OpenGLES" "$OUT/OpenGLES.framework/OpenGLES"
+  cp "$TMP/inj/libOSMesa.8.dylib" "$TMP/inj/libdrm.2.dylib" "$OUT/"
+  (cd "$OUT" && shasum -a 256 bgl-launch OpenGLES.framework/OpenGLES libOSMesa.8.dylib libdrm.2.dylib > MANIFEST.sha256 && cat MANIFEST.sha256)
+  exit 0
+fi
 rm -rf "$TMP" "$OUT"; mkdir -p "$TMP" "$OUT/OpenGLES.framework"
 EAGL_DEFS=-DEAGL_INJECT MESA_BLD="$WORK/build-hw" "$HERE/build.sh" "$TMP/inj" >/dev/null
 xcrun --sdk iphoneos clang -arch arm64e -miphoneos-version-min=18.0 -isysroot "$SDK" -O2 -Wall -Wextra "$HERE/launch/bgl-launch.c" -o "$TMP/bgl-launch"
