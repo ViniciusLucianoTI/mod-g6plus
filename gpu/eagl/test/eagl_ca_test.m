@@ -271,6 +271,21 @@ int main(void) {
             CHECK(abs(a[0] - a[2]) < 40 && abs(a[1] - a[2]) < 40, "colorSaturate 0 desaturates the red layer");
             printf("TIME  colorSaturate filter: %.1f ms/frame\n", ms);
         dump(surf, "saturate");
+            // compositing filters (blend modes that read the destination): what vibrancy on tab bar glyphs and the lock screen clock use.
+            // No expected values: compare the softpipe and GPU runs. "spread" = largest channel difference between 5 points inside the layer.
+            for (NSString *mode in @[ @"plusL", @"plusD", @"multiplyBlendMode", @"screenBlendMode", @"destOut", @"vibrantDark", @"vibrantLight" ]) {
+                CALayer *bl = [CALayer layer];
+                bl.frame = CGRectMake(20, 20, 64, 64);
+                bl.backgroundColor = rgb(0.5, 0.25, 0.75);
+                bl.compositingFilter = mode;
+                [root addSublayer:bl];
+                ms = render(r, root, W, H, 3, ^{});
+                uint8_t c[5][4]; int pts[5][2] = { {52, 52}, {26, 26}, {78, 26}, {26, 78}, {78, 78} }, spread = 0;
+                for (int i = 0; i < 5; i++) { px(surf, pts[i][0], pts[i][1], c[i]); for (int k = 0; k < 3; k++) if (abs(c[i][k] - c[0][k]) > spread) spread = abs(c[i][k] - c[0][k]); }
+                printf("BLEND %-18s centre BGRA=%3d %3d %3d %3d spread %3d  %.1f ms/frame  GL error 0x%x\n", mode.UTF8String, c[0][0], c[0][1], c[0][2], c[0][3], spread, ms, glGetError());
+                dump(surf, mode.UTF8String);
+                [bl removeFromSuperlayer];
+            }
         }
 
         // ---- 6. many layers
