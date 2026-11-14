@@ -132,6 +132,8 @@ struct _EAGLContextPrivate {
     EAGLMacroContext *macro;
     // render-to-self emulation (fbk_pre): 2D texture bound per unit, active unit, colour texture of the draw framebuffer, the scratch copy
     GLuint unit_tex[8]; int act; GLuint fb_tex; GLuint fbk_tex; int fbk_w, fbk_h; long fbk_n;
+    // program 0 emulation (p0_pre): the program CoreAnimation has current, where it keeps its vertex matrix, our stand-in programs
+    GLuint cur_prog; const GLfloat *vmat; GLuint p0_prog[3]; GLint p0_umat[3], p0_utm[3]; long p0_n;
     EAGLContext *owner;             // not retained: the context this block belongs to (eagl_macro_enter)
 };
 
@@ -590,7 +592,112 @@ static void fbk_post(struct _EAGLContextPrivate *p, unsigned mask) {
     for (int u = 0; u < 4; u++) if (mask & (1u << u)) { o_ActiveTexture(GL_TEXTURE0 + u); o_BindTexture(GL_TEXTURE_2D, p->unit_tex[u]); }
     o_ActiveTexture(GL_TEXTURE0 + p->act);
 }
-#define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; call; if (fm_) fbk_post(fc_->_private, fm_); } while (0)
+// Debug: `touch /private/var/tmp/bgl-fbk` -> for the next 60 render-to-self draws: program, samplers, scissor, and the pixel at the centre of the
+// scissor box before and after the draw.
+static int g_fbk_dbg; static int g_fbk_px[4];
+int g_fbk_dbg_on(void) { return g_fbk_dbg > 0; }
+static void fbk_box_stats(const char *tag) {      // non-transparent pixels and mean colour inside the box the draw may touch
+    int x = g_fbk_px[0], y = g_fbk_px[1], w = g_fbk_px[2], h = g_fbk_px[3];
+    if (w <= 0 || h <= 0 || (long)w * h > 400000) { fprintf(stderr, " %s (box too large)", tag); return; }
+    uint8_t *b = malloc((size_t)w * h * 4); GLint oa = 4; glGetIntegerv(GL_PACK_ALIGNMENT, &oa); glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, b); glPixelStorei(GL_PACK_ALIGNMENT, oa);
+    long nz = 0, sr = 0, sg = 0, sb = 0, sa = 0;
+    for (long i = 0; i < (long)w * h; i++) { if (b[i * 4 + 3]) nz++; sr += b[i * 4]; sg += b[i * 4 + 1]; sb += b[i * 4 + 2]; sa += b[i * 4 + 3]; }
+    long n = (long)w * h;
+    fprintf(stderr, " %s alpha>0 %ld/%ld mean %ld %ld %ld %ld", tag, nz, n, sr / n, sg / n, sb / n, sa / n);
+    free(b);
+}
+static void fbk_dbg_pre(struct _EAGLContextPrivate *p, unsigned mask) {
+    static int tick;
+    if (!g_debug) return;
+    if (!g_fbk_dbg) { if ((++tick & 7) || access("/private/var/tmp/bgl-fbk", F_OK)) return; unlink("/private/var/tmp/bgl-fbk"); g_fbk_dbg = 60; }
+    GLint prog = 0, fb = 0, vp[4] = { 0 }, sb[4] = { 0 }, sc = glIsEnabled(GL_SCISSOR_TEST), bl = glIsEnabled(GL_BLEND), sr = 0, dr = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prog); glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); glGetIntegerv(GL_VIEWPORT, vp); glGetIntegerv(GL_SCISSOR_BOX, sb); glGetIntegerv(0x80c9, &sr); glGetIntegerv(0x80c8, &dr);
+    int cx = sc ? sb[0] + sb[2] / 2 : vp[2] / 2, cy = sc ? sb[1] + sb[3] / 2 : vp[3] / 2; if (cx < 0) cx = 0; if (cy < 0) cy = 0;
+    (void)cx; (void)cy;
+    { int x0 = sc ? sb[0] : 0, y0 = sc ? sb[1] : 0, x1 = sc ? sb[0] + sb[2] : vp[2], y1 = sc ? sb[1] + sb[3] : vp[3];
+      if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > vp[2]) x1 = vp[2]; if (y1 > vp[3]) y1 = vp[3];
+      g_fbk_px[0] = x0; g_fbk_px[1] = y0; g_fbk_px[2] = x1 - x0; g_fbk_px[3] = y1 - y0; }
+    fprintf(stderr, "EAGL(shim): FBK prog %d fbo %d tex %u (%dx%d) vp %dx%d scissor %d (%d %d %d %d) blend %d (%x %x) units 0x%x unit-tex %u %u %u |", prog, fb, p->fb_tex, p->fbk_w, p->fbk_h, vp[2], vp[3], sc, sb[0], sb[1], sb[2], sb[3], bl, sr, dr, mask,
+            p->unit_tex[0], p->unit_tex[1], p->unit_tex[2]);
+    for (int u = 0; u < 3; u++) { char nm[16]; snprintf(nm, sizeof nm, "texture%d", u); GLint l = glGetUniformLocation(prog, nm), v = -1; if (l >= 0) { glGetUniformiv(prog, l, &v); fprintf(stderr, " %s=unit%d", nm, v); } }
+    GLint l = glGetUniformLocation(prog, "function_arg"); GLfloat f4[4] = { 0 }; if (l >= 0) { glGetUniformfv(prog, l, f4); fprintf(stderr, " function_arg (%g %g %g %g)", f4[0], f4[1], f4[2], f4[3]); }
+    l = glGetUniformLocation(prog, "color_matrix[0]"); if (l >= 0) { GLfloat m[3]; fprintf(stderr, " color_matrix"); for (int i = 0; i < 4; i++) { char nm[24]; snprintf(nm, sizeof nm, "color_matrix[%d]", i); glGetUniformfv(prog, glGetUniformLocation(prog, nm), m); fprintf(stderr, " [%g %g %g]", m[0], m[1], m[2]); } }
+    l = glGetUniformLocation(prog, "texmatD"); if (l >= 0) { glGetUniformfv(prog, l, f4); fprintf(stderr, " texmatD (%g %g %g %g)", f4[0], f4[1], f4[2], f4[3]); }
+    fprintf(stderr, " |"); fbk_box_stats("before");
+    {              // where is anything at all in this surface? rows with content, top and bottom halves (GL rows: 0 = bottom)
+        int w = vp[2], h = vp[3]; if ((long)w * h <= 3000000) { uint8_t *b = malloc((size_t)w * h * 4); glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, b);
+            int ymin = -1, ymax = -1, xmin = w, xmax = -1; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) if (b[((size_t)y * w + x) * 4 + 3]) { if (ymin < 0) ymin = y; ymax = y; if (x < xmin) xmin = x; if (x > xmax) xmax = x; }
+            fprintf(stderr, " content x %d..%d y %d..%d", xmin, xmax, ymin, ymax); free(b); } }
+}
+static void fbk_dbg_post(void) {
+    if (!g_fbk_dbg) return;
+    g_fbk_dbg--;
+    fbk_box_stats("after"); fprintf(stderr, "\n");
+}
+// Draws without a program. CoreAnimation's GL renderer treats shader function 0x59 as "no shader": CA::OGL::GLContext::update_shader calls
+// glUseProgram(0) for it and draws (disassembly, iOS 16.7.16). It is what the filter passes use to copy the destination into a group surface and
+// to put a filtered group back (texture bound on unit 0, blend off or ONE/ONE_MINUS_SRC_ALPHA), and to fill with the vertex colour (no texture).
+// In OpenGL ES 2/3 a draw without a program draws nothing, so every vibrant element was missing (lock screen clock, tab bar glyphs and labels on the
+// Moto G6 Plus, softpipe and Adreno alike). Stand-in: texel (times the vertex colour when that array is enabled), same vertex layout as CA's
+// generated programs (attribute 0 position, 1 colour, 2 texcoord0 in texels), CA's own vertex matrix (the pointer it last gave glUniformMatrix4fv
+// for location 0) and texmat0 = 1 / size of the bound texture, as it sets for its own programs.
+static void (*o_UseProgram)(GLuint);
+static void (*o_UniformMatrix4fv)(GLint, GLsizei, GLboolean, const GLfloat *);
+static void h_UseProgram(GLuint prog) { o_UseProgram(prog); EAGLContext *c = cur_ctx(); if (c) c->_private->cur_prog = prog; }
+static void h_UniformMatrix4fv(GLint loc, GLsizei n, GLboolean tr, const GLfloat *v) { o_UniformMatrix4fv(loc, n, tr, v); if (loc == 0 && n == 1 && v) { EAGLContext *c = cur_ctx(); if (c) c->_private->vmat = v; } }
+static GLuint p0_build(int kind, GLint *umat, GLint *utm) {       // 0 = texture, 1 = texture * colour, 2 = colour
+    static const char *vs = "uniform highp mat4 vertex_matrix; uniform highp vec4 texmat0; attribute highp vec4 vertex_position; attribute lowp vec4 vertex_color;"
+                            "attribute highp vec2 vertex_texcoord0; varying lowp vec4 color; varying highp vec2 tc;"
+                            "void main() { gl_Position = vertex_matrix * vertex_position; color = vertex_color; tc = vertex_texcoord0 * texmat0.xy + texmat0.zw; }";
+    static const char *fs[3] = {
+        "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = texture2D(texture0, tc); }",
+        "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = texture2D(texture0, tc) * color; }",
+        "varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = color; }" };
+    GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER), pr = glCreateProgram();
+    glShaderSource(v, 1, &vs, NULL); glCompileShader(v); glShaderSource(f, 1, &fs[kind], NULL); glCompileShader(f);
+    glAttachShader(pr, v); glAttachShader(pr, f);
+    glBindAttribLocation(pr, 0, "vertex_position"); glBindAttribLocation(pr, 1, "vertex_color"); glBindAttribLocation(pr, 2, "vertex_texcoord0");
+    glLinkProgram(pr); glDeleteShader(v); glDeleteShader(f);
+    GLint ok = 0; glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+    if (!ok) { fprintf(stderr, "EAGL(shim): the stand-in for program 0 (kind %d) does not link\n", kind); return 0; }
+    *umat = glGetUniformLocation(pr, "vertex_matrix"); *utm = glGetUniformLocation(pr, "texmat0");
+    o_UseProgram(pr); GLint ut = glGetUniformLocation(pr, "texture0"); if (ut >= 0) glUniform1i(ut, 0);
+    return pr;
+}
+static int p0_pre(struct _EAGLContextPrivate *p) {
+    static int off = -1; if (off < 0) off = getenv("BGL_NO_PROGRAM0") != NULL;
+    if (off || !p->vmat) return 0;
+    GLint en1 = 0; glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en1);
+    GLuint tex = p->unit_tex[0];
+    int kind = tex ? (en1 ? 1 : 0) : 2;
+    static int fill = -1; if (fill < 0) fill = getenv("BGL_PROGRAM0_FILL") != NULL;
+    if (kind == 2 && !fill) return 0;      // without a texture: drawing the vertex colour painted a red gradient over the display (seen 2026-11-14); left as before (nothing)
+    if (!p->p0_prog[kind]) { p->p0_prog[kind] = p0_build(kind, &p->p0_umat[kind], &p->p0_utm[kind]); if (!p->p0_prog[kind]) return 0; }
+    o_UseProgram(p->p0_prog[kind]);
+    o_UniformMatrix4fv(p->p0_umat[kind], 1, GL_FALSE, p->vmat);
+    GLint w = 0, h = 0;
+    if (tex) {
+        if (p->act != 0) o_ActiveTexture(GL_TEXTURE0);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &w); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &h);
+        if (p->act != 0) o_ActiveTexture(GL_TEXTURE0 + p->act);
+        if (p->p0_utm[kind] >= 0) glUniform4f(p->p0_utm[kind], w > 0 ? 1.0f / w : 1, h > 0 ? 1.0f / h : 1, 0, 0);
+    }
+    if (g_debug && (p->p0_n++ < 24 || !(p->p0_n % 5000))) {
+        GLint en2 = 0; void *tp = NULL; glGetVertexAttribiv(2, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en2); glGetVertexAttribPointerv(2, GL_VERTEX_ATTRIB_ARRAY_POINTER, &tp);
+        GLint st = 0; glGetVertexAttribiv(2, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st); const float *t = tp;
+        fprintf(stderr, "EAGL(shim): program-0 draw #%ld: kind %d texture %u (%dx%d) dest %u blend %d colour array %d texcoord array %d", p->p0_n, kind, tex, w, h, p->fb_tex, glIsEnabled(GL_BLEND), en1, en2);
+        if (en2 && t && st) fprintf(stderr, " texcoords (%g %g) (%g %g) (%g %g) (%g %g)", t[0], t[1], *(const float *)((const char *)t + st), *(const float *)((const char *)t + st + 4),
+                                    *(const float *)((const char *)t + 2 * st), *(const float *)((const char *)t + 2 * st + 4), *(const float *)((const char *)t + 3 * st), *(const float *)((const char *)t + 3 * st + 4));
+        fprintf(stderr, " matrix [%g %g %g %g | %g %g %g %g | .. | %g %g %g %g]\n", p->vmat[0], p->vmat[1], p->vmat[2], p->vmat[3], p->vmat[4], p->vmat[5], p->vmat[6], p->vmat[7], p->vmat[12], p->vmat[13], p->vmat[14], p->vmat[15]);
+    }
+    return 1;
+}
+static void fbk_dbg_plain(struct _EAGLContextPrivate *p) {
+    GLint prog = 0, sb[4] = { 0 }; glGetIntegerv(GL_CURRENT_PROGRAM, &prog); glGetIntegerv(GL_SCISSOR_BOX, sb);
+    fprintf(stderr, "EAGL(shim): FBK   draw prog %d dest-tex %u units %u %u %u blend %d scissor %d (%d %d %d %d)\n", prog, p->fb_tex, p->unit_tex[0], p->unit_tex[1], p->unit_tex[2], glIsEnabled(GL_BLEND), glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3]);
+}
+#define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } else if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) o_UseProgram(0); } while (0)
 static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); FBK_DRAW(o_DrawArrays(a, b, c)); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
 static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); FBK_DRAW(o_DrawElements(a, b, c, d)); }
@@ -641,7 +748,8 @@ static void (*o_BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint
 // BGL_COPY_FINISH=1 finishes the pending rendering first (experiment for the Adreno 508, NOTES.md 2026-11-13).
 static void copy_pre(const char *what, int x, int y, int w, int h) {
     static int dbg = -1, fin, n; if (dbg < 0) { dbg = getenv("BGL_COPYDBG") != NULL; fin = getenv("BGL_COPY_FINISH") != NULL; }
-    if (dbg && n++ < 60) { GLint rf = 0, df = 0, tex = 0; glGetIntegerv(0x8caa, &rf); glGetIntegerv(0x8ca6, &df); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    extern int g_fbk_dbg_on(void);
+    if ((dbg && n++ < 60) || g_fbk_dbg_on()) { GLint rf = 0, df = 0, tex = 0; glGetIntegerv(0x8caa, &rf); glGetIntegerv(0x8ca6, &df); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
         fprintf(stderr, "EAGL(shim): COPY %s %d,%d %dx%d read-fbo %d draw-fbo %d bound-tex %d\n", what, x, y, w, h, rf, df, tex); }
     if (fin && mesa_glFinish) mesa_glFinish();
 }
@@ -735,7 +843,8 @@ static void fbo_dump_leave(void) {
     seq++; free(b);
     fprintf(stderr, "EAGL(shim): fbo dump %d: fbo %d %dx%d error 0x%x\n", seq - 1, fb, w, h, glGetError());
 }
-static void h_BindFramebuffer(GLenum t, GLuint f) { fbo_dump_leave(); o_BindFramebuffer(t, f); EAGLContext *c = cur_ctx(); if (c) update_cur_target(c); }
+extern int g_fbk_dbg_on(void);
+static void h_BindFramebuffer(GLenum t, GLuint f) { fbo_dump_leave(); if (g_fbk_dbg_on()) fprintf(stderr, "EAGL(shim): FBK bind framebuffer %u\n", f); o_BindFramebuffer(t, f); EAGLContext *c = cur_ctx(); if (c) update_cur_target(c); }
 static void (*o_FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
 static void h_FramebufferTexture2D(GLenum a, GLenum b, GLenum c, GLuint d, GLint e) { o_FramebufferTexture2D(a, b, c, d, e); EAGLContext *x = cur_ctx(); if (x) update_cur_target(x); }
 static void (*o_FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
@@ -761,6 +870,19 @@ static void h_ShaderSource(GLuint sh, GLsizei count, const GLchar *const *str, c
     const GLchar *one = buf; o_ShaderSource(sh, 1, &one, NULL);
     free(buf);
 }
+// Debug: a shader that does not compile (CoreAnimation then silently goes without that program: glUseProgram(0) and draws that do nothing).
+static void (*o_CompileShader)(GLuint);
+static void h_CompileShader(GLuint sh) {
+    o_CompileShader(sh);
+    if (!g_debug) return;
+    GLint ok = 1; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (ok) return;
+    static int n; if (n++ >= 12) return;
+    GLint type = 0, len = 0; glGetShaderiv(sh, GL_SHADER_TYPE, &type); glGetShaderiv(sh, GL_SHADER_SOURCE_LENGTH, &len);
+    char *src = calloc(1, (size_t)len + 1), sl[1024] = ""; glGetShaderSource(sh, len + 1, NULL, src); glGetShaderInfoLog(sh, sizeof sl, NULL, sl);
+    fprintf(stderr, "EAGL(shim): COMPILE FAILED shader %u type 0x%x: %s\n%s\n----\n", sh, type, sl, src);
+    free(src);
+}
 // Debug: say why a program the render server links does not link (info log + the sources of its shaders).
 static void (*o_LinkProgram)(GLuint);
 static void h_LinkProgram(GLuint prog) {
@@ -783,6 +905,8 @@ static void h_LinkProgram(GLuint prog) {
 }
 static const struct { const char *name; void **orig; void *hook; } g_dirty_hooks[] = {
     { "glLinkProgram", (void **)&o_LinkProgram, h_LinkProgram },
+    { "glUseProgram", (void **)&o_UseProgram, h_UseProgram }, { "glUniformMatrix4fv", (void **)&o_UniformMatrix4fv, h_UniformMatrix4fv },
+    { "glCompileShader", (void **)&o_CompileShader, h_CompileShader },
     { "glActiveTexture", (void **)&o_ActiveTexture, h_ActiveTexture },
     { "glShaderSource", (void **)&o_ShaderSource, h_ShaderSource },
     { "glDrawArrays", (void **)&o_DrawArrays, h_DrawArrays }, { "glDrawElements", (void **)&o_DrawElements, h_DrawElements },
