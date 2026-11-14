@@ -689,6 +689,11 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
         fprintf(stderr, "EAGL(shim): program-0 draw #%ld: kind %d texture %u (%dx%d) dest %u blend %d colour array %d texcoord array %d", p->p0_n, kind, tex, w, h, p->fb_tex, glIsEnabled(GL_BLEND), en1, en2);
         if (en2 && t && st) fprintf(stderr, " texcoords (%g %g) (%g %g) (%g %g) (%g %g)", t[0], t[1], *(const float *)((const char *)t + st), *(const float *)((const char *)t + st + 4),
                                     *(const float *)((const char *)t + 2 * st), *(const float *)((const char *)t + 2 * st + 4), *(const float *)((const char *)t + 3 * st), *(const float *)((const char *)t + 3 * st + 4));
+        { GLint ty = 0, no = 0, cst = 0; void *cp = NULL; glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty); glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &no);
+          glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &cst); glGetVertexAttribPointerv(1, GL_VERTEX_ATTRIB_ARRAY_POINTER, &cp);
+          if (en1 && cp) { const uint8_t *q = cp; fprintf(stderr, " colour type 0x%x norm %d raw", ty, no); for (int i = 0; i < 8; i++) fprintf(stderr, " %02x", q[i]);
+                           if (cst) { fprintf(stderr, " /"); for (int i = 0; i < 8; i++) fprintf(stderr, " %02x", q[2 * cst + i]); } }
+          GLint sr = 0, dr = 0; glGetIntegerv(0x80c9, &sr); glGetIntegerv(0x80c8, &dr); fprintf(stderr, " blendfunc %x %x", sr, dr); }
         fprintf(stderr, " matrix [%g %g %g %g | %g %g %g %g | .. | %g %g %g %g]\n", p->vmat[0], p->vmat[1], p->vmat[2], p->vmat[3], p->vmat[4], p->vmat[5], p->vmat[6], p->vmat[7], p->vmat[12], p->vmat[13], p->vmat[14], p->vmat[15]);
     }
     return 1;
