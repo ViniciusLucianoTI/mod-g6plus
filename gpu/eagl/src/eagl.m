@@ -1323,6 +1323,11 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
     }
     IOSurfaceUnlock(ioSurface, kIOSurfaceLockReadOnly, NULL);
     (void)pf;
+    if (g_debug && bpp == 8 && w >= 4) {            // half-float RGBA (gradient colour maps): first, middle and last texel as stored
+        static int n; if (n++ < 12) { fprintf(stderr, "EAGL(shim): texImageIOSurface half-float %ux%u texels", w, h);
+            for (int k = 0; k < 3; k++) { const uint16_t *q = (const uint16_t *)(tmp + (size_t)(k == 0 ? 0 : k == 1 ? w / 2 : w - 1) * 8); fprintf(stderr, " [%04x %04x %04x %04x]", q[0], q[1], q[2], q[3]); }
+            fprintf(stderr, "\n"); }
+    }
     GLint oldAlign = 4, oldRow = 0;
     glGetIntegerv(GL_UNPACK_ALIGNMENT, &oldAlign);
     glGetIntegerv(GL_UNPACK_ROW_LENGTH, &oldRow);
