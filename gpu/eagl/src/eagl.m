@@ -130,6 +130,8 @@ struct _EAGLContextPrivate {
     int cur_att;                    // index of the attachment the bound draw framebuffer renders into (colour 0), -1 = none
     GLuint tmpfbo;
     EAGLMacroContext *macro;
+    // render-to-self emulation (fbk_pre): 2D texture bound per unit, active unit, colour texture of the draw framebuffer, the scratch copy
+    GLuint unit_tex[8]; int act; GLuint fb_tex; GLuint fbk_tex; int fbk_w, fbk_h; long fbk_n;
     EAGLContext *owner;             // not retained: the context this block belongs to (eagl_macro_enter)
 };
 
@@ -387,6 +389,7 @@ static void verify_direct(EAGLContext *c, Attach *a) {
     IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL); free(buf);
 }
 
+static uint32_t g_shot_done[6]; static int g_shot_n;
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
@@ -394,10 +397,13 @@ static void sync_att(EAGLContext *c, int i) {
         if (a->direct) {
             double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
             if (g_debug_frames) verify_direct(c, a);
+            // (the list of surfaces already written is per trigger: bglshot.sh restarts backboardd's view of it by removing the file; see below)
             // screenshot on demand: `touch /private/var/tmp/bgl-shot` -> /private/var/tmp/bgl-shot-<surface>.ppm (1/3 size) at the next sync of each display surface
-            if (g_debug && IOSurfaceGetWidth(a->surf) >= 1000 && access("/private/var/tmp/bgl-shot", F_OK) == 0) {
-                static uint32_t done[2]; uint32_t sid = IOSurfaceGetID(a->surf);
-                if (done[0] != sid && IOSurfaceLock(a->surf, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
+            if (g_debug && IOSurfaceGetWidth(a->surf) >= 1000 && access("/private/var/tmp/bgl-shot", F_OK) != 0) g_shot_n = 0;
+            else if (g_debug && IOSurfaceGetWidth(a->surf) >= 1000) {
+                uint32_t sid = IOSurfaceGetID(a->surf); int seen = 0;
+                for (int i = 0; i < g_shot_n; i++) if (g_shot_done[i] == sid) seen = 1;
+                if (!seen && g_shot_n < 6 && IOSurfaceLock(a->surf, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
                     char path[96]; snprintf(path, sizeof path, "/private/var/tmp/bgl-shot-%u.ppm", sid);
                     const uint8_t *b = IOSurfaceGetBaseAddress(a->surf); size_t w = IOSurfaceGetWidth(a->surf) / 3, h = IOSurfaceGetHeight(a->surf) / 3, bpr = IOSurfaceGetBytesPerRow(a->surf);
                     FILE *f = b ? fopen(path, "wb") : NULL;
@@ -405,7 +411,7 @@ static void sync_att(EAGLContext *c, int i) {
                         for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) { const uint8_t *q = b + y * 3 * bpr + x * 12; fputc(q[2], f); fputc(q[1], f); fputc(q[0], f); }
                         fclose(f); }
                     IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL);
-                    done[0] = sid; unlink("/private/var/tmp/bgl-shot");
+                    g_shot_done[g_shot_n++] = sid;      // every display surface synced while the trigger exists (the script removes it), each once
                 }
             }
             return;
@@ -463,9 +469,15 @@ static BOOL att_is_tex(Attach *a) { return a->kind ? a->kind == 1 : (glIsTexture
 static void update_cur_target(EAGLContext *c) {
     struct _EAGLContextPrivate *p = c->_private;
     p->cur_att = -1;
-    if (!p->natt) return;
     GLint fb = 0, type = 0, name = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+    p->fb_tex = 0;
+    if (fb) {
+        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+        if (type == GL_TEXTURE) { glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name); p->fb_tex = (GLuint)name; }
+        type = 0; name = 0;
+    }
+    if (!p->natt) return;
     if (!fb) { if (g_debug) { static int n; if (n++ < 20) fprintf(stderr, "EAGL(shim): FBO tracking: no framebuffer bound (%d attachments)\n", p->natt); } return; }
     glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
     glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
@@ -529,15 +541,65 @@ static void diag_maskdraw(const void *indices) {
         fprintf(stderr, "\n");
     }
 }
-static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); o_DrawArrays(a, b, c); }
+// Render to self. CoreAnimation's filters that read the destination (vibrancy: luminance map, colour matrix; programs with
+// `texture2DProj(textureN, texcoordD)`) bind the colour texture of the framebuffer they are drawing into as a sampler, glFlush, and draw
+// (CA::OGL::GLESContext::bind_destination_with_filters). Apple's GL gives them the pixels drawn so far; in Mesa that is an undefined feedback
+// loop (softpipe and freedreno both returned nothing useful: the lock screen clock and the tab bar glyphs were missing on the Moto G6 Plus).
+// Before such a draw, copy the destination (the scissor box when one is set) into a scratch texture and sample that instead.
+static void (*o_ActiveTexture)(GLenum);
+static void (*o_BindTexture)(GLenum, GLuint);
+static void h_ActiveTexture(GLenum t) { o_ActiveTexture(t); EAGLContext *c = cur_ctx(); if (c && t >= GL_TEXTURE0 && t < GL_TEXTURE0 + 8) c->_private->act = (int)(t - GL_TEXTURE0); }
+static unsigned fbk_pre(struct _EAGLContextPrivate *p) {
+    unsigned mask = 0;
+    if (!p->fb_tex) return 0;
+    for (int u = 0; u < 4; u++) if (p->unit_tex[u] == p->fb_tex) mask |= 1u << u;
+    if (!mask) return 0;
+    static int off = -1; if (off < 0) off = getenv("BGL_NO_FEEDBACK_COPY") != NULL;
+    if (off) return 0;
+    GLint w = 0, h = 0, mn = GL_LINEAR, mg = GL_LINEAR, ws = GL_CLAMP_TO_EDGE, wt = GL_CLAMP_TO_EDGE, sb[4] = { 0 };
+    int first = __builtin_ctz(mask);
+    o_ActiveTexture(GL_TEXTURE0 + first);          // the destination texture is bound here: read its size and sampling state
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &w); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &h);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &mn); glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &mg);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws); glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wt);
+    if (w <= 0 || h <= 0) { o_ActiveTexture(GL_TEXTURE0 + p->act); return 0; }
+    if (!p->fbk_tex) glGenTextures(1, &p->fbk_tex);
+    o_BindTexture(GL_TEXTURE_2D, p->fbk_tex);
+    if (mn != GL_NEAREST && mn != GL_LINEAR) mn = GL_LINEAR;      // the scratch copy has one level
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mn); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mg);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt);
+    int x0 = 0, y0 = 0, x1 = w, y1 = h;
+    if (glIsEnabled(GL_SCISSOR_TEST)) {
+        glGetIntegerv(GL_SCISSOR_BOX, sb);
+        x0 = sb[0] - 2; y0 = sb[1] - 2; x1 = sb[0] + sb[2] + 2; y1 = sb[1] + sb[3] + 2;
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > w) x1 = w; if (y1 > h) y1 = h;
+    }
+    if (p->fbk_w != w || p->fbk_h != h) {
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, w, h, 0);          // (re)allocate at the destination's size with its whole contents
+        p->fbk_w = w; p->fbk_h = h;
+    } else if (x1 > x0 && y1 > y0) {
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);
+    }
+    for (int u = first + 1; u < 4; u++) if (mask & (1u << u)) { o_ActiveTexture(GL_TEXTURE0 + u); o_BindTexture(GL_TEXTURE_2D, p->fbk_tex); }
+    o_ActiveTexture(GL_TEXTURE0 + p->act);
+    if (g_debug && (p->fbk_n++ < 6 || !(p->fbk_n % 2000))) fprintf(stderr, "EAGL(shim): render-to-self draw #%ld: destination texture %u (%dx%d) sampled on units 0x%x, copied %d,%d %dx%d, error 0x%x\n",
+                                                                   p->fbk_n, p->fb_tex, w, h, mask, x0, y0, x1 - x0, y1 - y0, glGetError());
+    return mask;
+}
+static void fbk_post(struct _EAGLContextPrivate *p, unsigned mask) {
+    for (int u = 0; u < 4; u++) if (mask & (1u << u)) { o_ActiveTexture(GL_TEXTURE0 + u); o_BindTexture(GL_TEXTURE_2D, p->unit_tex[u]); }
+    o_ActiveTexture(GL_TEXTURE0 + p->act);
+}
+#define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; call; if (fm_) fbk_post(fc_->_private, fm_); } while (0)
+static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); FBK_DRAW(o_DrawArrays(a, b, c)); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
-static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); o_DrawElements(a, b, c, d); }
+static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); FBK_DRAW(o_DrawElements(a, b, c, d)); }
 static void (*o_DrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
-static void h_DrawArraysInstanced(GLenum a, GLint b, GLsizei c, GLsizei d) { mark_cur_dirty(); o_DrawArraysInstanced(a, b, c, d); }
+static void h_DrawArraysInstanced(GLenum a, GLint b, GLsizei c, GLsizei d) { mark_cur_dirty(); FBK_DRAW(o_DrawArraysInstanced(a, b, c, d)); }
 static void (*o_DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void *, GLsizei);
-static void h_DrawElementsInstanced(GLenum a, GLsizei b, GLenum c, const void *d, GLsizei e) { mark_cur_dirty(); o_DrawElementsInstanced(a, b, c, d, e); }
+static void h_DrawElementsInstanced(GLenum a, GLsizei b, GLenum c, const void *d, GLsizei e) { mark_cur_dirty(); FBK_DRAW(o_DrawElementsInstanced(a, b, c, d, e)); }
 static void (*o_DrawRangeElements)(GLenum, GLuint, GLuint, GLsizei, GLenum, const void *);
-static void h_DrawRangeElements(GLenum a, GLuint b, GLuint c, GLsizei d, GLenum e, const void *f) { mark_cur_dirty(); o_DrawRangeElements(a, b, c, d, e, f); }
+static void h_DrawRangeElements(GLenum a, GLuint b, GLuint c, GLsizei d, GLenum e, const void *f) { mark_cur_dirty(); FBK_DRAW(o_DrawRangeElements(a, b, c, d, e, f)); }
 static void (*o_Clear)(GLbitfield);
 static void diag_fbo(void) {      // debug: say why a framebuffer the render server draws into is incomplete
     static int n; if (!g_debug || n >= 40) return;
@@ -606,8 +668,9 @@ static void h_BindTexture(GLenum target, GLuint name) {
     if (target != GL_TEXTURE_2D && g_debug) { static int n; if (n++ < 12) fprintf(stderr, "EAGL(shim): glBindTexture target 0x%x name %u\n", target, name); }
     if (target == 0x84f5) target = GL_TEXTURE_2D;   // rectangle textures do not exist in Mesa's ES: see h_ShaderSource
     o_BindTexture(target, name);
-    if (target != GL_TEXTURE_2D || !name || !g_nlive) return;
     EAGLContext *c = cur_ctx(); if (!c) return;
+    if (target == GL_TEXTURE_2D) c->_private->unit_tex[c->_private->act] = name;
+    if (target != GL_TEXTURE_2D || !name || !g_nlive) return;
     LiveSrc e; BOOL hit = NO;
     pthread_mutex_lock(&g_live_lock);
     for (int i = 0; i < g_nlive; i++) if (g_live[i].ctx == c && g_live[i].name == name) {
@@ -627,6 +690,7 @@ static void (*o_DeleteTextures)(GLsizei, const GLuint *);
 static void h_DeleteTextures(GLsizei n, const GLuint *t) {
     // A display texture that was drawn into but not yet copied (CoreAnimation recreates them) would lose its pixels: copy it out before it goes.
     EAGLContext *c = cur_ctx();
+    if (c) for (GLsizei i = 0; i < n; i++) for (int u = 0; u < 8; u++) if (t[i] && c->_private->unit_tex[u] == t[i]) c->_private->unit_tex[u] = 0;
     if (c) for (GLsizei i = 0; i < n; i++) for (int k = 0; k < c->_private->natt; k++) {
         Attach *a = &c->_private->att[k];
         if (a->name != t[i] || a->kind == 2 || !att_is_tex(a)) continue;
@@ -719,6 +783,7 @@ static void h_LinkProgram(GLuint prog) {
 }
 static const struct { const char *name; void **orig; void *hook; } g_dirty_hooks[] = {
     { "glLinkProgram", (void **)&o_LinkProgram, h_LinkProgram },
+    { "glActiveTexture", (void **)&o_ActiveTexture, h_ActiveTexture },
     { "glShaderSource", (void **)&o_ShaderSource, h_ShaderSource },
     { "glDrawArrays", (void **)&o_DrawArrays, h_DrawArrays }, { "glDrawElements", (void **)&o_DrawElements, h_DrawElements },
     { "glDrawArraysInstanced", (void **)&o_DrawArraysInstanced, h_DrawArraysInstanced }, { "glDrawElementsInstanced", (void **)&o_DrawElementsInstanced, h_DrawElementsInstanced },
