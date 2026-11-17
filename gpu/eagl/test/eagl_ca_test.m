@@ -123,6 +123,8 @@ static double render(CARenderer *r, CALayer *root, int W, int H, int frames, voi
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);       // keep our lines in order with the shim's stderr
+
     @autoreleasepool {
         const char *inj = getenv("EAGL_INJECT_LIB");       // injection build of the shim: patches the real EAGL classes at load
         if (inj && !(g_shim = dlopen(inj, RTLD_NOW))) { printf("FAIL  dlopen %s: %s\n", inj, dlerror()); return 1; }
@@ -289,9 +291,26 @@ int main(void) {
                 dump(surf, "text");
                 [tx removeFromSuperlayer]; [mk removeFromSuperlayer];
             }
+            // gradient with colours given in a gray colour space (white, alpha 1 -> 0), as the lock screen wallpaper has, and the same in sRGB
+            {
+                CGColorSpaceRef gs = CGColorSpaceCreateDeviceGray(), cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB), eg = CGColorSpaceCreateWithName(kCGColorSpaceExtendedGray);
+                CGFloat g1[2] = { 1, 1 }, g0[2] = { 1, 0 }, c1[4] = { 1, 1, 1, 1 }, c0[4] = { 1, 1, 1, 0 };
+                struct { const char *name; CGColorSpaceRef sp; CGFloat *a, *b; } v[3] = { { "device gray", gs, g1, g0 }, { "extended gray", eg, g1, g0 }, { "sRGB", cs, c1, c0 } };
+                for (int k = 0; k < 3; k++) {
+                    CGColorRef ca = CGColorCreate(v[k].sp, v[k].a), cb = CGColorCreate(v[k].sp, v[k].b);
+                    CAGradientLayer *gl = [CAGradientLayer layer];
+                    gl.frame = CGRectMake(20, 100, 64, 64); gl.colors = @[ (id)ca, (id)cb ];
+                    CALayer *under = [CALayer layer]; under.frame = gl.frame; under.backgroundColor = rgb(0, 0, 1);
+                    [root addSublayer:under]; [root addSublayer:gl];
+                    render(r, root, W, H, 1, ^{}); usleep(600000); render(r, root, W, H, 2, ^{});
+                    uint8_t q[4]; px(surf, 52, 104, q);
+                    printf("GRADIENT white over blue, colours in %-13s: start BGRA=%3d %3d %3d (want about 255 255 255)\n", v[k].name, q[0], q[1], q[2]);
+                    [gl removeFromSuperlayer]; [under removeFromSuperlayer]; CGColorRelease(ca); CGColorRelease(cb);
+                }
+            }
             // compositing filters (blend modes that read the destination): what vibrancy on tab bar glyphs and the lock screen clock use.
             // No expected values: compare the softpipe and GPU runs. "spread" = largest channel difference between 5 points inside the layer.
-            for (NSString *mode in @[ @"plusL", @"plusD", @"multiplyBlendMode", @"screenBlendMode", @"destOut", @"vibrantDark", @"vibrantLight" ]) {
+            for (NSString *mode in @[ @"plusL", @"plusD", @"multiplyBlendMode", @"screenBlendMode", @"destOut", @"vibrantDark", @"vibrantLight", @"overlayBlendMode", @"softLightBlendMode", @"hardLightBlendMode", @"colorDodgeBlendMode", @"colorBurnBlendMode", @"darkenBlendMode", @"lightenBlendMode", @"differenceBlendMode", @"exclusionBlendMode", @"hueBlendMode", @"saturationBlendMode", @"colorBlendMode", @"luminosityBlendMode", @"normalBlendMode", @"sourceAtop", @"sourceIn", @"destIn", @"xor", @"copy" ]) {
                 CALayer *bl = [CALayer layer];
                 bl.frame = CGRectMake(20, 20, 64, 64);
                 bl.backgroundColor = rgb(0.5, 0.25, 0.75);

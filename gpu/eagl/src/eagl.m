@@ -133,7 +133,7 @@ struct _EAGLContextPrivate {
     // render-to-self emulation (fbk_pre): 2D texture bound per unit, active unit, colour texture of the draw framebuffer, the scratch copy
     GLuint unit_tex[8]; int act; GLuint fb_tex; GLuint fbk_tex; int fbk_w, fbk_h; long fbk_n;
     // program 0 emulation (p0_pre): the program CoreAnimation has current, where it keeps its vertex matrix, our stand-in programs
-    GLuint cur_prog; const GLfloat *vmat; GLuint p0_prog[3]; GLint p0_umat[3], p0_utm[3]; long p0_n;
+    GLuint cur_prog; const GLfloat *vmat; GLuint p0_prog[4]; GLint p0_umat[4], p0_utm[4]; long p0_n;
     EAGLContext *owner;             // not retained: the context this block belongs to (eagl_macro_enter)
 };
 
@@ -646,14 +646,15 @@ static void (*o_UseProgram)(GLuint);
 static void (*o_UniformMatrix4fv)(GLint, GLsizei, GLboolean, const GLfloat *);
 static void h_UseProgram(GLuint prog) { o_UseProgram(prog); EAGLContext *c = cur_ctx(); if (c) c->_private->cur_prog = prog; }
 static void h_UniformMatrix4fv(GLint loc, GLsizei n, GLboolean tr, const GLfloat *v) { o_UniformMatrix4fv(loc, n, tr, v); if (loc == 0 && n == 1 && v) { EAGLContext *c = cur_ctx(); if (c) c->_private->vmat = v; } }
-static GLuint p0_build(int kind, GLint *umat, GLint *utm) {       // 0 = texture, 1 = texture * colour, 2 = colour
+static GLuint p0_build(int kind, GLint *umat, GLint *utm) {       // 0 = texture, 1 = texture * colour, 2 = colour, 3 = colour * texture alpha (experiment)
     static const char *vs = "uniform highp mat4 vertex_matrix; uniform highp vec4 texmat0; attribute highp vec4 vertex_position; attribute lowp vec4 vertex_color;"
                             "attribute highp vec2 vertex_texcoord0; varying lowp vec4 color; varying highp vec2 tc;"
                             "void main() { gl_Position = vertex_matrix * vertex_position; color = vertex_color; tc = vertex_texcoord0 * texmat0.xy + texmat0.zw; }";
-    static const char *fs[3] = {
+    static const char *fs[4] = {
         "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = texture2D(texture0, tc); }",
         "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = texture2D(texture0, tc) * color; }",
-        "varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = color; }" };
+        "varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = color; }",
+        "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = color * texture2D(texture0, tc).a; }" };
     GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER), pr = glCreateProgram();
     glShaderSource(v, 1, &vs, NULL); glCompileShader(v); glShaderSource(f, 1, &fs[kind], NULL); glCompileShader(f);
     glAttachShader(pr, v); glAttachShader(pr, f);
@@ -672,7 +673,10 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     GLuint tex = p->unit_tex[0];
     int kind = tex ? (en1 ? 1 : 0) : 2;
     static int fill = -1; if (fill < 0) fill = getenv("BGL_PROGRAM0_FILL") != NULL;
-    if (kind == 2 && !fill) return 0;      // without a texture: drawing the vertex colour painted a red gradient over the display (seen 2026-11-14); left as before (nothing)
+    if (kind == 2 && !fill) return 0;
+    // experiment switch, re-read now and then: /private/var/tmp/bgl-p0mode = 1: colour * texture alpha for blended draws, 2: for all textured draws
+    { static int mode, tick; if (!(tick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); mode = 0; if (mf) { mode = fgetc(mf) - '0'; fclose(mf); } }
+      if (kind == 1 && (mode == 2 || (mode == 1 && glIsEnabled(GL_BLEND)))) kind = 3; }      // without a texture: drawing the vertex colour painted a red gradient over the display (seen 2026-11-14); left as before (nothing)
     if (!p->p0_prog[kind]) { p->p0_prog[kind] = p0_build(kind, &p->p0_umat[kind], &p->p0_utm[kind]); if (!p->p0_prog[kind]) return 0; }
     o_UseProgram(p->p0_prog[kind]);
     o_UniformMatrix4fv(p->p0_umat[kind], 1, GL_FALSE, p->vmat);
@@ -699,10 +703,18 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     return 1;
 }
 static void fbk_dbg_plain(struct _EAGLContextPrivate *p) {
-    GLint prog = 0, sb[4] = { 0 }; glGetIntegerv(GL_CURRENT_PROGRAM, &prog); glGetIntegerv(GL_SCISSOR_BOX, sb);
-    fprintf(stderr, "EAGL(shim): FBK   draw prog %d dest-tex %u units %u %u %u blend %d scissor %d (%d %d %d %d)\n", prog, p->fb_tex, p->unit_tex[0], p->unit_tex[1], p->unit_tex[2], glIsEnabled(GL_BLEND), glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3]);
+    GLint prog = 0, sb[4] = { 0 }, sr = 0, dr = 0, sa = 0, da = 0, eq = 0, st = 0, cst = 0, en1 = 0; GLboolean cm[4] = { 1, 1, 1, 1 }; void *pp = NULL, *cp = NULL;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prog); glGetIntegerv(GL_SCISSOR_BOX, sb);
+    glGetIntegerv(0x80c9, &sr); glGetIntegerv(0x80c8, &dr); glGetIntegerv(0x80cb, &sa); glGetIntegerv(0x80ca, &da); glGetIntegerv(0x8009, &eq); glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pp); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st);
+    glGetVertexAttribPointerv(1, GL_VERTEX_ATTRIB_ARRAY_POINTER, &cp); glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &cst); glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en1);
+    fprintf(stderr, "EAGL(shim): FBK   draw prog %u(%d) dest-tex %u units %u %u %u blend %d (%x %x / %x %x eq %x) mask %d%d%d%d scissor %d (%d %d %d %d)", p->cur_prog, prog, p->fb_tex, p->unit_tex[0], p->unit_tex[1], p->unit_tex[2],
+            glIsEnabled(GL_BLEND), sr, dr, sa, da, eq, cm[0], cm[1], cm[2], cm[3], glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3]);
+    if (pp && st) { const float *a = pp, *b = (const float *)((const char *)pp + 2 * st); fprintf(stderr, " pos (%g %g)-(%g %g)", a[0], a[1], b[0], b[1]); }
+    if (en1 && cp) { const uint16_t *q = cp; fprintf(stderr, " colour %04x %04x %04x %04x", q[0], q[1], q[2], q[3]); }
+    fprintf(stderr, "\n");
 }
-#define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } else if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) o_UseProgram(0); } while (0)
+#define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) o_UseProgram(0); } while (0)
 static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); FBK_DRAW(o_DrawArrays(a, b, c)); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
 static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); FBK_DRAW(o_DrawElements(a, b, c, d)); }
