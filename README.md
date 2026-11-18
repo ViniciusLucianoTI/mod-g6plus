@@ -49,7 +49,7 @@ The kernel resets the SoC by itself after a set time (`sweetselfreset=N` seconds
 | Area | State |
 | --- | --- |
 | iOS | 16.7.16 (20H392) to the **lock screen and the home screen**; Settings and the stock apps open |
-| CPU | 8× Kryo 260 (ARMv8.0, no LSE, no pointer authentication). iOS 16 for the iPhone X is plain arm64, so no binary rewriting is needed. Cluster clocks raised from the bootloader's 1670 / ~300 MHz to 2016 / 1536 MHz (the most the boot rail voltage allows) |
+| CPU | 8× Kryo 260 (ARMv8.0, no LSE, no pointer authentication). iOS 16 for the iPhone X is plain arm64, so no binary rewriting is needed. Cluster clocks raised from the bootloader's 1670 / ~300 MHz to 2208 MHz (the maximum) / 1728 MHz (1843 needs a rail change) |
 | Memory | 3.2 GB of the 4 GB given to the kernel, 4 KiB pages |
 | Display | Tianma 1080×2160 panel; iOS renders the iPhone X layout (1125×2436), scaled with thin black bars |
 | Touch | Goodix GT9xx over I²C, powered through our own RPM client |
