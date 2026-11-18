@@ -55,8 +55,8 @@ The kernel resets the SoC by itself after a set time (`sweetselfreset=N` seconds
 | Touch | Goodix GT9xx over I²C, powered through our own RPM client |
 | Buttons | Power and both volume keys (PM660 / PM660L over SPMI) |
 | USB | One link for the root disk, the kernel log, input from the Mac, and SSH at `root@192.168.7.2` |
-| GPU | **Adreno 508 composites the UI**: zap shader authenticated by TrustZone, command processor running, Mesa freedreno a5xx (OpenGL ES 3.1), CoreAnimation's GLES renderer in `backboardd` |
-| Working on | Vibrant text on the GPU path (lock screen clock, tab bar glyphs), rendering without the forced-GMEM workaround, GPU clock above 240 MHz |
+| GPU | **Adreno 508 composites the UI**: zap shader authenticated by TrustZone, command processor running, Mesa freedreno a5xx (OpenGL ES 3.1), CoreAnimation's GLES renderer in `backboardd`. Core clock on the GPU's own PLLs, 160 to 700 MHz, scaled with load, with a temperature ceiling |
+| Working on | Frame rate (what bounds a frame once the GPU is fast), rendering without the forced-GMEM workaround, GPU compositing from a cold boot |
 | Not working | Wi-Fi, cellular, Bluetooth, audio, camera, sensors, battery gauge, CPU frequency scaling, Metal |
 
 Measured on the phone, CoreAnimation scenes drawn by the GPU instead of the CPU (small offscreen scenes, GPU at 240 MHz):
