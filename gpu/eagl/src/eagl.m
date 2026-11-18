@@ -408,7 +408,9 @@ static void sync_att(EAGLContext *c, int i) {
             else if (g_debug && IOSurfaceGetWidth(a->surf) >= 1000) {
                 uint32_t sid = IOSurfaceGetID(a->surf); int seen = 0;
                 for (int i = 0; i < g_shot_n; i++) if (g_shot_done[i] == sid) seen = 1;
-                if (!seen && g_shot_n < 6 && IOSurfaceLock(a->surf, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
+                // every sync while the trigger exists rewrites the file: the last one before the script removes the trigger is what counts. (Writing only the
+                // first sync caught frames half way: CoreAnimation flushes in the middle of a frame, e.g. before the tab bar is drawn: 2026-11-17.)
+                if ((seen || g_shot_n < 6) && IOSurfaceLock(a->surf, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
                     char path[96]; snprintf(path, sizeof path, "/private/var/tmp/bgl-shot-%u.ppm", sid);
                     const uint8_t *b = IOSurfaceGetBaseAddress(a->surf); size_t w = IOSurfaceGetWidth(a->surf) / 3, h = IOSurfaceGetHeight(a->surf) / 3, bpr = IOSurfaceGetBytesPerRow(a->surf);
                     FILE *f = b ? fopen(path, "wb") : NULL;
@@ -416,7 +418,7 @@ static void sync_att(EAGLContext *c, int i) {
                         for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) { const uint8_t *q = b + y * 3 * bpr + x * 12; fputc(q[2], f); fputc(q[1], f); fputc(q[0], f); }
                         fclose(f); }
                     IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL);
-                    g_shot_done[g_shot_n++] = sid;      // every display surface synced while the trigger exists (the script removes it), each once
+                    if (!seen) g_shot_done[g_shot_n++] = sid;      // every display surface synced while the trigger exists (the script removes it), each once
                 }
             }
             return;
@@ -464,7 +466,8 @@ static void pipe_count_sync(EAGLContext *c) {
     size_t w = 0, h = 0; for (int i = 0; i < c->_private->natt; i++) { size_t aw = IOSurfaceGetWidth(c->_private->att[i].surf); if (aw > w) { w = aw; h = IOSurfaceGetHeight(c->_private->att[i].surf); } }
     if (w >= 1000 && h >= 2000 && ++g_ps_syncs % 60 == 0) pipe_stats_report();
 }
-static void shim_glFlush(void) { g_frame++; double t = g_debug ? now_ms() : 0; mesa_glFlush(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
+extern int g_fbk_dbg_on(void);
+static void shim_glFlush(void) { g_frame++; if (g_fbk_dbg_on()) fprintf(stderr, "EAGL(shim): FBK flush (frame %u)\n", g_frame); double t = g_debug ? now_ms() : 0; mesa_glFlush(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
 static void shim_glFinish(void) { double t = g_debug ? now_ms() : 0; mesa_glFinish(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
 
 // Dirty tracking of the display-size attachments: the render server draws into one texture per frame (through an FBO) and flushes; copying both of its
@@ -815,7 +818,7 @@ static void fbk_window_poll(void) {
     if (!g_debug) return;
     if (left && !--left) g_fbk_dbg = 0;
     if ((++tick & 63) || access("/private/var/tmp/bgl-fbk", F_OK)) return;
-    unlink("/private/var/tmp/bgl-fbk"); g_fbk_dbg = 1000000; left = 4000;
+    unlink("/private/var/tmp/bgl-fbk"); g_fbk_dbg = 1000000; left = 6000;
 }
 #define FBK_DRAW(call) do { fbk_window_poll(); EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
 static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); FBK_DRAW(o_DrawArrays(a, b, c)); }
@@ -848,7 +851,7 @@ static void diag_fbo(void) {      // debug: say why a framebuffer the render ser
     (void)w;
     fprintf(stderr, "EAGL(shim): INCOMPLETE FBO %d status 0x%x: colour0 type 0x%x name %d bits %d/%d/%d/%d, depth type 0x%x name %d, stencil type 0x%x name %d\n", fb, st, t0, n0, r, g, b, a, td, nd, ts, ns);
 }
-static void h_Clear(GLbitfield m) { mark_cur_dirty(); diag_fbo(); o_Clear(m); }
+static void h_Clear(GLbitfield m) { mark_cur_dirty(); diag_fbo(); if (g_fbk_dbg_on()) { GLint sb[4] = { 0 }, fb = 0; glGetIntegerv(GL_SCISSOR_BOX, sb); glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); fprintf(stderr, "EAGL(shim): FBK clear fbo %d scissor %d (%d %d %d %d)\n", fb, glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3]); } o_Clear(m); }
 static void (*o_ClearBufferfv)(GLenum, GLint, const GLfloat *);
 static void h_ClearBufferfv(GLenum a, GLint b, const GLfloat *c) { mark_cur_dirty(); o_ClearBufferfv(a, b, c); }
 static void mark_bound_texture_dirty(void) {     // texture writes (upload / copy) land in the texture bound to GL_TEXTURE_2D
@@ -1425,6 +1428,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
         p->att[j] = p->att[--p->natt];
     }
     update_cur_target(self);
+    if (g_fbk_dbg_on()) fprintf(stderr, "EAGL(shim): FBK attach texture %u <- surface %u %zux%zu direct %d\n", name, IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), direct);
     if (g_debug && IOSurfaceGetWidth(surface) * IOSurfaceGetHeight(surface) >= 1000000 && IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
         const uint8_t *sp = IOSurfaceGetBaseAddress(surface); size_t bpr = IOSurfaceGetBytesPerRow(surface), sh2 = IOSurfaceGetHeight(surface), sw2 = IOSurfaceGetWidth(surface);
         if (sp) fprintf(stderr, "EAGL(shim): attach: surface %u holds first %02x%02x%02x%02x centre %02x%02x%02x%02x (direct %d)\n", IOSurfaceGetID(surface), sp[0], sp[1], sp[2], sp[3],
