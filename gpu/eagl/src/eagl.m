@@ -92,7 +92,7 @@ __attribute__((visibility("default"))) const char *EAGLShimVersionString(void) {
 #define DUMMY_W 16
 #define DUMMY_H 16
 #define POOL_N 3
-#define MAX_BIND 16
+#define MAX_BIND 64
 
 typedef struct {                    // renderbuffer bound to a drawable (renderbufferStorage:fromDrawable:)
     GLuint rb;
@@ -1408,6 +1408,13 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
         }
         if (glGetError() != GL_NO_ERROR) EAGL_DEBUG("attachImage: storage for %ux%u failed\n", w, h);
     }
+    // A source image needs no attachment record (nothing is ever copied back to its surface; the live-surface list refreshes it). Registering
+    // them filled the table: with 16 slots the Photos app's row icons, chevrons and tab glyphs did not all fit, attachImage returned NO for the
+    // ones over the limit and CoreAnimation left them out, a different set in each display buffer (user's video 2026-11-17: icons blinking).
+    if (source_only) {
+        if (g_debug) { static int n; if (n++ < 40) fprintf(stderr, "EAGL(shim): [ctx %p] attachImage %lu -> texture %u, IOSurface %u (%zux%zu) as a source image\n", self, (unsigned long)image, name, IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface)); }
+        return YES;
+    }
     int idx = -1;
     for (int i = 0; i < p->natt; i++) if (p->att[i].name == name && p->att[i].kind == kind) idx = i;
     if (!surface) {                                     // detach
@@ -1415,7 +1422,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
         return YES;
     }
     if (idx < 0) {
-        if (p->natt >= MAX_BIND) return NO;
+        if (p->natt >= MAX_BIND) { static int n; if (n++ < 20) fprintf(stderr, "EAGL(shim): attachImage: no free attachment slot (%d in use): refused\n", p->natt); return NO; }
         idx = p->natt++;
     } else { osm_sweet_forget(IOSurfaceGetID(p->att[idx].surf)); CFRelease(p->att[idx].surf); }
     p->att[idx].name = name; p->att[idx].kind = kind; p->att[idx].surf = (IOSurfaceRef)CFRetain(surface); p->att[idx].inverted = inverted; p->att[idx].dirty = source_only ? 0 : 1; p->att[idx].direct = direct;
