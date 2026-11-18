@@ -11,6 +11,10 @@ Default list, each observed on the G6 (2026-11-12, ps and the kernel's exec log)
   com.apple.voicemail.vmd   vmd at 94 % of a core, no modem
   com.apple.bluetoothd      exec'd 39 times in 12 minutes, no Bluetooth driver
   com.apple.fairplayd.H2    exec'd 39 times in 12 minutes
+
+Also applied on the G6's root image (2026-11-17, pass the labels on the command line): com.apple.ReportCrash
+(184 % CPU while other things crash in a loop), com.apple.nanotimekitcompaniond (exec'd 92 times in 40 minutes),
+com.apple.sirittsd (its three synthesiser extensions crash 29 times each in the same time).
 """
 import plistlib, subprocess, sys
 
