@@ -398,13 +398,20 @@ static void verify_direct(EAGLContext *c, Attach *a) {
     IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL); free(buf);
 }
 
+static void (*mesa_glFlush)(void), (*mesa_glFinish)(void);
 static uint32_t g_shot_done[6]; static int g_shot_n;
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
         a->dirty = 0;
         if (a->direct) {
-            double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
+            // Experiment switches (2026-11-18, spindump: on the Moto G6 Plus 31 % of the display thread waits for the GPU in st_finish here and 24 % is the kernel's
+            // clean+invalidate of the whole 11 MB display surface): /private/var/tmp/bgl-nodsync = finish but no cache sync, bgl-nofinish = flush only, neither.
+            static int sync_mode = -1; static unsigned sync_chk;
+            if (sync_mode < 0 || (++sync_chk & 31) == 0) sync_mode = access("/private/var/tmp/bgl-nofinish", F_OK) == 0 ? 2 : access("/private/var/tmp/bgl-nodsync", F_OK) == 0 ? 1 : 0;
+            double td = g_debug ? now_ms() : 0;
+            if (sync_mode == 0) osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); else if (sync_mode == 1) mesa_glFinish();
+            if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
             if (g_debug_frames) verify_direct(c, a);
             // (the list of surfaces already written is per trigger: bglshot.sh restarts backboardd's view of it by removing the file; see below)
             // screenshot on demand: `touch /private/var/tmp/bgl-shot` -> /private/var/tmp/bgl-shot-<surface>.ppm (1/3 size) at the next sync of each display surface
@@ -464,7 +471,6 @@ static void sync_attached(EAGLContext *c) {
 }
 
 // glFlush / glFinish wrappers installed over the Mesa entry points (see eagl_install_hooks).
-static void (*mesa_glFlush)(void), (*mesa_glFinish)(void);
 static void pipe_count_sync(EAGLContext *c) {
     if (!g_debug || !c->_private->natt) return;
     size_t w = 0, h = 0; for (int i = 0; i < c->_private->natt; i++) { size_t aw = IOSurfaceGetWidth(c->_private->att[i].surf); if (aw > w) { w = aw; h = IOSurfaceGetHeight(c->_private->att[i].surf); } }
