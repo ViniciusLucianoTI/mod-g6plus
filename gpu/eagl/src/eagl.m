@@ -44,6 +44,7 @@
 #endif
 
 #define EAGL_DEBUG(...) do { if (g_debug) fprintf(stderr, "EAGL(shim): " __VA_ARGS__); } while (0)
+static long g_vcm_copies, g_vcm_reuses, g_fbk_copies, g_p0_draws;      // statistics for the PIPE line
 static uint32_t g_frame = 1; static long g_live_sum_hits;       // frame counter (glFlush) and checksum-triggered refreshes of small live images
 static int g_argb_src;          // texImageIOSurface: the 4-byte source is A,R,G,B (set by attachImage for surfaces without a fourcc)
 // Live IOSurface textures: iOS binds an IOSurface as texture storage, so a producer that writes the surface after the bind (glyph renderers, snapshot
@@ -136,6 +137,7 @@ struct _EAGLContextPrivate {
     GLuint unit_tex[8]; int act; GLuint fb_tex; GLuint fbk_tex; int fbk_w, fbk_h; long fbk_n;
     // program 0 emulation (p0_pre): the program CoreAnimation has current, where it keeps its vertex matrix, our stand-in programs
     GLuint cur_prog; const GLfloat *vmat; GLuint p0_prog[6]; GLint p0_umat[6], p0_utm[6]; long p0_n;
+    int vc_valid, vc_n; GLuint vc_for; int vc_box[16][4];      // vcm: the scratch copy of the destination is current for vc_for except inside these boxes (drawn since)
     void *ca_ctx;                   // CoreAnimation's CA::OGL::GLContext for this context (eagl_macro_enter), NULL until found
     EAGLContext *owner;             // not retained: the context this block belongs to (eagl_macro_enter)
 };
@@ -364,6 +366,7 @@ static void pipe_stats_report(void) {
             (int)dn, now - last_t, (now - last_t) / dn, (g_ps_flush_ms - last_flush) / dn, st[0] - last[0], st[6] - last[6],
             (st[1] - last[1]) / dn, (st[2] - last[2]) / dn, (st[3] - last[3]) / dn, (st[4] - last[4]) / dn, (st[5] - last[5]) / dn,
             g_ps_cpu_n - last_cpu_n, (g_ps_cpu_ms - last_cpu) / dn, g_ps_direct_n, g_ps_direct_n ? g_ps_direct_ms / g_ps_direct_n : 0.0, g_ps_skipped, g_mark_hit, g_mark_miss);
+    { static long lv, lr, lf, lp; fprintf(stderr, "EAGL(shim): PIPE+ in those syncs: vcm destination copies %ld reused %ld | render-to-self copies %ld | program-0 draws %ld | live refreshes by contents %ld total\n", g_vcm_copies - lv, g_vcm_reuses - lr, g_fbk_copies - lf, g_p0_draws - lp, g_live_sum_hits); lv = g_vcm_copies; lr = g_vcm_reuses; lf = g_fbk_copies; lp = g_p0_draws; }
     memcpy(last, st, sizeof st); last_flush = g_ps_flush_ms; last_cpu = g_ps_cpu_ms; last_t = now; last_cpu_n = g_ps_cpu_n; last_syncs = g_ps_syncs;
 }
 
@@ -562,8 +565,9 @@ static unsigned fbk_pre(struct _EAGLContextPrivate *p) {
     if (!p->fb_tex) return 0;
     for (int u = 0; u < 4; u++) if (p->unit_tex[u] == p->fb_tex) mask |= 1u << u;
     if (!mask) return 0;
-    static int off = -1; if (off < 0) off = getenv("BGL_NO_FEEDBACK_COPY") != NULL;
+    static int off = -1, tick; if (off < 0 || !(tick++ & 255)) off = getenv("BGL_NO_FEEDBACK_COPY") != NULL || access("/private/var/tmp/bgl-nofbk", F_OK) == 0;
     if (off) return 0;
+    p->vc_valid = 0; g_fbk_copies++; // the scratch texture is about to hold something else
     GLint w = 0, h = 0, mn = GL_LINEAR, mg = GL_LINEAR, ws = GL_CLAMP_TO_EDGE, wt = GL_CLAMP_TO_EDGE, sb[4] = { 0 };
     int first = __builtin_ctz(mask);
     o_ActiveTexture(GL_TEXTURE0 + first);          // the destination texture is bound here: read its size and sampling state
@@ -697,7 +701,7 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     // CoreAnimation's GL path already emulates with its own passes (copy, colour matrix in place, masked draw back): drawing the layer itself as
     // well put its raw colours on screen (the red gradient over the wallpaper). So 0x2d..0x2f (vcm, vdk, vlt) are left undrawn.
     int fn = -1;
-    if (p->ca_ctx) { void *state = NULL; uint8_t b = 0; if (safe_read((const char *)p->ca_ctx + 0x10, &state, sizeof state) && state && safe_read((const char *)state + 0x10, &b, 1)) fn = b; }
+    if (p->ca_ctx) { const uint8_t *state = *(const uint8_t *const *)((const char *)p->ca_ctx + 0x10); if (state) fn = state[0x10]; }      // plain reads: the object was validated once (eagl_macro_enter) and lives as long as the context
     { static int all = -1, tick; if (all < 0 || !(tick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); all = 0; if (mf) { all = fgetc(mf) == '3'; fclose(mf); } }
       static int novcm = -1; if (novcm < 0) novcm = getenv("BGL_P0_NO_VCM") != NULL;
       int vcm = fn == 0x2d && !novcm && p->unit_tex[0] && p->fb_tex && g_fu[0].comps == 4 && g_fu[0].count == 5;
@@ -723,7 +727,7 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     o_UseProgram(p->p0_prog[kind]);
     o_UniformMatrix4fv(p->p0_umat[kind], 1, GL_FALSE, p->vmat);
     if (kind == 4 || kind == 5) { GLint l = glGetUniformLocation(p->p0_prog[kind], "cm"); if (l >= 0) glUniform4fv(l, 5, g_fu[0].v); }
-    int ret = 1;
+    int ret = 1; g_p0_draws++;
     if (kind == 5) {                 // what is on screen under the layer -> the scratch texture, on unit 1
         GLint dw = 0, dh = 0, sb[4] = { 0 };
         o_ActiveTexture(GL_TEXTURE1);
@@ -734,8 +738,18 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         int x0 = 0, y0 = 0, x1 = dw, y1 = dh;
         if (glIsEnabled(GL_SCISSOR_TEST)) { glGetIntegerv(GL_SCISSOR_BOX, sb); x0 = sb[0]; y0 = sb[1]; x1 = sb[0] + sb[2]; y1 = sb[1] + sb[3]; if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > dw) x1 = dw; if (y1 > dh) y1 = dh; }
-        if (p->fbk_w != dw || p->fbk_h != dh) { glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, dw, dh, 0); p->fbk_w = dw; p->fbk_h = dh; }
-        else if (x1 > x0 && y1 > y0) glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);
+        // One copy serves a run of vcm draws (a tab bar is eight of them, glyph and label per tab): reading the destination back makes the GPU
+        // finish and resolve what it has, so a copy per draw was a full pass over the display each time. The copy stays good for the next vcm draw
+        // as long as nothing else drew into this framebuffer and the new box does not touch a box a vcm draw has painted since.
+        static int every = -1; if (every < 0) every = getenv("BGL_VCM_COPY_EVERY_DRAW") != NULL;
+        int reuse = !every && p->vc_valid && p->vc_for == p->fb_tex && p->fbk_w == dw && p->fbk_h == dh;
+        for (int i = 0; reuse && i < p->vc_n; i++) { const int *b = p->vc_box[i]; if (x0 < b[2] && b[0] < x1 && y0 < b[3] && b[1] < y1) reuse = 0; }
+        if (!reuse) {
+            if (p->fbk_w != dw || p->fbk_h != dh) { glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, dw, dh, 0); p->fbk_w = dw; p->fbk_h = dh; }
+            else glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, dw, dh);
+            p->vc_valid = 1; p->vc_for = p->fb_tex; p->vc_n = 0; g_vcm_copies++;
+        } else g_vcm_reuses++;
+        if (p->vc_n < 16) { int *b = p->vc_box[p->vc_n++]; b[0] = x0; b[1] = y0; b[2] = x1; b[3] = y1; } else p->vc_valid = 0;
         o_ActiveTexture(GL_TEXTURE0 + p->act);
         ret = 2;
     }
@@ -820,7 +834,7 @@ static void fbk_window_poll(void) {
     if ((++tick & 63) || access("/private/var/tmp/bgl-fbk", F_OK)) return;
     unlink("/private/var/tmp/bgl-fbk"); g_fbk_dbg = 1000000; left = 6000;
 }
-#define FBK_DRAW(call) do { fbk_window_poll(); EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
+#define FBK_DRAW(call) do { fbk_window_poll(); EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; if (fc_ && p0_ != 2) fc_->_private->vc_valid = 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
 static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); FBK_DRAW(o_DrawArrays(a, b, c)); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
 static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); FBK_DRAW(o_DrawElements(a, b, c, d)); }
