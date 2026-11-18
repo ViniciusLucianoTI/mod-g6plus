@@ -45,7 +45,7 @@
 
 #define EAGL_DEBUG(...) do { if (g_debug) fprintf(stderr, "EAGL(shim): " __VA_ARGS__); } while (0)
 static uint8_t g_smp_used[2048], g_smp_known[2048];       // per GL program: units its sampler uniforms use (fbk_pre); forgotten when the program is linked again
-static long g_vcm_copies, g_vcm_reuses, g_fbk_copies, g_p0_draws;      // statistics for the PIPE line
+static long g_vcm_copies, g_vcm_reuses, g_fbk_copies, g_p0_draws; static double g_fbk_mpx, g_fbk_full; static long g_fk_reuse, g_fk_part, g_fk_fullc;      // statistics for the PIPE line
 static uint32_t g_frame = 1; static long g_live_sum_hits;       // frame counter (glFlush) and checksum-triggered refreshes of small live images
 static int g_argb_src;          // texImageIOSurface: the 4-byte source is A,R,G,B (set by attachImage for surfaces without a fourcc)
 // Live IOSurface textures: iOS binds an IOSurface as texture storage, so a producer that writes the surface after the bind (glyph renderers, snapshot
@@ -138,6 +138,7 @@ struct _EAGLContextPrivate {
     GLuint unit_tex[8]; int act; GLuint fb_tex; GLuint fbk_tex; int fbk_w, fbk_h; long fbk_n;
     // program 0 emulation (p0_pre): the program CoreAnimation has current, where it keeps its vertex matrix, our stand-in programs
     GLuint cur_prog; const GLfloat *vmat; GLuint p0_prog[6]; GLint p0_umat[6], p0_utm[6]; long p0_n;
+    int fk_valid, fk_n; GLuint fk_for; int fk_box[48][4];      // scratch copy of destination fk_for: current everywhere except inside these boxes (drawn since the copy)
     int vc_valid, vc_n; GLuint vc_for; int vc_box[16][4];      // vcm: the scratch copy of the destination is current for vc_for except inside these boxes (drawn since)
     void *ca_ctx;                   // CoreAnimation's CA::OGL::GLContext for this context (eagl_macro_enter), NULL until found
     EAGLContext *owner;             // not retained: the context this block belongs to (eagl_macro_enter)
@@ -532,6 +533,7 @@ static int bgl_SwapEnd(void *fb) {
     if ((g_nswap++ & 31) == 0) g_oneflush = access("/private/var/tmp/bgl-multiflush", F_OK) != 0;      // default since 2026-11-18 (user: clearly smoother, no defects); bgl-multiflush = every glFlush is real again
     ev_log('S', cur_ctx(), 0);
     g_swap_thread = pthread_self(); g_swap_thread_set = 1;
+    { EAGLContext *sc_ = cur_ctx(); if (sc_) sc_->_private->fk_valid = 0; }      // the next frame starts from a fresh copy
     if (g_flush_pending) {
         EAGLContext *c = cur_ctx();
         if (!pthread_equal(g_flush_thread, pthread_self())) g_nswap_other++;
@@ -540,7 +542,10 @@ static int bgl_SwapEnd(void *fb) {
     if (g_nswap % 120 == 0) {
         double now = now_ms();
         if (access("/private/var/tmp/bgl-stat", F_OK) == 0) { FILE *f = fopen("/private/var/tmp/bgl-stat.log", "a");
-            if (f) { fprintf(f, "swaps %u (%.1f/s) flushes %u (%.2f per swap) deferred %u oneflush %d swap-without-context %u swap-on-other-thread %u\n", g_nswap, t0 ? 120000.0 / (now - t0) : 0.0, g_nflush, (g_nflush - f0) / 120.0, g_nflush_deferred, g_oneflush, g_nswap_noctx, g_nswap_other); fclose(f); } }
+            static long c0[4]; static unsigned d0; static double m0, fu0;
+            if (f) { fprintf(f, "swaps %u (%.1f/s) flushes %.2f/swap oneflush %d | per swap: draws %.1f, render-to-self copies %.2f (%.2f Mpx, %.2f full-screen), vcm copies %.2f reuses %.2f, program-0 draws %.2f | scratch: whole copies %ld, box copies %ld, reused %ld (totals)\n", g_nswap, t0 ? 120000.0 / (now - t0) : 0.0, (g_nflush - f0) / 120.0, g_oneflush,
+                         (g_draw_total - d0) / 120.0, (g_fbk_copies - c0[0]) / 120.0, (g_fbk_mpx - m0) / 120.0, (g_fbk_full - fu0) / 120.0, (g_vcm_copies - c0[1]) / 120.0, (g_vcm_reuses - c0[2]) / 120.0, (g_p0_draws - c0[3]) / 120.0, g_fk_fullc, g_fk_part, g_fk_reuse); fclose(f); }
+            c0[0] = g_fbk_copies; c0[1] = g_vcm_copies; c0[2] = g_vcm_reuses; c0[3] = g_p0_draws; d0 = g_draw_total; m0 = g_fbk_mpx; fu0 = g_fbk_full; }
         t0 = now; f0 = g_nflush;
     }
     if (!swap_write(g_swap_orig)) abort();
@@ -647,6 +652,21 @@ static void diag_maskdraw(const void *indices) {
 static void (*o_ActiveTexture)(GLenum);
 static void (*o_BindTexture)(GLenum, GLuint);
 static void h_ActiveTexture(GLenum t) { o_ActiveTexture(t); EAGLContext *c = cur_ctx(); if (c && t >= GL_TEXTURE0 && t < GL_TEXTURE0 + 8) c->_private->act = (int)(t - GL_TEXTURE0); }
+// The scratch copy of the destination is kept across draws (2026-11-18: a home-screen frame was 12 draws, 9 of them render-to-self, each with its own
+// copy = flush the batch, blit, new batch). After one whole copy it stays good except where something has drawn since: every draw and clear into
+// that texture adds its scissor box to a list (no scissor = everything), and a render-to-self draw copies again only when its own box touches one.
+// Opt-in with /private/var/tmp/bgl-fbkreuse (see the measurement at the switch).
+static void fk_touch(struct _EAGLContextPrivate *p) {
+    if (!p->fk_valid || !p->fb_tex || p->fk_for != p->fb_tex) return;
+    GLint sb[4];
+    if (!glIsEnabled(GL_SCISSOR_TEST) || p->fk_n >= 48) { p->fk_valid = 0; return; }
+    glGetIntegerv(GL_SCISSOR_BOX, sb);
+    int *b = p->fk_box[p->fk_n++]; b[0] = sb[0]; b[1] = sb[1]; b[2] = sb[0] + sb[2]; b[3] = sb[1] + sb[3];
+}
+static int fk_stale(struct _EAGLContextPrivate *p, int x0, int y0, int x1, int y1) {
+    for (int i = 0; i < p->fk_n; i++) { const int *b = p->fk_box[i]; if (x0 < b[2] && b[0] < x1 && y0 < b[3] && b[1] < y1) return 1; }
+    return 0;
+}
 static unsigned fbk_pre(struct _EAGLContextPrivate *p) {
     unsigned mask = 0;
     if (!p->fb_tex) return 0;
@@ -689,11 +709,18 @@ static unsigned fbk_pre(struct _EAGLContextPrivate *p) {
         x0 = sb[0] - 2; y0 = sb[1] - 2; x1 = sb[0] + sb[2] + 2; y1 = sb[1] + sb[3] + 2;
         if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > w) x1 = w; if (y1 > h) y1 = h;
     }
-    if (p->fbk_w != w || p->fbk_h != h) {
-        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, w, h, 0);          // (re)allocate at the destination's size with its whole contents
-        p->fbk_w = w; p->fbk_h = h;
-    } else if (x1 > x0 && y1 > y0) {
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);
+    static int every = -1, etick; if (every < 0 || !(etick++ & 255)) every = access("/private/var/tmp/bgl-fbkreuse", F_OK) != 0;      // reuse is OFF by default: measured 2026-11-18, 11 reuses in 1400 copies (each render-to-self draw of a swipe frame has its own small offscreen destination), not worth the risk of a stale copy
+    int have = !every && p->fk_valid && p->fk_for == p->fb_tex && p->fbk_w == w && p->fbk_h == h;
+    if (have && !fk_stale(p, x0, y0, x1, y1)) {
+        g_fk_reuse++;                                                         // nothing drew there since the copy
+    } else if (have && (long)(x1 - x0) * (y1 - y0) < (long)w * h / 2 && x1 > x0 && y1 > y0) {
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);      // refresh only the box this draw reads
+        g_fk_part++; g_fbk_mpx += (double)(x1 - x0) * (y1 - y0) / 1e6;
+    } else {
+        if (p->fbk_w != w || p->fbk_h != h) { glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, w, h, 0); p->fbk_w = w; p->fbk_h = h; }      // (re)allocate at the destination's size
+        else glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+        p->fk_valid = !every; p->fk_for = p->fb_tex; p->fk_n = 0;
+        g_fk_fullc++; g_fbk_full++; g_fbk_mpx += (double)w * h / 1e6;
     }
     for (int u = first + 1; u < 4; u++) if (mask & (1u << u)) { o_ActiveTexture(GL_TEXTURE0 + u); o_BindTexture(GL_TEXTURE_2D, p->fbk_tex); }
     o_ActiveTexture(GL_TEXTURE0 + p->act);
@@ -845,14 +872,12 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
         // finish and resolve what it has, so a copy per draw was a full pass over the display each time. The copy stays good for the next vcm draw
         // as long as nothing else drew into this framebuffer and the new box does not touch a box a vcm draw has painted since.
         static int every = -1; if (every < 0) every = getenv("BGL_VCM_COPY_EVERY_DRAW") != NULL;
-        int reuse = !every && p->vc_valid && p->vc_for == p->fb_tex && p->fbk_w == dw && p->fbk_h == dh;
-        for (int i = 0; reuse && i < p->vc_n; i++) { const int *b = p->vc_box[i]; if (x0 < b[2] && b[0] < x1 && y0 < b[3] && b[1] < y1) reuse = 0; }
+        int reuse = !every && p->fk_valid && p->fk_for == p->fb_tex && p->fbk_w == dw && p->fbk_h == dh && !fk_stale(p, x0, y0, x1, y1);
         if (!reuse) {
             if (p->fbk_w != dw || p->fbk_h != dh) { glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, dw, dh, 0); p->fbk_w = dw; p->fbk_h = dh; }
             else glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, dw, dh);
-            p->vc_valid = 1; p->vc_for = p->fb_tex; p->vc_n = 0; g_vcm_copies++;
+            p->fk_valid = !every; p->fk_for = p->fb_tex; p->fk_n = 0; g_vcm_copies++;        // a whole copy: the same record the render-to-self path keeps (fk_touch adds this draw's box)
         } else g_vcm_reuses++;
-        if (p->vc_n < 16) { int *b = p->vc_box[p->vc_n++]; b[0] = x0; b[1] = y0; b[2] = x1; b[3] = y1; } else p->vc_valid = 0;
         o_ActiveTexture(GL_TEXTURE0 + p->act);
         ret = 2;
     }
@@ -937,7 +962,7 @@ static void fbk_window_poll(void) {
     if ((++tick & 63) || access("/private/var/tmp/bgl-fbk", F_OK)) return;
     unlink("/private/var/tmp/bgl-fbk"); g_fbk_dbg = 1000000; left = 6000;
 }
-#define FBK_DRAW(call) do { fbk_window_poll(); EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; if (fc_ && p0_ != 2) fc_->_private->vc_valid = 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
+#define FBK_DRAW(call) do { fbk_window_poll(); EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; if (fc_ && p0_ != 2) fc_->_private->vc_valid = 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; if (fc_) fk_touch(fc_->_private); int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
 static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); FBK_DRAW(o_DrawArrays(a, b, c)); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
 static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); FBK_DRAW(o_DrawElements(a, b, c, d)); }
@@ -968,9 +993,9 @@ static void diag_fbo(void) {      // debug: say why a framebuffer the render ser
     (void)w;
     fprintf(stderr, "EAGL(shim): INCOMPLETE FBO %d status 0x%x: colour0 type 0x%x name %d bits %d/%d/%d/%d, depth type 0x%x name %d, stencil type 0x%x name %d\n", fb, st, t0, n0, r, g, b, a, td, nd, ts, ns);
 }
-static void h_Clear(GLbitfield m) { mark_cur_dirty(); diag_fbo(); if (g_fbk_dbg_on()) { GLint sb[4] = { 0 }, fb = 0; glGetIntegerv(GL_SCISSOR_BOX, sb); glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); fprintf(stderr, "EAGL(shim): FBK clear fbo %d scissor %d (%d %d %d %d)\n", fb, glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3]); } o_Clear(m); }
+static void h_Clear(GLbitfield m) { mark_cur_dirty(); { EAGLContext *kc_ = cur_ctx(); if (kc_) fk_touch(kc_->_private); } diag_fbo(); if (g_fbk_dbg_on()) { GLint sb[4] = { 0 }, fb = 0; glGetIntegerv(GL_SCISSOR_BOX, sb); glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); fprintf(stderr, "EAGL(shim): FBK clear fbo %d scissor %d (%d %d %d %d)\n", fb, glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3]); } o_Clear(m); }
 static void (*o_ClearBufferfv)(GLenum, GLint, const GLfloat *);
-static void h_ClearBufferfv(GLenum a, GLint b, const GLfloat *c) { mark_cur_dirty(); o_ClearBufferfv(a, b, c); }
+static void h_ClearBufferfv(GLenum a, GLint b, const GLfloat *c) { mark_cur_dirty(); { EAGLContext *kc_ = cur_ctx(); if (kc_) fk_touch(kc_->_private); } o_ClearBufferfv(a, b, c); }
 static void mark_bound_texture_dirty(void) {     // texture writes (upload / copy) land in the texture bound to GL_TEXTURE_2D
     EAGLContext *c = cur_ctx(); if (!c || !c->_private->natt) return;
     GLint t = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
@@ -979,9 +1004,9 @@ static void mark_bound_texture_dirty(void) {     // texture writes (upload / cop
     g_draw_total++;
 }
 static void (*o_ClearBufferiv)(GLenum, GLint, const GLint *);
-static void h_ClearBufferiv(GLenum a, GLint b, const GLint *c) { mark_cur_dirty(); o_ClearBufferiv(a, b, c); }
+static void h_ClearBufferiv(GLenum a, GLint b, const GLint *c) { mark_cur_dirty(); { EAGLContext *kc_ = cur_ctx(); if (kc_) fk_touch(kc_->_private); } o_ClearBufferiv(a, b, c); }
 static void (*o_ClearBufferuiv)(GLenum, GLint, const GLuint *);
-static void h_ClearBufferuiv(GLenum a, GLint b, const GLuint *c) { mark_cur_dirty(); o_ClearBufferuiv(a, b, c); }
+static void h_ClearBufferuiv(GLenum a, GLint b, const GLuint *c) { mark_cur_dirty(); { EAGLContext *kc_ = cur_ctx(); if (kc_) fk_touch(kc_->_private); } o_ClearBufferuiv(a, b, c); }
 static void (*o_ClearBufferfi)(GLenum, GLint, GLfloat, GLint);
 static void h_ClearBufferfi(GLenum a, GLint b, GLfloat c, GLint d) { mark_cur_dirty(); o_ClearBufferfi(a, b, c, d); }
 static void (*o_BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
