@@ -672,7 +672,11 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     GLint en1 = 0; glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en1);
     GLuint tex = p->unit_tex[0];
     int kind = tex ? (en1 ? 1 : 0) : 2;
-    static int fill = -1; if (fill < 0) fill = getenv("BGL_PROGRAM0_FILL") != NULL;
+    static int fill = -1, ftick; if (fill < 0) fill = getenv("BGL_PROGRAM0_FILL") != NULL;
+    if (kind == 2 && !(ftick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); if (mf) { int ch = fgetc(mf); fclose(mf); fill = ch == '4' || getenv("BGL_PROGRAM0_FILL") != NULL; } else fill = getenv("BGL_PROGRAM0_FILL") != NULL; }
+    if (kind == 2 && g_debug) { static long nf; if (nf++ < 16) { GLint st = 0; void *pp = NULL, *cp = NULL; glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pp); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st); glGetVertexAttribPointerv(1, GL_VERTEX_ATTRIB_ARRAY_POINTER, &cp);
+        const float *a0 = pp, *a2 = pp && st ? (const float *)((const char *)pp + 2 * st) : NULL; const uint16_t *q = cp;
+        fprintf(stderr, "EAGL(shim): program-0 untextured draw: dest %u blend %d pos (%g %g)-(%g %g) colour %04x %04x %04x %04x drawn %d\n", p->fb_tex, glIsEnabled(GL_BLEND), a0 ? a0[0] : -1, a0 ? a0[1] : -1, a2 ? a2[0] : -1, a2 ? a2[1] : -1, en1 && q ? q[0] : 0, en1 && q ? q[1] : 0, en1 && q ? q[2] : 0, en1 && q ? q[3] : 0, fill); } }
     if (kind == 2 && !fill) return 0;
     // experiment switch, re-read now and then: /private/var/tmp/bgl-p0mode = 1: colour * texture alpha for blended draws, 2: for all textured draws
     { static int mode, tick; if (!(tick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); mode = 0; if (mf) { mode = fgetc(mf) - '0'; fclose(mf); } }
@@ -686,6 +690,23 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
         glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &w); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &h);
         if (p->act != 0) o_ActiveTexture(GL_TEXTURE0 + p->act);
         if (p->p0_utm[kind] >= 0) glUniform4f(p->p0_utm[kind], w > 0 ? 1.0f / w : 1, h > 0 ? 1.0f / h : 1, 0, 0);
+    }
+    // HEURISTIC, not understood (NOTES.md 2026-11-17): a blended, whole-surface draw of a texture as large as the destination. On the lock screen
+    // that is a red (alpha 1 -> 0) gradient surface put over the wallpaper right after a darkened copy of the backdrop was drawn: it looks like a
+    // mask, not content, and drawing it as texel * colour paints a red veil the CPU-composited UI does not have. Left undrawn, as before the
+    // stand-in existed. /private/var/tmp/bgl-p0mode = 3 draws it.
+    if (tex && glIsEnabled(GL_BLEND) && p->fb_tex && p->fb_tex != tex) {
+        static int keep = -1, tick; if (keep < 0 || !(tick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); keep = 0; if (mf) { keep = fgetc(mf) == '3'; fclose(mf); } }
+        GLint dw = 0, dh = 0, st = 0; void *pp = NULL;
+        o_BindTexture(GL_TEXTURE_2D, p->fb_tex); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &dw); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &dh); o_BindTexture(GL_TEXTURE_2D, p->unit_tex[p->act]);
+        glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pp); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st);
+        if (!keep && dw == w && dh == h && w >= 1000 && pp && st) {
+            const float *a0 = pp, *a2 = (const float *)((const char *)pp + 2 * st);
+            if (a0[0] == 0 && a0[1] == 0 && a2[0] == (float)w && a2[1] == (float)h) {
+                static long nskip; if (g_debug && (nskip++ < 4 || !(nskip % 2000))) fprintf(stderr, "EAGL(shim): program-0 draw of whole-surface texture %u (%dx%d) over %u left undrawn (#%ld)\n", tex, w, h, p->fb_tex, nskip);
+                o_UseProgram(0); return 0;
+            }
+        }
     }
     if (g_debug && (p->p0_n++ < 24 || !(p->p0_n % 5000))) {
         GLint en2 = 0; void *tp = NULL; glGetVertexAttribiv(2, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en2); glGetVertexAttribPointerv(2, GL_VERTEX_ATTRIB_ARRAY_POINTER, &tp);

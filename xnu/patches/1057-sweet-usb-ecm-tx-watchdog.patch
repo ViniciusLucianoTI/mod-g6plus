@@ -1,0 +1,65 @@
+From 9aaff62110743a449e25ff7d4e8fa6904482436f Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Tue, 17 Nov 2026 21:13:08 -0300
+Subject: [PATCH] sweet: ECM transmit watchdog (sweetecmwd=ms): end a transfer
+ that never completes and go on with the queue
+
+---
+ bsd/dev/sweet_usb.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 8543536ee..f6072dc00 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1299,6 +1299,47 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			swd.want_reconnect = false;
+ 			continue;
+ 		}
++		/*
++		 * ECM transmit watchdog. Seen on the Moto G6 Plus (2026-11-17, twice, right after backboardd was restarted):
++		 * the IN transfer of one frame never completes (TRB still owned by the controller, nothing sent), tx_busy
++		 * stays set, the queue fills and the phone is off the network for the rest of the boot while the disk link
++		 * on the other endpoints keeps working. After sweetecmwd ms (default 3000, 0 = off) with the same frame
++		 * pending: end that transfer, drop the frame and go on with the queue. Cause of the stuck transfer unknown.
++		 */
++		{
++			static uint64_t wd_frames = ~0ULL; static uint32_t wd_ms, wd_limit = ~0u, wd_fired;
++			if (wd_limit == ~0u) {
++				wd_limit = 3000;
++				PE_parse_boot_argn("sweetecmwd", &wd_limit, sizeof(wd_limit));
++			}
++			if (wd_limit != 0 && ud.tx_busy) {
++				if (ud.tx_frames != wd_frames) {
++					wd_frames = ud.tx_frames;
++					wd_ms = 0;
++				} else if (++wd_ms >= wd_limit) {
++					volatile uint32_t *tx = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
++					lck_mtx_lock(ud.lock);
++					if (ud.tx_busy && ud.tx_frames == wd_frames) {
++						uint32_t w2 = tx[2], w3 = tx[3];
++						if (ud.xfer_active[EP_TX]) {
++							ud_epcmd(EP_TX, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[EP_TX] << 16), 0, 0, 0);
++							ud.xfer_active[EP_TX] = false;
++						}
++						ud.tx_busy = false;
++						wd_fired++;
++						if (wd_fired <= 20 || (wd_fired % 100) == 0) {
++							printf("SWEET USB: ue0 transmit stuck for %u ms (frame %llu, trb %08x/%08x, queue %u): transfer ended, frame dropped (#%u)\n",
++							    wd_ms, wd_frames, w2, w3, ud.txq_count, wd_fired);
++						}
++						ud_tx_kick_locked();
++					}
++					lck_mtx_unlock(ud.lock);
++					wd_ms = 0;
++				}
++			} else {
++				wd_ms = 0;
++			}
++		}
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("SWEET USBDISK: seq %u reads %llu writes %llu retries %llu; tmo tx %u rx %u bad %u logabort %u reconnects %u; "
+ 			    "dtx act %d drx act %d\n", swd.seq, swd.reads, swd.writes, swd.errors, swd.tx_timeouts, swd.rx_timeouts,
+-- 
+2.56.0
+
