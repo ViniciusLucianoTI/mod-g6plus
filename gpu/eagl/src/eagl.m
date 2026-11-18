@@ -393,6 +393,7 @@ static void verify_direct(EAGLContext *c, Attach *a) {
 }
 
 static uint32_t g_shot_done[6]; static int g_shot_n;
+static int g_argb_src;          // texImageIOSurface: the 4-byte source is A,R,G,B (set by attachImage for surfaces without a fourcc)
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
@@ -1348,7 +1349,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             else {
                 // A surface in another format is an image CoreAnimation samples (attach_surface_texture: the tab bar glyphs of the Phone app are
                 // 70x70 surfaces attached this way; without their pixels they drew nothing). Load it in its own format and never write back to it.
-                OSType pf = IOSurfaceGetPixelFormat(surface); GLenum fi = 0, ff = 0, ft = GL_UNSIGNED_BYTE;
+                OSType pf = IOSurfaceGetPixelFormat(surface); GLenum fi = 0, ff = 0, ft = GL_UNSIGNED_BYTE; int argb = 0;
                 switch (pf) {
                 case 'A008': case 'A8  ': fi = ff = GL_ALPHA; break;
                 case 'L008': fi = ff = GL_LUMINANCE; break;
@@ -1357,11 +1358,13 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
                 case 'RGhA': fi = 0x881a; ff = GL_RGBA; ft = 0x140b; break;
                 default: {      // no fourcc (CoreAnimation's own image surfaces report 0): go by the bytes per element, as its texImageIOSurface calls do (4 = RGBA)
                     size_t bpe = IOSurfaceGetBytesPerElement(surface);
-                    if (bpe == 4) fi = ff = GL_RGBA; else if (bpe == 1) fi = ff = GL_ALPHA; else if (bpe == 2) fi = ff = GL_LUMINANCE_ALPHA;
+                    // 4 bytes: taken as A,R,G,B (alpha first). Observed: the Phone app's template glyphs have data only in the first byte of each texel, which is
+                    // what a black, alpha-shaped image looks like in that order; as R,G,B,A their alpha was 0 and CoreAnimation's alpha-reading shader drew nothing.
+                    if (bpe == 4) { fi = ff = GL_RGBA; argb = 1; } else if (bpe == 1) fi = ff = GL_ALPHA; else if (bpe == 2) fi = ff = GL_LUMINANCE_ALPHA;
                     break; }
                 }
                 EAGL_DEBUG("attachImage: surface %u is %ux%u fourcc %08x: %s\n", IOSurfaceGetID(surface), w, h, (unsigned)pf, fi ? "loaded as a source image" : "format not handled, left empty");
-                if (fi) { [self texImageIOSurface:surface target:GL_TEXTURE_2D internalFormat:fi width:w height:h format:ff type:ft plane:0 invert:!inverted]; source_only = YES; }
+                if (fi) { g_argb_src = argb; [self texImageIOSurface:surface target:GL_TEXTURE_2D internalFormat:fi width:w height:h format:ff type:ft plane:0 invert:!inverted]; g_argb_src = 0; source_only = YES; }
             }
         }
         if (glGetError() != GL_NO_ERROR) EAGL_DEBUG("attachImage: storage for %ux%u failed\n", w, h);
@@ -1482,10 +1485,15 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
         const uint8_t *sp = src + ((invert || g_target_attach) ? y : (h - 1 - y)) * bpr;   // render server (target-form attach): images keep their native top-down rows; CARenderer-style clients: flipped unless invert
         uint8_t *dp = tmp + (size_t)y * w * bpp;
         if (bgra8) for (uint32_t x = 0; x < w; x++) { uint32_t q = ((const uint32_t *)sp)[x]; ((uint32_t *)dp)[x] = (q & 0xff00ff00u) | ((q & 0xff) << 16) | ((q >> 16) & 0xff); }
+        else if (g_argb_src && bpp == 4) for (uint32_t x = 0; x < w; x++) { uint32_t q = ((const uint32_t *)sp)[x]; ((uint32_t *)dp)[x] = (q >> 8) | ((q & 0xff) << 24); }   // A,R,G,B bytes -> R,G,B,A
         else memcpy(dp, sp, (size_t)w * bpp);
     }
     IOSurfaceUnlock(ioSurface, kIOSurfaceLockReadOnly, NULL);
     (void)pf;
+    if (g_debug && bpp == 4 && w <= 128 && h <= 128 && type == 0x1401) {      // small 4-byte images (glyphs): which byte of each texel carries data, as uploaded
+        static int n; if (n++ < 24) { unsigned long c[4] = { 0 }, mx[4] = { 0 }; for (size_t i = 0; i < (size_t)w * h; i++) for (int k = 0; k < 4; k++) { uint8_t v = tmp[i * 4 + k]; if (v) c[k]++; if (v > mx[k]) mx[k] = v; }
+            fprintf(stderr, "EAGL(shim): texImageIOSurface 4-byte %ux%u fourcc %08x fmt 0x%lx: non-zero per byte %lu %lu %lu %lu, max %lu %lu %lu %lu\n", w, h, (unsigned)IOSurfaceGetPixelFormat(ioSurface), (unsigned long)format, c[0], c[1], c[2], c[3], mx[0], mx[1], mx[2], mx[3]); }
+    }
     if (g_debug && bpp == 8 && w >= 4) {            // half-float RGBA (gradient colour maps): first, middle and last texel as stored
         static int n; if (n++ < 12) { fprintf(stderr, "EAGL(shim): texImageIOSurface half-float %ux%u texels", w, h);
             for (int k = 0; k < 3; k++) { const uint16_t *q = (const uint16_t *)(tmp + (size_t)(k == 0 ? 0 : k == 1 ? w / 2 : w - 1) * 8); fprintf(stderr, " [%04x %04x %04x %04x]", q[0], q[1], q[2], q[3]); }
