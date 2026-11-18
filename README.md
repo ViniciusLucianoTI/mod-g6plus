@@ -49,7 +49,7 @@ The kernel resets the SoC by itself after a set time (`sweetselfreset=N` seconds
 | Area | State |
 | --- | --- |
 | iOS | 16.7.16 (20H392) to the **lock screen and the home screen**; Settings and the stock apps open |
-| CPU | 8× Kryo 260 (ARMv8.0, no LSE, no pointer authentication). iOS 16 for the iPhone X is plain arm64, so no binary rewriting is needed |
+| CPU | 8× Kryo 260 (ARMv8.0, no LSE, no pointer authentication). iOS 16 for the iPhone X is plain arm64, so no binary rewriting is needed. Cluster clocks raised from the bootloader's 1670 / ~300 MHz to 2016 / 1536 MHz (the most the boot rail voltage allows) |
 | Memory | 3.2 GB of the 4 GB given to the kernel, 4 KiB pages |
 | Display | Tianma 1080×2160 panel; iOS renders the iPhone X layout (1125×2436), scaled with thin black bars |
 | Touch | Goodix GT9xx over I²C, powered through our own RPM client |
@@ -57,7 +57,7 @@ The kernel resets the SoC by itself after a set time (`sweetselfreset=N` seconds
 | USB | One link for the root disk, the kernel log, input from the Mac, and SSH at `root@192.168.7.2` |
 | GPU | **Adreno 508 composites the UI**: zap shader authenticated by TrustZone, command processor running, Mesa freedreno a5xx (OpenGL ES 3.1), CoreAnimation's GLES renderer in `backboardd`. Core clock on the GPU's own PLLs, 160 to 700 MHz, scaled with load, with a temperature ceiling |
 | Working on | Frame rate (what bounds a frame once the GPU is fast), rendering without the forced-GMEM workaround, GPU compositing from a cold boot |
-| Not working | Wi-Fi, cellular, Bluetooth, audio, camera, sensors, battery gauge, CPU frequency scaling, Metal |
+| Not working | Wi-Fi, cellular, Bluetooth, audio, camera, sensors, battery gauge, CPU frequency scaling with load, Metal |
 
 Measured on the phone, CoreAnimation scenes drawn by the GPU instead of the CPU (small offscreen scenes, GPU at 240 MHz):
 
