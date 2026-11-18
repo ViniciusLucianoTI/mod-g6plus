@@ -5,7 +5,10 @@
  */
 #include <stdio.h>
 #include <unistd.h>
-#include <sys/reboot.h>
+
+/* not in the iOS SDK's headers */
+extern int reboot(int howto);
+#define RB_AUTOBOOT 0
 
 int
 main(void)
