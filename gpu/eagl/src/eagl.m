@@ -779,6 +779,8 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     }
     return ret;
 }
+static void (*o_BindFramebuffer)(GLenum, GLuint);
+static void (*o_FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
 static void fbk_dbg_plain(struct _EAGLContextPrivate *p) {
     GLint prog = 0, sb[4] = { 0 }, sr = 0, dr = 0, sa = 0, da = 0, eq = 0, st = 0, cst = 0, en1 = 0; GLboolean cm[4] = { 1, 1, 1, 1 }; void *pp = NULL, *cp = NULL;
     glGetIntegerv(GL_CURRENT_PROGRAM, &prog); glGetIntegerv(GL_SCISSOR_BOX, sb);
@@ -790,10 +792,31 @@ static void fbk_dbg_plain(struct _EAGLContextPrivate *p) {
     if (pp && st) { const float *a = pp, *b = (const float *)((const char *)pp + 2 * st); fprintf(stderr, " pos (%g %g)-(%g %g)", a[0], a[1], b[0], b[1]); }
     if (en1 && cp) { const uint16_t *q = cp; fprintf(stderr, " colour %04x %04x %04x %04x", q[0], q[1], q[2], q[3]); }
     { void *state = NULL; uint8_t st[0x1b8]; if (p->ca_ctx && safe_read((const char *)p->ca_ctx + 0x10, &state, sizeof state) && state && safe_read(state, st, sizeof st)) fprintf(stderr, " CA fn 0x%x blend 0x%x", st[0x10], st[0x1b0]); }
-    { GLint w = 0, h = 0, f = 0; if (p->unit_tex[0]) { if (p->act) o_ActiveTexture(GL_TEXTURE0); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &w); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &h); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1003, &f); if (p->act) o_ActiveTexture(GL_TEXTURE0 + p->act); fprintf(stderr, " tex0 %dx%d ifmt 0x%x", w, h, f); } }
+    { GLint w = 0, h = 0, f = 0; if (p->unit_tex[0]) { if (p->act) o_ActiveTexture(GL_TEXTURE0); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &w); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &h); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1003, &f); if (p->act) o_ActiveTexture(GL_TEXTURE0 + p->act); fprintf(stderr, " tex0 %dx%d ifmt 0x%x", w, h, f);
+        if (w >= 20 && w <= 140 && h >= 20 && h <= 140) {          // small source images (glyphs): filter state and what the texture really holds
+            static GLuint rf; GLint mn = 0, mg = 0, ofb = 0; uint8_t *b = malloc((size_t)w * h * 4); long na = 0, nc = 0;
+            if (p->act) o_ActiveTexture(GL_TEXTURE0);
+            glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &mn); glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &mg);
+            if (p->act) o_ActiveTexture(GL_TEXTURE0 + p->act);
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &ofb); if (!rf) glGenFramebuffers(1, &rf);
+            o_BindFramebuffer(GL_FRAMEBUFFER, rf); o_FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, p->unit_tex[0], 0);
+            GLenum fst = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if (b && fst == GL_FRAMEBUFFER_COMPLETE) { GLint oa = 4; glGetIntegerv(GL_PACK_ALIGNMENT, &oa); glPixelStorei(GL_PACK_ALIGNMENT, 1); glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, b); glPixelStorei(GL_PACK_ALIGNMENT, oa);
+                for (long i = 0; i < (long)w * h; i++) { if (b[i * 4 + 3]) na++; if (b[i * 4] | b[i * 4 + 1] | b[i * 4 + 2]) nc++; } }
+            o_FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0); o_BindFramebuffer(GL_FRAMEBUFFER, (GLuint)ofb); free(b);
+            fprintf(stderr, " min 0x%x mag 0x%x holds alpha>0 %ld colour>0 %ld of %d (fbo 0x%x) err 0x%x", mn, mg, na, nc, w * h, fst, glGetError());
+        } } }
     fprintf(stderr, "\n");
 }
-#define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
+// The diagnostic window (bgl-fbk) opens on any draw, not only on a render-to-self one, and closes after 4000 draws.
+static void fbk_window_poll(void) {
+    static int tick, left;
+    if (!g_debug) return;
+    if (left && !--left) g_fbk_dbg = 0;
+    if ((++tick & 63) || access("/private/var/tmp/bgl-fbk", F_OK)) return;
+    unlink("/private/var/tmp/bgl-fbk"); g_fbk_dbg = 1000000; left = 4000;
+}
+#define FBK_DRAW(call) do { fbk_window_poll(); EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
 static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); FBK_DRAW(o_DrawArrays(a, b, c)); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
 static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); FBK_DRAW(o_DrawElements(a, b, c, d)); }
