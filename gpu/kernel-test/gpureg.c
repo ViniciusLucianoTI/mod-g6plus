@@ -5,6 +5,7 @@
  *   gpureg REG VALUE      write, then read back
  *   gpureg freq           core clock now (MHz), hottest SoC sensor, level changes (xnu/patches 1058)
  *   gpureg cpu big|little MHZ|boot   CPU cluster clock (xnu/patches 1062; limits in the kernel: big <= 2016, little <= 1536)
+ *   gpureg phys ADDR [VALUE]   read 0x178xxxxx-0x179xxxxx (APCS/OSM/CPR), write only in the 0x179d0000 page
  *   gpureg freq MHZ|auto  pin the core clock at a level (160 240 370 465 588 647 700) or hand it to the governor
  */
 #include <IOKit/IOKitLib.h>
@@ -30,6 +31,19 @@ main(int argc, char **argv)
 	}
 	struct sweet_gpu_debug d;
 	memset(&d, 0, sizeof(d));
+	if (!strcmp(argv[1], "phys") && argc >= 3) {
+		d.w[39] = argc > 3 ? 0x50485752u : 0x50485244u;        /* 'PHWR' / 'PHRD' */
+		d.w[36] = (uint32_t)strtoul(argv[2], NULL, 16);
+		d.w[37] = argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 16) : 0;
+		size_t op_ = sizeof(d);
+		kern_return_t kp = IOConnectCallStructMethod(c, SWEET_GPU_SEL_DEBUG, &d, sizeof(d), &d, &op_);
+		if (kp != 0 || d.w[39] != 0x444f4e45u) {
+			printf("%08x: refused (kr %#x)\n", (uint32_t)strtoul(argv[2], NULL, 16), kp);
+			return 1;
+		}
+		printf("%08x: %08x\n", (uint32_t)strtoul(argv[2], NULL, 16), d.w[37]);
+		return 0;
+	}
 	if (cpu) {
 		if (argc < 4 || (strcmp(argv[2], "big") && strcmp(argv[2], "little"))) {
 			fprintf(stderr, "usage: gpureg cpu big|little MHZ|boot\n");

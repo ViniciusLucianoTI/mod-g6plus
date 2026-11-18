@@ -1,0 +1,45 @@
+From 9c2d8543861fe293b2724138e14e93c1e36eb853 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Wed, 18 Nov 2026 01:37:17 -0300
+Subject: [PATCH] sweet: debug read of the APCS/OSM/CPR blocks and write in the
+ APM page (PHRD/PHWR)
+
+---
+ bsd/dev/sweet_a508.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index 12817638d..a067ebd1d 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -1207,6 +1207,27 @@ sweet_gpu_debug(uint32_t *w)
+ 	if (op == 0x43505546u && reg < 2) {
+ 		a5cpu_request[reg] = val;
+ 	}
++	/*
++	 * w[39] = 'PHRD' / 'PHWR' (sweetgpupoke=1): one 32-bit read of the APCS / OSM / CPR blocks (0x17800000..0x179fffff,
++	 * w[36] = physical address), or one write inside the APCS common page that holds the APM controls (0x179d0000).
++	 * For finding out by hand how the array power mux answers; gpureg phys ADDR [VALUE].
++	 */
++	if (poke && (op == 0x50485244u || op == 0x50485752u) && reg >= 0x17800000u && reg < 0x17a00000u && !(reg & 3u)) {
++		static vm_offset_t pg_va;
++		static uint32_t pg_pa;
++		if (pg_pa != (reg & ~0xfffu) || !pg_va) {
++			pg_va = ml_io_map(reg & ~0xfffu, 0x1000);
++			pg_pa = reg & ~0xfffu;
++		}
++		if (pg_va) {
++			if (op == 0x50485752u && pg_pa == 0x179d0000u) {
++				a5_wr(pg_va, reg & 0xfffu, val);
++			}
++			w[37] = a5_rd(pg_va, reg & 0xfffu);
++			w[39] = 0x444f4e45u;
++			return;
++		}
++	}
+ 	bool freq = op == 0x46524551u;
+ 	if (freq && reg) {
+ 		sweet_a508_request_mhz(reg);
+-- 
+2.56.0
+
