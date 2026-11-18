@@ -1,0 +1,256 @@
+From 86510d002b74e9914060d26d32a8c2e197a241ad Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Wed, 18 Nov 2026 01:29:21 -0300
+Subject: [PATCH] sweet: little cluster at 1843.2 MHz: PM660 S1 set point write
+ and APM switch to APC (sweetcpulittlemv)
+
+---
+ bsd/dev/sweet_a508.c | 118 ++++++++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_keys.c |  71 +++++++++++++++++++++++++-
+ 2 files changed, 186 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index 0bb8a9e2c..12817638d 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -1518,12 +1518,119 @@ static const struct { const char *name; vm_offset_t pll_pa, rcg_pa; uint32_t boo
+ 	 * little 1382.4/1536/1728/1843.2 MHz = 740/792/860/900 mV against a boot rail of 868 mV;
+ 	 * big 1670.4/1881.6/2016/2150.4/2208 MHz = 712/756/784/820/852 mV against 872 mV.
+ 	 */
+-	{ "little (cpu4-7)", 0x17916000, 0x17911000, 0, 90 },          /* boot: on GPLL0; up to L 90 = 1728 MHz */
++	{ "little (cpu4-7)", 0x17916000, 0x17911000, 0, 96 },          /* boot: on GPLL0; L 90 = 1728 MHz on the boot rail, L 96 = 1843.2 MHz (maximum) with the rail raised, see a5cpu_little_rail() */
+ 	{ "big (cpu0-3)", 0x17816000, 0x17811000, 87, 115 },           /* boot: L 87; up to L 115 = 2208 MHz, its maximum */
+ };
+ static struct { vm_offset_t pll, rcg; uint32_t l; bool raised; } a5cpu[2];
+ static volatile uint32_t a5cpu_request[2];      /* MHz asked for per cluster, 0 = none pending, 1 = back to boot */
+ 
++/*
++ * The last step of the little cluster, 1843.2 MHz, needs its rail (PM660 S1, sid 1, set point in mV at 0x1440/41,
++ * 868 mV from the bootloader) at the 900 mV this phone's CPR uses, and 900 is above the 872 mV "APM threshold":
++ * past it the cluster's memory arrays must run from the APC rail instead of MX. The stock kernel leaves both to
++ * hardware (CPRh through SAW, the OSM sequencer for the array power mux), off here. By hand, as the sequencer is
++ * programmed in clock-osm.c: rail to the 872 mV crossover, mode control (0x179d0004) field 0x1f = 0x3, status
++ * (0x179d000c) bit 1 = on APC, then the rail up. Down: the reverse. Target mV: boot-arg sweetcpulittlemv
++ * (default 912 = the measured 900 plus 12 for having no closed loop; never above the 940 of the open-loop table).
++ */
++extern bool sweet_evert_pmic_read(unsigned sid, unsigned addr, uint8_t *out);
++extern bool sweet_evert_pmic_write2(unsigned sid, unsigned addr, uint8_t b0, uint8_t b1);
++static vm_offset_t a5cpu_apm;
++static bool a5cpu_little_high;
++
++static int
++a5cpu_s1_mv(void)
++{
++	uint8_t lo = 0, hi = 0;
++	if (!sweet_evert_pmic_read(1, 0x1440, &lo) || !sweet_evert_pmic_read(1, 0x1441, &hi)) {
++		return -1;
++	}
++	return (int)lo | ((int)hi << 8);
++}
++
++static bool
++a5cpu_s1_set(int mv)
++{
++	int now = a5cpu_s1_mv();
++	if (now < 0) {
++		return false;
++	}
++	while (now != mv) {                     /* 8 mV at a time */
++		int next = mv > now ? (mv - now > 8 ? now + 8 : mv) : (now - mv > 8 ? now - 8 : mv);
++		if (!sweet_evert_pmic_write2(1, 0x1440, (uint8_t)next, (uint8_t)(next >> 8))) {
++			return false;
++		}
++		delay(200);
++		now = next;
++	}
++	return a5cpu_s1_mv() == mv;
++}
++
++static bool
++a5cpu_little_rail(bool high)
++{
++	uint32_t mv = 912;
++	(void)PE_parse_boot_argn("sweetcpulittlemv", &mv, sizeof(mv));
++	if (mv < 900 || mv > 940) {
++		mv = 912;
++	}
++	if (!a5cpu_apm) {
++		a5cpu_apm = ml_io_map(0x179d0000, 0x1000);
++	}
++	int s1 = a5cpu_s1_mv();
++	if (!a5cpu_apm || s1 < 0) {
++		printf("SWEET CPUCLK: little rail: no access to the regulator (S1 %d) or the APM block\n", s1);
++		return false;
++	}
++	uint32_t mode0 = a5_rd(a5cpu_apm, 0x4), st0 = a5_rd(a5cpu_apm, 0xc);
++	if (high) {
++		if (s1 < 860 || s1 > 880) {
++			printf("SWEET CPUCLK: little rail: S1 at %d mV, not the 868 expected from the bootloader: left alone\n", s1);
++			return false;
++		}
++		if (!a5cpu_s1_set(872)) {
++			printf("SWEET CPUCLK: little rail: S1 did not take 872 mV (reads %d)\n", a5cpu_s1_mv());
++			return false;
++		}
++		a5_wr(a5cpu_apm, 0x4, (mode0 & ~0x1fu) | 0x3u);
++		uint32_t st = 0;
++		for (int i = 0; i < 5000; i++) {
++			st = a5_rd(a5cpu_apm, 0xc);
++			if (st & 0x2u) {
++				break;
++			}
++			delay(1);
++		}
++		if (!(st & 0x2u)) {
++			a5_wr(a5cpu_apm, 0x4, mode0);
++			delay(500);
++			(void)a5cpu_s1_set(s1);
++			printf("SWEET CPUCLK: little rail: APM did not report APC mode (mode 0x%08x -> 0x%08x, status 0x%08x -> 0x%08x); put back, S1 %d mV\n",
++			    mode0, (mode0 & ~0x1fu) | 0x3u, st0, st, a5cpu_s1_mv());
++			return false;
++		}
++		bool ok = a5cpu_s1_set((int)mv);
++		printf("SWEET CPUCLK: little rail: APM mode 0x%08x -> 0x%08x, status 0x%08x -> 0x%08x; S1 %d -> %d mV%s\n", mode0, a5_rd(a5cpu_apm, 0x4), st0, st, s1,
++		    a5cpu_s1_mv(), ok ? "" : " (NOT the value asked)");
++		a5cpu_little_high = ok;
++		return ok;
++	}
++	(void)a5cpu_s1_set(872);
++	a5_wr(a5cpu_apm, 0x4, mode0 & ~0x1fu);
++	uint32_t st = 0;
++	for (int i = 0; i < 5000; i++) {
++		st = a5_rd(a5cpu_apm, 0xc);
++		if (!(st & 0x2u)) {
++			break;
++		}
++		delay(1);
++	}
++	(void)a5cpu_s1_set(868);
++	a5cpu_little_high = false;
++	printf("SWEET CPUCLK: little rail back: APM mode 0x%08x -> 0x%08x, status 0x%08x -> 0x%08x; S1 %d -> %d mV\n", mode0, a5_rd(a5cpu_apm, 0x4), st0, st, s1, a5cpu_s1_mv());
++	return true;
++}
++
+ static bool
+ a5cpu_rcg(int c, uint32_t cfg)
+ {
+@@ -1563,11 +1670,17 @@ a5cpu_set(int c, uint32_t l)
+ 		return false;
+ 	}
+ 	if (l == 0) {                           /* the little cluster's boot state is GPLL0 itself */
++		if (c == 0 && a5cpu_little_high) {
++			(void)a5cpu_little_rail(false);
++		}
+ 		a5cpu[c].raised = false;
+ 		a5cpu[c].l = 0;
+ 		printf("SWEET CPUCLK: %s back on GPLL0 (RCG CFG 0x%08x)\n", a5cpu_def[c].name, a5_rd(a5cpu[c].rcg, 0x54));
+ 		return true;
+ 	}
++	if (c == 0 && l > 90 && !a5cpu_little_high && !a5cpu_little_rail(true)) {
++		l = 90;                         /* the rail stays as booted: the most it carries */
++	}
+ 	a5_wr(a5cpu[c].pll, 0x0, 0x0);
+ 	a5_wr(a5cpu[c].pll, 0x4, l);
+ 	a5_wr(a5cpu[c].pll, 0x0, 0x2);
+@@ -1583,6 +1696,9 @@ a5cpu_set(int c, uint32_t l)
+ 	}
+ 	a5cpu[c].l = l;
+ 	a5cpu[c].raised = l != a5cpu_def[c].boot_l;
++	if (c == 0 && l <= 90 && a5cpu_little_high) {
++		(void)a5cpu_little_rail(false);         /* slower clock first, then the rail down */
++	}
+ 	printf("SWEET CPUCLK: %s now L %u = %u.%u MHz (was L %u, RCG CFG 0x%08x -> 0x%08x; PLL MODE 0x%08x STATUS 0x%08x)\n", a5cpu_def[c].name, l, l * 192 / 10,
+ 	    (l * 192) % 10, l0, cfg0, a5_rd(a5cpu[c].rcg, 0x54), mode, status);
+ 	return true;
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 31c37e983..c041b24ab 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -9,8 +9,8 @@
+  * channel map is at core 0x800 + 4n and an observer channel is 0x8000 apart (Linux spmi-pmic-arb.c, v2/v3).
+  * sweet_ufs_init() does not run on evert: sweet_usb_start_evert() calls sweet_keys_init_evert()
+  * (boot-arg sweetkeys=1).
+- * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+- * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * PMIC access is read only (EXT_READL on an observer channel) with ONE exception, evert only:
++ * sweet_evert_pmic_write2(), the set point of the little cluster's regulator. No IRQ acknowledge or reset writes.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -264,6 +264,73 @@ sweet_evert_pmic_smps_report(void)
+ 	}
+ }
+ 
++/*
++ * The one PMIC WRITE in this kernel (Moto G6 Plus): the 2-byte set point of an apps-owned regulator, for the CPU
++ * cluster clocks in sweet_a508.c. v2/v3 arbiter, Linux spmi-pmic-arb.c: write channel = chnls (0x08400000) +
++ * 0x1000 * ee + 0x8000 * apid, EXT_WRITEL = opcode 0, data in WDATA0 (+0x10), command (opc << 27 | reg << 4 | len-1)
++ * at +0x0, status +0x8 (bit 0 done, 1 failure, 2 denied, 3 dropped). Refuses peripherals the apps EE does not own.
++ * sweet_evert_pmic_read() reads one register through the observer channel.
++ */
++bool sweet_evert_pmic_read(unsigned sid, unsigned addr, uint8_t *out);
++bool sweet_evert_pmic_write2(unsigned sid, unsigned addr, uint8_t b0, uint8_t b1);
++static bool
++evert_pmic_xfer(vm_offset_t va, uint32_t cmd, uint32_t *status)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)va = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 2000; ++i) {
++		uint32_t st = keys_rd(va, 0x08u);
++		if (st & 1u) {
++			*status = st;
++			return !(st & 0x0eu);
++		}
++		delay(1);
++	}
++	*status = 0xffffffffu;
++	return false;
++}
++
++bool
++sweet_evert_pmic_read(unsigned sid, unsigned addr, uint8_t *out)
++{
++	if (!keys_core || !keys_per_apid) {
++		return false;
++	}
++	uint16_t apid = keys_find_apid((uint16_t)((sid << 8) | (addr >> 8)), 512);
++	vm_offset_t va = apid == KEYS_NO_APID ? 0 : ml_io_map(0x09400000u + 0x8000u * apid, 0x1000);
++	uint32_t st = 0;
++	if (!va || !evert_pmic_xfer(va, (1u << 27) | ((addr & 0xffu) << 4), &st)) {
++		return false;
++	}
++	*out = (uint8_t)keys_rd(va, 0x18u);
++	return true;
++}
++
++bool
++sweet_evert_pmic_write2(unsigned sid, unsigned addr, uint8_t b0, uint8_t b1)
++{
++	if (!keys_core || !keys_per_apid) {
++		return false;
++	}
++	uint16_t apid = keys_find_apid((uint16_t)((sid << 8) | (addr >> 8)), 512);
++	if (apid == KEYS_NO_APID || (keys_rd(keys_cnfg, 0x700u + 4u * apid) & 7u) != 0) {
++		printf("SWEET PMIC: write to sid %u 0x%04x refused: not an apps-owned peripheral\n", sid, addr);
++		return false;
++	}
++	vm_offset_t va = ml_io_map(0x08400000u + 0x8000u * apid, 0x1000);
++	if (!va) {
++		return false;
++	}
++	uint32_t st = 0;
++	*(volatile uint32_t *)(va + 0x10u) = (uint32_t)b0 | ((uint32_t)b1 << 8);
++	bool ok = evert_pmic_xfer(va, (0u << 27) | ((addr & 0xffu) << 4) | 1u, &st);
++	if (!ok) {
++		printf("SWEET PMIC: write to sid %u 0x%04x failed, status 0x%08x\n", sid, addr, st);
++	}
++	return ok;
++}
++
+ void sweet_keys_init_evert(void);
+ void
+ sweet_keys_init_evert(void)
+-- 
+2.56.0
+
