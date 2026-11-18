@@ -408,7 +408,7 @@ static void sync_att(EAGLContext *c, int i) {
             // Experiment switches (2026-11-18, spindump: on the Moto G6 Plus 31 % of the display thread waits for the GPU in st_finish here and 24 % is the kernel's
             // clean+invalidate of the whole 11 MB display surface): /private/var/tmp/bgl-nodsync = finish but no cache sync, bgl-nofinish = flush only, neither.
             static int sync_mode = -1; static unsigned sync_chk;
-            if (sync_mode < 0 || (++sync_chk & 31) == 0) sync_mode = access("/private/var/tmp/bgl-nofinish", F_OK) == 0 ? 2 : access("/private/var/tmp/bgl-nodsync", F_OK) == 0 ? 1 : 0;
+            if (sync_mode < 0 || (++sync_chk & 31) == 0) sync_mode = access("/private/var/tmp/bgl-nofinish", F_OK) == 0 ? 2 : access("/private/var/tmp/bgl-dsync", F_OK) == 0 ? 0 : 1;   // default since 2026-11-18: finish, no cache sync (user: picture fine); bgl-dsync brings the sync back
             double td = g_debug ? now_ms() : 0;
             if (sync_mode == 0) osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); else if (sync_mode == 1) mesa_glFinish();
             if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
@@ -529,7 +529,7 @@ static int swap_write(const uint32_t *w) {
 }
 static int bgl_SwapEnd(void *fb) {
     static double t0; static unsigned f0;
-    if ((g_nswap++ & 31) == 0) g_oneflush = access("/private/var/tmp/bgl-oneflush", F_OK) == 0;
+    if ((g_nswap++ & 31) == 0) g_oneflush = access("/private/var/tmp/bgl-multiflush", F_OK) != 0;      // default since 2026-11-18 (user: clearly smoother, no defects); bgl-multiflush = every glFlush is real again
     ev_log('S', cur_ctx(), 0);
     g_swap_thread = pthread_self(); g_swap_thread_set = 1;
     if (g_flush_pending) {

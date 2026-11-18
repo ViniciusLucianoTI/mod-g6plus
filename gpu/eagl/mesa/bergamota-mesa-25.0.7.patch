@@ -234,6 +234,32 @@ index 2c40d46..4e697c0 100644
  #include "freedreno_batch.h"
  #include "freedreno_context.h"
  #include "ir3_gallium.h"
+diff --git a/src/gallium/drivers/freedreno/a5xx/fd5_gmem.c b/src/gallium/drivers/freedreno/a5xx/fd5_gmem.c
+index a7ba587..cef5f3d 100644
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_gmem.c
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_gmem.c
+@@ -722,7 +722,20 @@ fd5_emit_sysmem_prep(struct fd_batch *batch) assert_dt
+    /* 0x10000000 for BYPASS.. 0x7c13c080 for GMEM: */
+    fd_wfi(batch, ring);
+    OUT_PKT4(ring, REG_A5XX_RB_CCU_CNTL, 1);
+-   OUT_RING(ring, 0x10000000); /* RB_CCU_CNTL */
++   {
++      /* Adreno 508 (Moto G6 Plus, 2026-11-18): with the a530 value 0x10000000 bypass rendering writes 64x4 blocks of
++       * noise (osmesa_blit: 4.9k of 16384 pixels right). With bit 20 also set, or with 0, every pixel is right
++       * (16384 of 16384, five runs); bits 16-19 and 21 alone do not help. Bit 20 is also set in the GMEM value
++       * 0x7c13c080. Meaning unknown. FD5_CCU_BYPASS=0x... overrides for experiments.
++       */
++      static uint32_t ccu; static int have;
++      if (!have) {
++         const char *e = getenv("FD5_CCU_BYPASS");
++         ccu = e ? (uint32_t)strtoul(e, NULL, 0) : (ctx->screen->gpu_id == 508 ? 0x10100000 : 0x10000000);
++         have = 1;
++      }
++      OUT_RING(ring, ccu); /* RB_CCU_CNTL */
++   }
+ 
+    OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
+    OUT_RING(ring, A5XX_RB_CNTL_WIDTH(0) | A5XX_RB_CNTL_HEIGHT(0) |
 diff --git a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
 index e41699a..bc326aa 100644
 --- a/src/gallium/drivers/freedreno/freedreno_screen.c

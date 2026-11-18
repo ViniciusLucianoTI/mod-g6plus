@@ -315,6 +315,16 @@ int main(int argc, char **argv)
 			} else {
 				setenv("FD_MESA_DEBUG", BGL_FD_DEBUG, 1);
 			}
+			/* experiments without a reboot: one line in /private/var/tmp/bgl-fd replaces it ("-" = none) */
+			FILE *ff = fopen("/private/var/tmp/bgl-fd", "r");
+			if (ff) {
+				char line[64] = "";
+				if (fgets(line, sizeof line, ff)) {
+					line[strcspn(line, "\r\n")] = 0;
+					if (!strcmp(line, "-")) unsetenv("FD_MESA_DEBUG"); else if (line[0]) setenv("FD_MESA_DEBUG", line, 1);
+				}
+				fclose(ff);
+			}
 		}
 #endif
 		{   /* the render-server hook of the shim (ca_server_hook.m): on unless bglhook=0 (boot-arg) or "nohook" in the marker */
