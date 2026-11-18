@@ -44,10 +44,11 @@
 #endif
 
 #define EAGL_DEBUG(...) do { if (g_debug) fprintf(stderr, "EAGL(shim): " __VA_ARGS__); } while (0)
+static int g_argb_src;          // texImageIOSurface: the 4-byte source is A,R,G,B (set by attachImage for surfaces without a fourcc)
 // Live IOSurface textures: iOS binds an IOSurface as texture storage, so a producer that writes the surface after the bind (glyph renderers, snapshot
 // decoders, Control Center material) is seen at once. The shim copies at bind time; to keep the same behaviour every uploaded surface is remembered with its
 // IOSurface seed and the texture is re-uploaded when it is bound again (glBindTexture) after the seed changed.
-typedef struct { void *ctx; GLuint name; IOSurfaceRef surf; uint32_t seed, w, h, plane; GLenum ifmt, fmt, type; BOOL invert; BOOL wrapped; } LiveSrc;
+typedef struct { void *ctx; GLuint name; IOSurfaceRef surf; uint32_t seed, w, h, plane; GLenum ifmt, fmt, type; BOOL invert; BOOL wrapped; BOOL argb; } LiveSrc;      // argb: the 4-byte source is A,R,G,B (g_argb_src at upload), kept for the re-uploads
 #define MAX_LIVE 768
 static LiveSrc g_live[MAX_LIVE]; static int g_nlive; static pthread_mutex_t g_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_wrapsample;              // BGL_WRAPSAMPLE=1 (marker word "wrapsample"): sample client-memory IOSurfaces with the GPU instead of copying them (experimental)
@@ -393,7 +394,6 @@ static void verify_direct(EAGLContext *c, Attach *a) {
 }
 
 static uint32_t g_shot_done[6]; static int g_shot_n;
-static int g_argb_src;          // texImageIOSurface: the 4-byte source is A,R,G,B (set by attachImage for surfaces without a fourcc)
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
@@ -908,9 +908,9 @@ static void h_BindTexture(GLenum target, GLuint name) {
     pthread_mutex_unlock(&g_live_lock);
     if (!hit) return;
     if (e.wrapped) { osm_sweet_wrap_sync(IOSurfaceGetID(e.surf)); return; }     // GPU samples the memory itself: only clean the producer's cache lines
-    g_reupload = 1;
+    g_reupload = 1; g_argb_src = e.argb;      // without this the re-upload put the glyphs' alpha byte back into red (tab bar glyphs invisible)
     [c texImageIOSurface:e.surf target:GL_TEXTURE_2D internalFormat:e.ifmt width:e.w height:e.h format:e.fmt type:e.type plane:e.plane invert:e.invert];
-    g_reupload = 0; g_live_reuploads++;
+    g_reupload = 0; g_argb_src = 0; g_live_reuploads++;
     if (g_debug) { static int n; if (n++ < 100) fprintf(stderr, "EAGL(shim): live surface %u re-uploaded into texture %u (seed changed)\n", IOSurfaceGetID(e.surf), name); }
 }
 static void (*o_DeleteTextures)(GLsizei, const GLuint *);
@@ -1484,7 +1484,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             if (k >= 0) {
                 if (g_live[k].surf && g_live[k].surf != ioSurface) CFRelease(g_live[k].surf);
                 if (g_live[k].surf != ioSurface) CFRetain(ioSurface);
-                g_live[k] = (LiveSrc){ self, (GLuint)wb, ioSurface, seed_at_copy, w, h, plane, (GLenum)internalFormat, (GLenum)format, (GLenum)type, invert, YES };
+                g_live[k] = (LiveSrc){ self, (GLuint)wb, ioSurface, seed_at_copy, w, h, plane, (GLenum)internalFormat, (GLenum)format, (GLenum)type, invert, YES, g_argb_src != 0 };
             }
             pthread_mutex_unlock(&g_live_lock);
             glTexParameteri((GLenum)target, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri((GLenum)target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1547,7 +1547,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
         if (bound && k >= 0) {
             if (g_live[k].surf && g_live[k].surf != ioSurface) CFRelease(g_live[k].surf);
             if (g_live[k].surf != ioSurface) CFRetain(ioSurface);
-            g_live[k] = (LiveSrc){ self, (GLuint)bound, ioSurface, seed_at_copy, w, h, plane, (GLenum)internalFormat, (GLenum)format, (GLenum)type, invert };
+            g_live[k] = (LiveSrc){ self, (GLuint)bound, ioSurface, seed_at_copy, w, h, plane, (GLenum)internalFormat, (GLenum)format, (GLenum)type, invert, NO, g_argb_src != 0 };
         }
         pthread_mutex_unlock(&g_live_lock);
     }
