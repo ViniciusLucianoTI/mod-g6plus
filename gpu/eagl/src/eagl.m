@@ -133,7 +133,7 @@ struct _EAGLContextPrivate {
     // render-to-self emulation (fbk_pre): 2D texture bound per unit, active unit, colour texture of the draw framebuffer, the scratch copy
     GLuint unit_tex[8]; int act; GLuint fb_tex; GLuint fbk_tex; int fbk_w, fbk_h; long fbk_n;
     // program 0 emulation (p0_pre): the program CoreAnimation has current, where it keeps its vertex matrix, our stand-in programs
-    GLuint cur_prog; const GLfloat *vmat; GLuint p0_prog[4]; GLint p0_umat[4], p0_utm[4]; long p0_n;
+    GLuint cur_prog; const GLfloat *vmat; GLuint p0_prog[6]; GLint p0_umat[6], p0_utm[6]; long p0_n;
     void *ca_ctx;                   // CoreAnimation's CA::OGL::GLContext for this context (eagl_macro_enter), NULL until found
     EAGLContext *owner;             // not retained: the context this block belongs to (eagl_macro_enter)
 };
@@ -644,19 +644,33 @@ static void fbk_dbg_post(void) {
 // generated programs (attribute 0 position, 1 colour, 2 texcoord0 in texels), CA's own vertex matrix (the pointer it last gave glUniformMatrix4fv
 // for location 0) and texmat0 = 1 / size of the bound texture, as it sets for its own programs.
 static int safe_read(const void *addr, void *out, size_t n);
+struct fu_rec { unsigned long comps, count; float v[20]; unsigned long seq; };
+static struct fu_rec g_fu[8]; static unsigned long g_fu_seq;
+extern unsigned long eagl_fu_dump(char *buf, size_t n, unsigned long newer_than);
 static void (*o_UseProgram)(GLuint);
 static void (*o_UniformMatrix4fv)(GLint, GLsizei, GLboolean, const GLfloat *);
 static void h_UseProgram(GLuint prog) { o_UseProgram(prog); EAGLContext *c = cur_ctx(); if (c) c->_private->cur_prog = prog; }
 static void h_UniformMatrix4fv(GLint loc, GLsizei n, GLboolean tr, const GLfloat *v) { o_UniformMatrix4fv(loc, n, tr, v); if (loc == 0 && n == 1 && v) { EAGLContext *c = cur_ctx(); if (c) c->_private->vmat = v; } }
 static GLuint p0_build(int kind, GLint *umat, GLint *utm) {       // 0 = texture, 1 = texture * colour, 2 = colour, 3 = colour * texture alpha (experiment)
     static const char *vs = "uniform highp mat4 vertex_matrix; uniform highp vec4 texmat0; attribute highp vec4 vertex_position; attribute lowp vec4 vertex_color;"
-                            "attribute highp vec2 vertex_texcoord0; varying lowp vec4 color; varying highp vec2 tc;"
-                            "void main() { gl_Position = vertex_matrix * vertex_position; color = vertex_color; tc = vertex_texcoord0 * texmat0.xy + texmat0.zw; }";
-    static const char *fs[4] = {
+                            "attribute highp vec2 vertex_texcoord0; varying lowp vec4 color; varying highp vec2 tc; varying highp vec2 dc;"
+                            "void main() { gl_Position = vertex_matrix * vertex_position; color = vertex_color; tc = vertex_texcoord0 * texmat0.xy + texmat0.zw; dc = gl_Position.xy / gl_Position.w * 0.5 + 0.5; }";
+    static const char *fs[6] = {
         "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = texture2D(texture0, tc); }",
         "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = texture2D(texture0, tc) * color; }",
         "varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = color; }",
-        "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = color * texture2D(texture0, tc).a; }" };
+        "uniform lowp sampler2D texture0; varying lowp vec4 color; varying highp vec2 tc; void main() { gl_FragColor = color * texture2D(texture0, tc).a; }",
+        // 4 = CA function 0x14 "c4p": 4x5 colour matrix, parameter 0 as five vec4 (columns for r, g, b, a, then the bias). ASSUMED from the
+        // GL shader CoreAnimation generates for its 3x4 sibling; seen on the lock screen with (0,0,0,1) for r and zeros: coverage kept in red -> alpha.
+        "uniform lowp sampler2D texture0; uniform mediump vec4 cm[5]; varying lowp vec4 color; varying highp vec2 tc;"
+        "void main() { mediump vec4 s = texture2D(texture0, tc); gl_FragColor = (s.r * cm[0] + s.g * cm[1] + s.b * cm[2] + s.a * cm[3] + cm[4]) * color; }",
+        // 5 = CA function 0x2d "vcm", vibrant colour matrix: the matrix is applied to what is already on screen under the layer (copied into
+        // texture1 before the draw), the layer only gives the shape (its alpha). Parameter 0 = five vec4 as for c4p. On the lock screen the clock's
+        // matrix makes rgb a constant (the clock's colour) and alpha about 0.9 minus a little of the backdrop's blue. ASSUMED: the result is not
+        // premultiplied (the clock's values would be an invalid premultiplied colour), so it is multiplied by its alpha here.
+        "uniform lowp sampler2D texture0; uniform lowp sampler2D texture1; uniform mediump vec4 cm[5]; varying lowp vec4 color; varying highp vec2 tc; varying highp vec2 dc;"
+        "void main() { mediump vec4 d = texture2D(texture1, dc); mediump vec4 v = clamp(d.r * cm[0] + d.g * cm[1] + d.b * cm[2] + d.a * cm[3] + cm[4], 0.0, 1.0);"
+        " gl_FragColor = vec4(v.rgb * v.a, v.a) * (texture2D(texture0, tc).a * color.a); }" };
     GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER), pr = glCreateProgram();
     glShaderSource(v, 1, &vs, NULL); glCompileShader(v); glShaderSource(f, 1, &fs[kind], NULL); glCompileShader(f);
     glAttachShader(pr, v); glAttachShader(pr, f);
@@ -666,6 +680,7 @@ static GLuint p0_build(int kind, GLint *umat, GLint *utm) {       // 0 = texture
     if (!ok) { fprintf(stderr, "EAGL(shim): the stand-in for program 0 (kind %d) does not link\n", kind); return 0; }
     *umat = glGetUniformLocation(pr, "vertex_matrix"); *utm = glGetUniformLocation(pr, "texmat0");
     o_UseProgram(pr); GLint ut = glGetUniformLocation(pr, "texture0"); if (ut >= 0) glUniform1i(ut, 0);
+    ut = glGetUniformLocation(pr, "texture1"); if (ut >= 0) glUniform1i(ut, 1);
     return pr;
 }
 static int p0_pre(struct _EAGLContextPrivate *p) {
@@ -679,7 +694,9 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     int fn = -1;
     if (p->ca_ctx) { void *state = NULL; uint8_t b = 0; if (safe_read((const char *)p->ca_ctx + 0x10, &state, sizeof state) && state && safe_read((const char *)state + 0x10, &b, 1)) fn = b; }
     { static int all = -1, tick; if (all < 0 || !(tick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); all = 0; if (mf) { all = fgetc(mf) == '3'; fclose(mf); } }
-      if (!all && fn >= 0x2d && fn <= 0x2f) { static long nv; if (g_debug && (nv++ < 4 || !(nv % 5000))) fprintf(stderr, "EAGL(shim): program-0 draw for CA function 0x%x left undrawn (#%ld)\n", fn, nv); return 0; }
+      static int novcm = -1; if (novcm < 0) novcm = getenv("BGL_P0_NO_VCM") != NULL;
+      int vcm = fn == 0x2d && !novcm && p->unit_tex[0] && p->fb_tex && g_fu[0].comps == 4 && g_fu[0].count == 5;
+      if (!all && !vcm && fn >= 0x2d && fn <= 0x2f) { static long nv; if (g_debug && (nv++ < 4 || !(nv % 5000))) fprintf(stderr, "EAGL(shim): program-0 draw for CA function 0x%x left undrawn (#%ld)\n", fn, nv); return 0; }
       if (g_debug && fn >= 0 && fn != 0x14 && fn != 0x1c && !(fn >= 0x2d && fn <= 0x2f)) { static int seen[256]; if (!seen[fn]++) fprintf(stderr, "EAGL(shim): program-0 draw for CA function 0x%x: drawn as texture * colour (first time)\n", fn); } }
     GLint en1 = 0; glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en1);
     GLuint tex = p->unit_tex[0];
@@ -693,9 +710,30 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     // experiment switch, re-read now and then: /private/var/tmp/bgl-p0mode = 1: colour * texture alpha for blended draws, 2: for all textured draws
     { static int mode, tick; if (!(tick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); mode = 0; if (mf) { mode = fgetc(mf) - '0'; fclose(mf); } }
       if (kind == 1 && (mode == 2 || (mode == 1 && glIsEnabled(GL_BLEND)))) kind = 3; }      // without a texture: drawing the vertex colour painted a red gradient over the display (seen 2026-11-14); left as before (nothing)
+    { static int nocm = -1; if (nocm < 0) nocm = getenv("BGL_P0_NO_C4P") != NULL;
+      if (fn == 0x14 && kind == 1 && !nocm && g_fu[0].comps == 4 && g_fu[0].count == 5) kind = 4;
+      static int novcm2 = -1; if (novcm2 < 0) novcm2 = getenv("BGL_P0_NO_VCM") != NULL;
+      if (fn == 0x2d && tex && p->fb_tex && !novcm2 && g_fu[0].comps == 4 && g_fu[0].count == 5) kind = 5; }
     if (!p->p0_prog[kind]) { p->p0_prog[kind] = p0_build(kind, &p->p0_umat[kind], &p->p0_utm[kind]); if (!p->p0_prog[kind]) return 0; }
     o_UseProgram(p->p0_prog[kind]);
     o_UniformMatrix4fv(p->p0_umat[kind], 1, GL_FALSE, p->vmat);
+    if (kind == 4 || kind == 5) { GLint l = glGetUniformLocation(p->p0_prog[kind], "cm"); if (l >= 0) glUniform4fv(l, 5, g_fu[0].v); }
+    int ret = 1;
+    if (kind == 5) {                 // what is on screen under the layer -> the scratch texture, on unit 1
+        GLint dw = 0, dh = 0, sb[4] = { 0 };
+        o_ActiveTexture(GL_TEXTURE1);
+        o_BindTexture(GL_TEXTURE_2D, p->fb_tex); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &dw); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &dh);
+        if (!p->fbk_tex) glGenTextures(1, &p->fbk_tex);
+        o_BindTexture(GL_TEXTURE_2D, p->fbk_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        int x0 = 0, y0 = 0, x1 = dw, y1 = dh;
+        if (glIsEnabled(GL_SCISSOR_TEST)) { glGetIntegerv(GL_SCISSOR_BOX, sb); x0 = sb[0]; y0 = sb[1]; x1 = sb[0] + sb[2]; y1 = sb[1] + sb[3]; if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > dw) x1 = dw; if (y1 > dh) y1 = dh; }
+        if (p->fbk_w != dw || p->fbk_h != dh) { glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, dw, dh, 0); p->fbk_w = dw; p->fbk_h = dh; }
+        else if (x1 > x0 && y1 > y0) glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);
+        o_ActiveTexture(GL_TEXTURE0 + p->act);
+        ret = 2;
+    }
     GLint w = 0, h = 0;
     if (tex) {
         if (p->act != 0) o_ActiveTexture(GL_TEXTURE0);
@@ -720,14 +758,15 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
             }
         }
     }
-    if (g_debug && (p->p0_n++ < 24 || !(p->p0_n % 5000))) {
+    if (g_debug && (p->p0_n++ < 40 || !(p->p0_n % 5000))) {
         GLint en2 = 0; void *tp = NULL; glGetVertexAttribiv(2, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en2); glGetVertexAttribPointerv(2, GL_VERTEX_ATTRIB_ARRAY_POINTER, &tp);
         GLint st = 0; glGetVertexAttribiv(2, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st); const float *t = tp;
         fprintf(stderr, "EAGL(shim): program-0 draw #%ld: kind %d texture %u (%dx%d) dest %u blend %d colour array %d texcoord array %d", p->p0_n, kind, tex, w, h, p->fb_tex, glIsEnabled(GL_BLEND), en1, en2);
         { uint8_t st[0x1b8]; void *state = NULL;
           if (p->ca_ctx && safe_read((const char *)p->ca_ctx + 0x10, &state, sizeof state) && state && safe_read(state, st, sizeof st))
               fprintf(stderr, " CA function 0x%x blend 0x%x flags 0x%x images %02x %02x", st[0x10], st[0x1b0], st[0x1b1], st[0x11], st[0x12]);
-          else fprintf(stderr, " CA state unknown (ctx %p)", p->ca_ctx); }
+          else fprintf(stderr, " CA state unknown (ctx %p)", p->ca_ctx);
+          { static char fb[700]; static unsigned long last; last = eagl_fu_dump(fb, sizeof fb, last); fprintf(stderr, " params since the last logged draw:%s", fb[0] ? fb : " none"); } }
         if (en2 && t && st) fprintf(stderr, " texcoords (%g %g) (%g %g) (%g %g) (%g %g)", t[0], t[1], *(const float *)((const char *)t + st), *(const float *)((const char *)t + st + 4),
                                     *(const float *)((const char *)t + 2 * st), *(const float *)((const char *)t + 2 * st + 4), *(const float *)((const char *)t + 3 * st), *(const float *)((const char *)t + 3 * st + 4));
         { GLint ty = 0, no = 0, cst = 0; void *cp = NULL; glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty); glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &no);
@@ -737,7 +776,7 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
           GLint sr = 0, dr = 0; glGetIntegerv(0x80c9, &sr); glGetIntegerv(0x80c8, &dr); fprintf(stderr, " blendfunc %x %x", sr, dr); }
         fprintf(stderr, " matrix [%g %g %g %g | %g %g %g %g | .. | %g %g %g %g]\n", p->vmat[0], p->vmat[1], p->vmat[2], p->vmat[3], p->vmat[4], p->vmat[5], p->vmat[6], p->vmat[7], p->vmat[12], p->vmat[13], p->vmat[14], p->vmat[15]);
     }
-    return 1;
+    return ret;
 }
 static void fbk_dbg_plain(struct _EAGLContextPrivate *p) {
     GLint prog = 0, sb[4] = { 0 }, sr = 0, dr = 0, sa = 0, da = 0, eq = 0, st = 0, cst = 0, en1 = 0; GLboolean cm[4] = { 1, 1, 1, 1 }; void *pp = NULL, *cp = NULL;
@@ -751,7 +790,7 @@ static void fbk_dbg_plain(struct _EAGLContextPrivate *p) {
     if (en1 && cp) { const uint16_t *q = cp; fprintf(stderr, " colour %04x %04x %04x %04x", q[0], q[1], q[2], q[3]); }
     fprintf(stderr, "\n");
 }
-#define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) o_UseProgram(0); } while (0)
+#define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
 static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { mark_cur_dirty(); diag_rect(); FBK_DRAW(o_DrawArrays(a, b, c)); }
 static void (*o_DrawElements)(GLenum, GLsizei, GLenum, const void *);
 static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { mark_cur_dirty(); diag_rect(); diag_maskdraw(d); FBK_DRAW(o_DrawElements(a, b, c, d)); }
@@ -1040,6 +1079,44 @@ static int safe_read(const void *addr, void *out, size_t n) {
     vm_size_t got = 0;
     return vm_read_overwrite(mach_task_self(), (vm_address_t)addr, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n;
 }
+// CoreAnimation hands shader parameters (colour matrices, weights) to CA::OGL::GLContext::function_uniform(index, components, count, floats),
+// which forwards them to glUniform only when a GL program exists. For the functions without one (program-0 draws) they never reach GL, so the
+// stand-in has to take them here: the context's vtable slot of that method is redirected to a recorder (plain arm64, no pointer authentication).
+// The method is found by its code (five register moves after the prologue), not by address.
+static void (*o_function_uniform)(void *, unsigned, unsigned long, unsigned long, const float *);
+static void h_function_uniform(void *self, unsigned idx, unsigned long comps, unsigned long count, const float *v) {
+    if (idx < 8 && v && comps >= 1 && comps <= 4 && count >= 1) {
+        unsigned long n = comps * count; if (n > 20) n = 20;
+        g_fu[idx].comps = comps; g_fu[idx].count = count; g_fu[idx].seq = ++g_fu_seq; memcpy(g_fu[idx].v, v, n * sizeof(float));
+    }
+    o_function_uniform(self, idx, comps, count, v);
+}
+unsigned long eagl_fu_dump(char *buf, size_t n, unsigned long newer_than) {       // the recorded parameters set after sequence number `newer_than`, as text
+    size_t o = 0; buf[0] = 0;
+    for (int i = 0; i < 8; i++) if (g_fu[i].seq > newer_than) {
+        unsigned long k = g_fu[i].comps * g_fu[i].count; if (k > 20) k = 20;
+        o += (size_t)snprintf(buf + o, o < n ? n - o : 0, " u%d(%lux%lu):", i, g_fu[i].comps, g_fu[i].count);
+        for (unsigned long j = 0; j < k && o < n; j++) o += (size_t)snprintf(buf + o, o < n ? n - o : 0, " %.4g", g_fu[i].v[j]);
+    }
+    return g_fu_seq;
+}
+static void hook_function_uniform(void *ctx) {
+    void **vt = NULL;
+    if (o_function_uniform || !safe_read(ctx, &vt, sizeof vt) || !vt) return;
+    static const uint32_t sig[5] = { 0xaa0403f3, 0xaa0303f4, 0xaa0203f6, 0xaa0103f7, 0xaa0003f5 };   // mov x19,x4; mov x20,x3; mov x22,x2; mov x23,x1; mov x21,x0
+    for (int i = 0; i < 400; i++) {
+        void *fn = NULL; uint32_t code[10];
+        if (!safe_read(&vt[i], &fn, sizeof fn) || !fn) break;
+        if (!safe_read(fn, code, sizeof code) || memcmp(&code[5], sig, sizeof sig)) continue;
+        vm_address_t page = (vm_address_t)&vt[i] & ~(vm_address_t)0x3fff;
+        kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr != KERN_SUCCESS) { fprintf(stderr, "EAGL(shim): cannot make CoreAnimation's vtable writable (0x%x): function parameters will be missing\n", kr); return; }
+        o_function_uniform = fn; vt[i] = (void *)h_function_uniform;
+        if (g_debug) fprintf(stderr, "EAGL(shim): function_uniform is vtable slot %d of CoreAnimation's GL context (%p), recording its parameters\n", i, fn);
+        return;
+    }
+    if (g_debug) fprintf(stderr, "EAGL(shim): function_uniform not found in CoreAnimation's vtable\n");
+}
 void eagl_macro_enter(void *rend, void *x19, void *x23) {
     if (!rend) return;
     struct _EAGLContextPrivate *p = rend;
@@ -1047,6 +1124,7 @@ void eagl_macro_enter(void *rend, void *x19, void *x23) {
         void *held = NULL;
         if (safe_read((const char *)x19 + 0x7f8, &held, sizeof held) && held == (void *)p->macro) {
             p->ca_ctx = x19;
+            hook_function_uniform(x19);
             if (g_debug) fprintf(stderr, "EAGL(shim): CoreAnimation's GL context object is at %p\n", x19);
         }
     }
