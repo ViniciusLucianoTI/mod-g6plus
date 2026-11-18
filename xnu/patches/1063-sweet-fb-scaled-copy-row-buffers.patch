@@ -1,0 +1,76 @@
+From 85aa64619f8b8ebceba6e0cf1d026e5fc6f78a70 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Wed, 18 Nov 2026 01:09:22 -0300
+Subject: [PATCH] sweet fb: scaled panel copy through cached row buffers; time
+ of a copy logged
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 30 +++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a3bed7eda..bb927ff57 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -165,6 +165,7 @@ public:
+ 	uint32_t      fScaleXNum, fScaleXDen, fScaleYNum, fScaleYDen;
+ 	int32_t       fPadX, fPadY;
+ 	uint32_t     *fXMap;
++	uint32_t     *fRowIn, *fRowOut;        /* cached row buffers for presentScaled */
+ 	bool          fBarsCleared;
+ 	/*
+ 	 * Poco F1 MDP (SDM845 DPU) page flipping, after ios-topaz 0092/0100/0102:
+@@ -358,6 +359,8 @@ AppleCLCD::start(IOService *provider)
+ 		if (fXMap == NULL) {
+ 			fScale = 0;
+ 		}
++		fRowIn = (uint32_t *)IOMallocData((fLogicalW + 16) * sizeof(uint32_t));
++		fRowOut = (uint32_t *)IOMallocData((fWidth + 16) * sizeof(uint32_t));
+ 	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+@@ -520,7 +523,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	bool dirty = fb->fDirty;        /* still unshown: not yet worth lighting the panel */
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		static uint64_t spent, shown;
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		spent += mach_absolute_time() - t0;
++		if (++shown % 600 == 0) {                /* how long a panel copy takes: every 600 copies */
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(spent, &ns);
++			IOLog("SWEET FB: %llu panel copies, the last 600 took %llu us each on average\n", shown, ns / 600 / 1000);
++			spent = 0;
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	if (fb->fZc) {
+@@ -1561,8 +1573,22 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+ 		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly) * s->bytesPerRow);
+ 		volatile uint32_t *drow = (volatile uint32_t *)(fDraw + (uint64_t)py * fRowBytes) + px0;
+ 		int32_t n = px1 - px0;
+-		for (int32_t i = 0; i < n; i++) {
+-			drow[i] = srow[fXMap[i]];
++		if (fRowIn != NULL && fRowOut != NULL && (uint32_t)w <= fLogicalW && (uint32_t)n <= fWidth) {
++			/*
++			 * Both ends are write-combined (uncached) mappings: the surface the GPU drew into and the panel
++			 * memory. Picking 2 million pixels one by one out of the first and storing them one by one into
++			 * the second cost about a core at 60 Hz on the Moto G6 Plus. One bulk read of the source row into
++			 * cached memory, the per-pixel pick there, one bulk write of the panel row.
++			 */
++			memcpy(fRowIn, srow + sx, (size_t)w * 4);
++			for (int32_t i = 0; i < n; i++) {
++				fRowOut[i] = fRowIn[fXMap[i] - (uint32_t)sx];
++			}
++			memcpy((void *)(uintptr_t)drow, fRowOut, (size_t)n * 4);
++		} else {
++			for (int32_t i = 0; i < n; i++) {
++				drow[i] = srow[fXMap[i]];
++			}
+ 		}
+ 	}
+ }
+-- 
+2.56.0
+
