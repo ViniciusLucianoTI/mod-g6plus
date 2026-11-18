@@ -13,3 +13,4 @@ xnu/out-*/
 __pycache__/
 tools/identity/out/
 tools/lseemu/out/
+tools/g6plus/out/
