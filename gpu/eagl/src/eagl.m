@@ -477,7 +477,83 @@ static void pipe_count_sync(EAGLContext *c) {
     if (w >= 1000 && h >= 2000 && ++g_ps_syncs % 60 == 0) pipe_stats_report();
 }
 extern int g_fbk_dbg_on(void);
-static void shim_glFlush(void) { g_frame++; if (g_fbk_dbg_on()) fprintf(stderr, "EAGL(shim): FBK flush (frame %u)\n", g_frame); double t = g_debug ? now_ms() : 0; mesa_glFlush(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
+// One real flush per frame (experiment, 2026-11-18). CoreAnimation calls glFlush several times while it builds one frame; with tiled rendering each
+// flush ends the batch (every tile stored to the display surface, loaded back for the rest of the frame) and this shim then waits for the GPU and syncs
+// the surface. With /private/var/tmp/bgl-oneflush the display thread's flushes are only remembered and the real one happens when the frame is handed
+// to the display: IOMobileFramebufferSwapEnd, interposed below (injection build). /private/var/tmp/bgl-stat: a line per 120 swaps in bgl-stat.log.
+static unsigned g_nflush, g_nflush_deferred, g_nswap, g_nswap_noctx, g_nswap_other; static int g_oneflush, g_flush_pending; static pthread_t g_flush_thread;
+static int g_swap_hooked; static void swap_hook_install(void);
+static unsigned g_draw_total;
+static void ev_log(char kind, EAGLContext *c, unsigned draws) {
+    static struct { double t; char k; unsigned thr, draws; int att, natt, dirty; } ev[400]; static int n = -1; static unsigned chk;
+    if (n < 0) { if ((chk++ & 63) || access("/private/var/tmp/bgl-flushlog", F_OK) != 0) return; unlink("/private/var/tmp/bgl-flushlog"); n = 0; }
+    int dirty = 0; if (c) for (int i = 0; i < c->_private->natt; i++) if (c->_private->att[i].dirty) dirty |= 1 << (i & 31);
+    ev[n].t = now_ms(); ev[n].k = kind; ev[n].thr = (unsigned)pthread_mach_thread_np(pthread_self()); ev[n].draws = draws; ev[n].att = c ? c->_private->cur_att : -9; ev[n].natt = c ? c->_private->natt : -1; ev[n].dirty = dirty;
+    if (++n < 400) return;
+    FILE *f = fopen("/private/var/tmp/bgl-flush.log", "w");
+    if (f) { for (int i = 0; i < 400; i++) fprintf(f, "%9.2f %c thr %x draws %u cur_att %d natt %d dirty %x\n", ev[i].t - ev[0].t, ev[i].k, ev[i].thr, ev[i].draws, ev[i].att, ev[i].natt, ev[i].dirty); fclose(f); }
+    n = -1;
+}
+static void shim_flush_now(void) { g_frame++; if (g_fbk_dbg_on()) fprintf(stderr, "EAGL(shim): FBK flush (frame %u)\n", g_frame); double t = g_debug ? now_ms() : 0; mesa_glFlush(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
+static void shim_glFlush(void) {
+    g_nflush++;
+    EAGLContext *c = cur_ctx();
+    // /private/var/tmp/bgl-flushlog: the next 400 flushes and swaps with time, thread, draws since the last one and the target, to bgl-flush.log
+    { static unsigned draws0; ev_log('F', c, g_draw_total - draws0); draws0 = g_draw_total; }
+#ifdef EAGL_INJECT
+    { static int tried; if (!tried && c && c->_private->natt) { tried = 1; swap_hook_install(); } }
+#else
+    (void)g_swap_hooked;
+#endif
+    if (g_oneflush && g_swap_hooked && c && c->_private->natt) {
+        g_nflush_deferred++; g_flush_pending = 1; g_flush_thread = pthread_self(); return; }
+    shim_flush_now();
+}
+#ifdef EAGL_INJECT
+// IOMobileFramebufferSwapEnd is reached from QuartzCore by a direct branch inside the shared cache (no stub, so dyld interposing never sees it: tried).
+// Its entry is patched instead: `ldr x16, #8; br x16; .quad bgl_SwapEnd`. To call the original the 16 bytes are put back for the duration of the call
+// (only the display thread swaps). Any failure (no symbol, page not writable) leaves the function alone and the one-flush mode unavailable.
+#include <libkern/OSCacheControl.h>
+#include <dlfcn.h>
+static int (*g_swapend)(void *); static uint32_t g_swap_orig[4], g_swap_patch[4];
+static int swap_write(const uint32_t *w) {
+    vm_address_t page = (vm_address_t)g_swapend & ~(vm_address_t)0x3fff; vm_size_t len = ((vm_address_t)g_swapend + 16 - page + 0x3fff) & ~(vm_size_t)0x3fff;
+    if (vm_protect(mach_task_self(), page, len, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return 0;
+    memcpy((void *)g_swapend, w, 16);
+    int ok = vm_protect(mach_task_self(), page, len, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS;
+    sys_icache_invalidate((void *)g_swapend, 16);
+    return ok;
+}
+static int bgl_SwapEnd(void *fb) {
+    static double t0; static unsigned f0;
+    if ((g_nswap++ & 31) == 0) g_oneflush = access("/private/var/tmp/bgl-oneflush", F_OK) == 0;
+    ev_log('S', cur_ctx(), 0);
+    if (g_flush_pending) {
+        EAGLContext *c = cur_ctx();
+        if (!pthread_equal(g_flush_thread, pthread_self())) g_nswap_other++;
+        if (c && c->_private->natt) { g_flush_pending = 0; shim_flush_now(); } else g_nswap_noctx++;
+    }
+    if (g_nswap % 120 == 0) {
+        double now = now_ms();
+        if (access("/private/var/tmp/bgl-stat", F_OK) == 0) { FILE *f = fopen("/private/var/tmp/bgl-stat.log", "a");
+            if (f) { fprintf(f, "swaps %u (%.1f/s) flushes %u (%.2f per swap) deferred %u oneflush %d swap-without-context %u swap-on-other-thread %u\n", g_nswap, t0 ? 120000.0 / (now - t0) : 0.0, g_nflush, (g_nflush - f0) / 120.0, g_nflush_deferred, g_oneflush, g_nswap_noctx, g_nswap_other); fclose(f); } }
+        t0 = now; f0 = g_nflush;
+    }
+    if (!swap_write(g_swap_orig)) abort();
+    int r = g_swapend(fb);
+    swap_write(g_swap_patch);
+    return r;
+}
+static void swap_hook_install(void) {
+    void *h = dlopen("/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/IOMobileFramebuffer", RTLD_NOW);
+    g_swapend = h ? (int (*)(void *))dlsym(h, "IOMobileFramebufferSwapEnd") : NULL;
+    if (!g_swapend) { fprintf(stderr, "EAGL(shim): no IOMobileFramebufferSwapEnd: one-flush mode unavailable\n"); return; }
+    memcpy(g_swap_orig, (void *)g_swapend, 16);
+    g_swap_patch[0] = 0x58000050; g_swap_patch[1] = 0xd61f0200; uint64_t t = (uint64_t)(uintptr_t)bgl_SwapEnd; memcpy(&g_swap_patch[2], &t, 8);
+    g_swap_hooked = swap_write(g_swap_patch);
+    FILE *f = fopen("/private/var/tmp/bgl-stat.log", "a"); if (f) { fprintf(f, "swap hook at %p: %s (first words %08x %08x)\n", (void *)g_swapend, g_swap_hooked ? "installed" : "FAILED", g_swap_orig[0], g_swap_orig[1]); fclose(f); }
+}
+#endif
 static void shim_glFinish(void) { double t = g_debug ? now_ms() : 0; mesa_glFinish(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
 
 // Dirty tracking of the display-size attachments: the render server draws into one texture per frame (through an FBO) and flushes; copying both of its
@@ -896,6 +972,7 @@ static void mark_bound_texture_dirty(void) {     // texture writes (upload / cop
     GLint t = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
     for (int i = 0; i < c->_private->natt; i++) if ((GLint)c->_private->att[i].name == t && att_is_tex(&c->_private->att[i])) c->_private->att[i].dirty = 1;
     g_draw_seen++;
+    g_draw_total++;
 }
 static void (*o_ClearBufferiv)(GLenum, GLint, const GLint *);
 static void h_ClearBufferiv(GLenum a, GLint b, const GLint *c) { mark_cur_dirty(); o_ClearBufferiv(a, b, c); }
