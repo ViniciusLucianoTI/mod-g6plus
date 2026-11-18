@@ -484,6 +484,7 @@ extern int g_fbk_dbg_on(void);
 static unsigned g_nflush, g_nflush_deferred, g_nswap, g_nswap_noctx, g_nswap_other; static int g_oneflush, g_flush_pending; static pthread_t g_flush_thread;
 static int g_swap_hooked; static void swap_hook_install(void);
 static unsigned g_draw_total;
+static pthread_t g_swap_thread; static int g_swap_thread_set;
 static void ev_log(char kind, EAGLContext *c, unsigned draws) {
     static struct { double t; char k; unsigned thr, draws; int att, natt, dirty; } ev[400]; static int n = -1; static unsigned chk;
     if (n < 0) { if ((chk++ & 63) || access("/private/var/tmp/bgl-flushlog", F_OK) != 0) return; unlink("/private/var/tmp/bgl-flushlog"); n = 0; }
@@ -505,7 +506,9 @@ static void shim_glFlush(void) {
 #else
     (void)g_swap_hooked;
 #endif
-    if (g_oneflush && g_swap_hooked && c && c->_private->natt) {
+    // Only the thread that swaps defers: another context rendering into a surface (seen: a second thread with its own attachment, e.g. the app
+    // switcher's background) has no swap of its own, and its picture would never be finished (user 2026-11-18: that background went black).
+    if (g_oneflush && g_swap_hooked && g_swap_thread_set && pthread_equal(pthread_self(), g_swap_thread) && c && c->_private->natt) {
         g_nflush_deferred++; g_flush_pending = 1; g_flush_thread = pthread_self(); return; }
     shim_flush_now();
 }
@@ -528,6 +531,7 @@ static int bgl_SwapEnd(void *fb) {
     static double t0; static unsigned f0;
     if ((g_nswap++ & 31) == 0) g_oneflush = access("/private/var/tmp/bgl-oneflush", F_OK) == 0;
     ev_log('S', cur_ctx(), 0);
+    g_swap_thread = pthread_self(); g_swap_thread_set = 1;
     if (g_flush_pending) {
         EAGLContext *c = cur_ctx();
         if (!pthread_equal(g_flush_thread, pthread_self())) g_nswap_other++;
