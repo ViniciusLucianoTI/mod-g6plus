@@ -1,18 +1,46 @@
-From 75985837c3b562fd19fee09e84e12d4a5b1d4f1e Mon Sep 17 00:00:00 2001
+From f52ca1b409868dc9df0496b0b971cf895fd6f0d5 Mon Sep 17 00:00:00 2001
 From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
 Date: Tue, 17 Nov 2026 23:44:58 -0300
 Subject: [PATCH] sweet: Adreno 508 core clock levels on the GPU PLLs (160-700
  MHz), load governor, TSENS ceiling
 
 ---
- bsd/dev/sweet_a508.c | 338 +++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 338 insertions(+)
+ bsd/dev/sweet_a508.c | 371 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 371 insertions(+)
 
 diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
-index d52dddf20..b6a4a53ab 100644
+index d52dddf20..fc1ad4513 100644
 --- a/bsd/dev/sweet_a508.c
 +++ b/bsd/dev/sweet_a508.c
-@@ -1260,6 +1260,335 @@ a5_stage4(uint32_t mhz)
+@@ -1173,6 +1173,9 @@ sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned co
+ 	return a5dev.seqno;
+ }
+ 
++static void sweet_a508_request_mhz(uint32_t mhz);
++static void sweet_a508_clock_state(uint32_t *mhz, uint32_t *temp, uint32_t *changes);
++
+ void
+ sweet_gpu_debug(uint32_t *w)
+ {
+@@ -1197,7 +1200,17 @@ sweet_gpu_debug(uint32_t *w)
+ 		out = gr(reg);
+ 		did = true;
+ 	}
++	/* w[39] = 'FREQ': w[36] = MHz to pin the core clock at, 1 = governor, 0 = only report. Answer: w[36] = MHz now (0 = the
++	 * bring-up clock), w[37] = hottest TSENS sensor in tenths of a degree, w[38] = level changes so far. Not behind sweetgpupoke. */
++	bool freq = op == 0x46524551u;
++	if (freq && reg) {
++		sweet_a508_request_mhz(reg);
++	}
+ 	bzero(w, 40 * sizeof(uint32_t));
++	if (freq) {
++		sweet_a508_clock_state(&w[36], &w[37], &w[38]);
++		w[39] = 0x444f4e45u;
++	}
+ 	if (did) {
+ 		w[36] = reg;
+ 		w[37] = out;
+@@ -1260,6 +1273,355 @@ a5_stage4(uint32_t mhz)
  	return true;
  }
  
@@ -233,6 +261,8 @@ index d52dddf20..b6a4a53ab 100644
 +	return r;
 +}
 +
++static volatile uint32_t a5clk_request;         /* from sweet_gpu_debug ('FREQ'): MHz to pin, or 1 = governor */
++
 +static void
 +a5_gov_thread(void *arg __unused, wait_result_t wr __unused)
 +{
@@ -256,37 +286,33 @@ index d52dddf20..b6a4a53ab 100644
 +	if (hi < lo) {
 +		hi = lo;
 +	}
++	bool automatic = gov != 0;
 +	if (fix) {
-+		int l = a5_level_for(fix, true);
-+		bool ok = a5_set_level(l, true);
++		bool ok = a5_set_level(a5_level_for(fix, true), true);
 +		a5_pll_dump(ok ? "after the fixed level" : "fixed level FAILED");
-+		if (!gov) {
-+			/* keep watching the temperature: above hot + 15 C fall back to 240 MHz and stay there */
-+			for (;;) {
-+				a5_wait(1000);
-+				int t = a5_hottest();
-+				static uint32_t n;
-+				if ((n++ % 30) == 0) {
-+					printf("SWEET GPU: fixed %u MHz, hottest sensor %d.%d C\n", a5clk.level >= 0 ? a5_levels[a5clk.level].mhz : 0, t / 10, t >= 0 ? t % 10 : 0);
-+				}
-+				if (t >= (int)hot + 150 && a5clk.level > 1) {
-+					printf("SWEET GPU: %d.%d C: falling back to 240 MHz\n", t / 10, t % 10);
-+					(void)a5_set_level(1, true);
-+				}
-+			}
-+		}
-+	}
-+	if (!gov) {
-+		(void)thread_terminate(current_thread());
-+		return;
-+	}
-+	printf("SWEET GPU: governor on, %u..%u MHz, ceiling comes down above %u.%u C\n", a5_levels[lo].mhz, a5_levels[hi].mhz, hot / 10, hot % 10);
-+	if (a5clk.level < 0) {
++		automatic = false;
++	} else if (automatic) {
++		printf("SWEET GPU: governor on, %u..%u MHz, ceiling comes down above %u.%u C\n", a5_levels[lo].mhz, a5_levels[hi].mhz, hot / 10, hot % 10);
 +		(void)a5_set_level(lo > 1 ? lo : 1, true);      /* off GPLL0, onto a GPU PLL */
 +	}
 +	uint32_t busy = 0, ticks = 0, calm = 0, windows = 0;
 +	for (;;) {
 +		a5_wait(10);
++		uint32_t req = a5clk_request;
++		if (req) {
++			a5clk_request = 0;
++			if (req == 1) {
++				automatic = true;
++				printf("SWEET GPU: governor on by request, %u..%u MHz\n", a5_levels[lo].mhz, a5_levels[hi].mhz);
++				if (a5clk.level < 0) {
++					(void)a5_set_level(lo > 1 ? lo : 1, true);
++				}
++			} else {
++				automatic = false;
++				bool ok = a5_set_level(a5_level_for(req, true), true);
++				printf("SWEET GPU: %u MHz requested: %s; hottest sensor %d\n", req, ok ? "done" : "FAILED", a5_hottest());
++			}
++		}
 +		if (a5dev.ready && a5dev.seqno != *(volatile uint32_t *)a5_cpu(A5_VA_FENCE)) {
 +			busy++;
 +		}
@@ -309,34 +335,42 @@ index d52dddf20..b6a4a53ab 100644
 +		if (cap > hi) {
 +			cap = hi;
 +		}
-+		if (busy >= 8) {
-+			want = cap;
-+			calm = 0;
-+		} else if (busy >= 5) {
-+			want = a5clk.level + 1;
-+			calm = 0;
-+		} else if (busy <= 2) {
-+			if (++calm >= 3) {
-+				want = a5clk.level - 1;
-+				calm = 0;
++		if (!automatic) {
++			/* a pinned level still comes down when the SoC is 15 C over the limit */
++			if (a5clk.level > 1 && t >= (int)hot + 150) {
++				printf("SWEET GPU: %d.%d C at a pinned %u MHz: falling back to 240 MHz\n", t / 10, t % 10, a5_levels[a5clk.level].mhz);
++				(void)a5_set_level(1, true);
 +			}
 +		} else {
-+			calm = 0;
++			if (busy >= 8) {
++				want = cap;
++				calm = 0;
++			} else if (busy >= 5) {
++				want = a5clk.level + 1;
++				calm = 0;
++			} else if (busy <= 2) {
++				if (++calm >= 3) {
++					want = a5clk.level - 1;
++					calm = 0;
++				}
++			} else {
++				calm = 0;
++			}
++			if (want > cap) {
++				want = cap;
++			}
++			if (want < lo) {
++				want = lo;
++			}
++			if (want != a5clk.level) {
++				(void)a5_set_level(want, false);
++			}
 +		}
-+		if (want > cap) {
-+			want = cap;
-+		}
-+		if (want < lo) {
-+			want = lo;
-+		}
-+		if (want != a5clk.level) {
-+			(void)a5_set_level(want, false);
-+		}
-+		if ((++windows % 300) == 0) {                   /* every 30 s */
-+			printf("SWEET GPU: governor: %u MHz, last window busy %u0 %%, hottest %d.%d C (ceiling %u MHz), %u changes (%u failed); seconds at",
-+			    a5_levels[a5clk.level].mhz, busy, t / 10, t >= 0 ? t % 10 : 0, a5_levels[cap].mhz, a5clk.changes, a5clk.failed);
-+			for (int i = 0; i < A5_NLEVELS; i++) {
-+				printf(" %u:%llu", a5_levels[i].mhz, a5clk.ticks_at[i] / 100);
++		if ((++windows % 300) == 0 && a5clk.level >= 0) {       /* every 30 s */
++			printf("SWEET GPU: %s: %u MHz, last window busy %u0 %%, hottest %d.%d C (ceiling %u MHz), %u changes (%u failed); seconds at",
++			    automatic ? "governor" : "pinned", a5_levels[a5clk.level].mhz, busy, t / 10, t >= 0 ? t % 10 : 0, a5_levels[cap].mhz, a5clk.changes, a5clk.failed);
++			for (int k = 0; k < A5_NLEVELS; k++) {
++				printf(" %u:%llu", a5_levels[k].mhz, a5clk.ticks_at[k] / 100);
 +			}
 +			printf("\n");
 +		}
@@ -345,17 +379,31 @@ index d52dddf20..b6a4a53ab 100644
 +	}
 +}
 +
++static void
++sweet_a508_request_mhz(uint32_t mhz)
++{
++	a5clk_request = mhz;
++}
++
++static void
++sweet_a508_clock_state(uint32_t *mhz, uint32_t *temp, uint32_t *changes)
++{
++	*mhz = a5clk.level >= 0 ? a5_levels[a5clk.level].mhz : 0;
++	*temp = (uint32_t)a5_hottest();
++	*changes = a5clk.changes;
++}
++
  static void
  a508_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -1392,6 +1721,15 @@ a508_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1392,6 +1754,15 @@ a508_thread(void *arg __unused, wait_result_t wr __unused)
  			if (cp && stage >= 4) {
  				bool up = a5_stage4(mhz);
  				printf("SWEET GPU: %s\n", up ? "SweetAdreno630 service published (Adreno 508 behind it)" : "stage 4 did not finish");
 +				uint32_t fix = 0, gov = 0;
 +				(void)PE_parse_boot_argn("sweetgpufix", &fix, sizeof(fix));
 +				(void)PE_parse_boot_argn("sweetgpugov", &gov, sizeof(gov));
-+				if (up && (fix || gov)) {
++				if (up) {
 +					thread_t gt;
 +					if (kernel_thread_start(a5_gov_thread, NULL, &gt) == KERN_SUCCESS) {
 +						thread_deallocate(gt);
