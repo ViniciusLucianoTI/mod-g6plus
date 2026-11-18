@@ -933,6 +933,10 @@ static void h_BindTexture(GLenum target, GLuint name) {
     EAGLContext *c = cur_ctx(); if (!c) return;
     if (target == GL_TEXTURE_2D) c->_private->unit_tex[c->_private->act] = name;
     if (target != GL_TEXTURE_2D || !name || !g_nlive) return;
+    // A live texture is checked against its surface once per frame, at its first bind: the render thread sat at 100 % of a core while pages
+    // were swiped, and every glBindTexture walked the whole live list under a lock and asked the surface for its seed. The table is indexed
+    // by the low 16 bits of the name (two names 65536 apart would share a slot and one of them be checked a frame late).
+    { static uint32_t seen[65536]; uint32_t k = name & 0xffffu; if (seen[k] == g_frame) return; seen[k] = g_frame; }
     LiveSrc e; BOOL hit = NO;
     pthread_mutex_lock(&g_live_lock);
     for (int i = 0; i < g_nlive; i++) if (g_live[i].ctx == c && g_live[i].name == name) {
