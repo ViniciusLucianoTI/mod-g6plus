@@ -1,0 +1,64 @@
+From e5c81052fa08c6dd03b6d8e4081cadc3fd5788f7 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Wed, 18 Nov 2026 01:42:11 -0300
+Subject: [PATCH] sweet: APM switch values as observed: mode 0x2, status & 0x1f
+ == 0x3
+
+---
+ bsd/dev/sweet_a508.c | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index a067ebd1d..6105bf762 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -1550,8 +1550,9 @@ static volatile uint32_t a5cpu_request[2];      /* MHz asked for per cluster, 0
+  * 868 mV from the bootloader) at the 900 mV this phone's CPR uses, and 900 is above the 872 mV "APM threshold":
+  * past it the cluster's memory arrays must run from the APC rail instead of MX. The stock kernel leaves both to
+  * hardware (CPRh through SAW, the OSM sequencer for the array power mux), off here. By hand, as the sequencer is
+- * programmed in clock-osm.c: rail to the 872 mV crossover, mode control (0x179d0004) field 0x1f = 0x3, status
+- * (0x179d000c) bit 1 = on APC, then the rail up. Down: the reverse. Target mV: boot-arg sweetcpulittlemv
++ * programmed in clock-osm.c: rail to the 872 mV crossover, mode control (0x179d0004) = 0x2, status (0x179d000c)
++ * low five bits = 0x3 when on APC (tried by hand 2026-11-18: 0x2 gives status 0xff000303 at once, 0x3 gives nothing,
++ * 0 gives 0: the msm8953 values of drivers/power/qcom/apm.c), then the rail up. Down: the reverse. Target mV: boot-arg sweetcpulittlemv
+  * (default 912 = the measured 900 plus 12 for having no closed loop; never above the 940 of the open-loop table).
+  */
+ extern bool sweet_evert_pmic_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -1613,21 +1614,21 @@ a5cpu_little_rail(bool high)
+ 			printf("SWEET CPUCLK: little rail: S1 did not take 872 mV (reads %d)\n", a5cpu_s1_mv());
+ 			return false;
+ 		}
+-		a5_wr(a5cpu_apm, 0x4, (mode0 & ~0x1fu) | 0x3u);
++		a5_wr(a5cpu_apm, 0x4, (mode0 & ~0x1fu) | 0x2u);
+ 		uint32_t st = 0;
+ 		for (int i = 0; i < 5000; i++) {
+ 			st = a5_rd(a5cpu_apm, 0xc);
+-			if (st & 0x2u) {
++			if ((st & 0x1fu) == 0x3u) {
+ 				break;
+ 			}
+ 			delay(1);
+ 		}
+-		if (!(st & 0x2u)) {
++		if ((st & 0x1fu) != 0x3u) {
+ 			a5_wr(a5cpu_apm, 0x4, mode0);
+ 			delay(500);
+ 			(void)a5cpu_s1_set(s1);
+ 			printf("SWEET CPUCLK: little rail: APM did not report APC mode (mode 0x%08x -> 0x%08x, status 0x%08x -> 0x%08x); put back, S1 %d mV\n",
+-			    mode0, (mode0 & ~0x1fu) | 0x3u, st0, st, a5cpu_s1_mv());
++			    mode0, (mode0 & ~0x1fu) | 0x2u, st0, st, a5cpu_s1_mv());
+ 			return false;
+ 		}
+ 		bool ok = a5cpu_s1_set((int)mv);
+@@ -1641,7 +1642,7 @@ a5cpu_little_rail(bool high)
+ 	uint32_t st = 0;
+ 	for (int i = 0; i < 5000; i++) {
+ 		st = a5_rd(a5cpu_apm, 0xc);
+-		if (!(st & 0x2u)) {
++		if ((st & 0x1fu) == 0) {
+ 			break;
+ 		}
+ 		delay(1);
+-- 
+2.56.0
+
