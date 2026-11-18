@@ -1,0 +1,89 @@
+From c4f4a25c57ec9966c578730b227d6cb78caa6668 Mon Sep 17 00:00:00 2001
+From: ViniciusLucianoTI <viniciusluciano2012@hotmail.com>
+Date: Wed, 18 Nov 2026 00:45:12 -0300
+Subject: [PATCH] sweet: read-only report of the PMICs' SMPS regulators (evert,
+ sweetcpuclkdump=1)
+
+---
+ bsd/dev/sweet_a508.c |  2 ++
+ bsd/dev/sweet_keys.c | 51 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/bsd/dev/sweet_a508.c b/bsd/dev/sweet_a508.c
+index a1bb95986..0ee8c2909 100644
+--- a/bsd/dev/sweet_a508.c
++++ b/bsd/dev/sweet_a508.c
+@@ -1538,6 +1538,8 @@ a5_gov_thread(void *arg __unused, wait_result_t wr __unused)
+ 				printf("\n");
+ 			}
+ 		}
++		extern void sweet_evert_pmic_smps_report(void);
++		sweet_evert_pmic_smps_report();
+ 		vm_offset_t osm = ml_io_map(0x179c0000, 0x4000);
+ 		if (osm) {
+ 			for (uint32_t base = 0; base < 0x4000; base += 0x2000) {
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 8af1f73ac..31c37e983 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -213,6 +213,57 @@ sweet_keys_init(void)
+ 	}
+ }
+ 
++/*
++ * Read-only look at the PMICs' switching regulators on the Moto G6 Plus (boot-arg sweetcpuclkdump=1, from the GPU
++ * thread once the keys have mapped the arbiter): type, subtype, the two voltage set-point bytes, mode and enable
++ * of every SMPS peripheral (0x14 + 3n) the arbiter knows on the four slave ids. The CPU cluster rails are among
++ * them and nothing in this kernel knows which or at what voltage the bootloader left them.
++ */
++void sweet_evert_pmic_smps_report(void);
++void
++sweet_evert_pmic_smps_report(void)
++{
++	static const uint8_t regs[] = { 0x04, 0x05, 0x40, 0x41, 0x44, 0x45, 0x46, 0x08 };
++	if (!keys_core || !keys_per_apid) {
++		printf("SWEET PMIC: arbiter not mapped (sweetkeys=1 needed), no regulator report\n");
++		return;
++	}
++	for (unsigned sid = 0; sid < 4; sid++) {
++		for (unsigned per = 0x14; per <= 0x26; per += 3) {
++			uint16_t apid = keys_find_apid((uint16_t)((sid << 8) | per), 512);
++			if (apid == KEYS_NO_APID) {
++				continue;
++			}
++			vm_offset_t va = ml_io_map(0x09400000u + 0x8000u * apid, 0x1000);
++			if (!va) {
++				continue;
++			}
++			uint8_t v[sizeof(regs)] = { 0 };
++			bool ok[sizeof(regs)] = { false };
++			for (unsigned r = 0; r < sizeof(regs); r++) {
++				uint32_t cmd = (1u << 27) | ((uint32_t)regs[r] << 4);
++				__asm__ volatile("dmb oshst" ::: "memory");
++				*(volatile uint32_t *)va = cmd;
++				__asm__ volatile("dsb osh" ::: "memory");
++				for (unsigned i = 0; i < 1000; ++i) {
++					uint32_t st = keys_rd(va, 0x08u);
++					if (st & 1u) {
++						if (!(st & 0x0eu)) {
++							v[r] = (uint8_t)keys_rd(va, 0x18u);
++							ok[r] = true;
++						}
++						break;
++					}
++					delay(1);
++				}
++			}
++			printf("SWEET PMIC: sid %u SMPS at 0x%02x00 (apid %u, owner %u): type 0x%02x/%d subtype 0x%02x/%d VSET 0x%02x%02x/%d%d (= %u as little-endian) 0x44 0x%02x mode 0x%02x/%d enable 0x%02x/%d status 0x%02x\n",
++			    sid, per, apid, keys_rd(keys_cnfg, 0x700u + 4u * apid) & 7u, v[0], ok[0], v[1], ok[1], v[3], v[2], ok[2], ok[3],
++			    (unsigned)v[2] | ((unsigned)v[3] << 8), v[4], v[5], ok[5], v[6], ok[6], v[7]);
++		}
++	}
++}
++
+ void sweet_keys_init_evert(void);
+ void
+ sweet_keys_init_evert(void)
+-- 
+2.56.0
+
