@@ -788,6 +788,8 @@ static void fbk_dbg_plain(struct _EAGLContextPrivate *p) {
             glIsEnabled(GL_BLEND), sr, dr, sa, da, eq, cm[0], cm[1], cm[2], cm[3], glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3]);
     if (pp && st) { const float *a = pp, *b = (const float *)((const char *)pp + 2 * st); fprintf(stderr, " pos (%g %g)-(%g %g)", a[0], a[1], b[0], b[1]); }
     if (en1 && cp) { const uint16_t *q = cp; fprintf(stderr, " colour %04x %04x %04x %04x", q[0], q[1], q[2], q[3]); }
+    { void *state = NULL; uint8_t st[0x1b8]; if (p->ca_ctx && safe_read((const char *)p->ca_ctx + 0x10, &state, sizeof state) && state && safe_read(state, st, sizeof st)) fprintf(stderr, " CA fn 0x%x blend 0x%x", st[0x10], st[0x1b0]); }
+    { GLint w = 0, h = 0, f = 0; if (p->unit_tex[0]) { if (p->act) o_ActiveTexture(GL_TEXTURE0); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &w); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &h); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1003, &f); if (p->act) o_ActiveTexture(GL_TEXTURE0 + p->act); fprintf(stderr, " tex0 %dx%d ifmt 0x%x", w, h, f); } }
     fprintf(stderr, "\n");
 }
 #define FBK_DRAW(call) do { EAGLContext *fc_ = cur_ctx(); int p0_ = fc_ && !fc_->_private->cur_prog ? p0_pre(fc_->_private) : 0; unsigned fm_ = fc_ ? fbk_pre(fc_->_private) : 0; int fd_ = 0; if (fm_) { fbk_dbg_pre(fc_->_private, fm_); fd_ = g_fbk_dbg; } if (fc_ && g_fbk_dbg > 0) fbk_dbg_plain(fc_->_private); call; if (fm_) { fbk_post(fc_->_private, fm_); if (fd_) fbk_dbg_post(); } if (p0_) { if (p0_ == 2) { o_ActiveTexture(GL_TEXTURE1); o_BindTexture(GL_TEXTURE_2D, fc_->_private->unit_tex[1]); o_ActiveTexture(GL_TEXTURE0 + fc_->_private->act); } o_UseProgram(0); } } while (0)
@@ -1322,7 +1324,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
     // currently bound at that target gets the IOSurface as its storage. A plain object name (our own tests) is still accepted.
     struct _EAGLContextPrivate *p = _private;
     int kind = 0;
-    BOOL direct = NO;
+    BOOL direct = NO, source_only = NO;
     GLuint name = (GLuint)image;
     if (surface && (image == GL_TEXTURE_2D || image == GL_RENDERBUFFER || image == 0x84f5)) g_target_attach = 1;
     if (surface && (image == GL_TEXTURE_2D || image == GL_RENDERBUFFER || image == 0x84f5 /* TEXTURE_RECTANGLE */)) {
@@ -1343,6 +1345,24 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             // keep what the surface already shows: CoreAnimation redraws only the damaged part of a swap-chain buffer
             else if (IOSurfaceGetPixelFormat(surface) == 'BGRA')
                 [self texImageIOSurface:surface target:GL_TEXTURE_2D internalFormat:GL_RGBA width:w height:h format:GL_BGRA_EXT type:GL_UNSIGNED_BYTE plane:0 invert:!inverted];   // same row order as the sync
+            else {
+                // A surface in another format is an image CoreAnimation samples (attach_surface_texture: the tab bar glyphs of the Phone app are
+                // 70x70 surfaces attached this way; without their pixels they drew nothing). Load it in its own format and never write back to it.
+                OSType pf = IOSurfaceGetPixelFormat(surface); GLenum fi = 0, ff = 0, ft = GL_UNSIGNED_BYTE;
+                switch (pf) {
+                case 'A008': case 'A8  ': fi = ff = GL_ALPHA; break;
+                case 'L008': fi = ff = GL_LUMINANCE; break;
+                case 'LA08': fi = ff = GL_LUMINANCE_ALPHA; break;
+                case 'RGBA': fi = ff = GL_RGBA; break;
+                case 'RGhA': fi = 0x881a; ff = GL_RGBA; ft = 0x140b; break;
+                default: {      // no fourcc (CoreAnimation's own image surfaces report 0): go by the bytes per element, as its texImageIOSurface calls do (4 = RGBA)
+                    size_t bpe = IOSurfaceGetBytesPerElement(surface);
+                    if (bpe == 4) fi = ff = GL_RGBA; else if (bpe == 1) fi = ff = GL_ALPHA; else if (bpe == 2) fi = ff = GL_LUMINANCE_ALPHA;
+                    break; }
+                }
+                EAGL_DEBUG("attachImage: surface %u is %ux%u fourcc %08x: %s\n", IOSurfaceGetID(surface), w, h, (unsigned)pf, fi ? "loaded as a source image" : "format not handled, left empty");
+                if (fi) { [self texImageIOSurface:surface target:GL_TEXTURE_2D internalFormat:fi width:w height:h format:ff type:ft plane:0 invert:!inverted]; source_only = YES; }
+            }
         }
         if (glGetError() != GL_NO_ERROR) EAGL_DEBUG("attachImage: storage for %ux%u failed\n", w, h);
     }
@@ -1356,7 +1376,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
         if (p->natt >= MAX_BIND) return NO;
         idx = p->natt++;
     } else { osm_sweet_forget(IOSurfaceGetID(p->att[idx].surf)); CFRelease(p->att[idx].surf); }
-    p->att[idx].name = name; p->att[idx].kind = kind; p->att[idx].surf = (IOSurfaceRef)CFRetain(surface); p->att[idx].inverted = inverted; p->att[idx].dirty = 1; p->att[idx].direct = direct;
+    p->att[idx].name = name; p->att[idx].kind = kind; p->att[idx].surf = (IOSurfaceRef)CFRetain(surface); p->att[idx].inverted = inverted; p->att[idx].dirty = source_only ? 0 : 1; p->att[idx].direct = direct;
     // CoreAnimation attaches a NEW texture to the same display surface every frame; the earlier textures keep older pixels. Syncing them all wrote
     // those stale images over the surface in array order (the flicker, the black wallpaper): only the latest attachment of a surface is valid.
     for (int j = p->natt - 1; j >= 0; j--) {
