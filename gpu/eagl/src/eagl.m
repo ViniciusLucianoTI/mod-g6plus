@@ -44,11 +44,12 @@
 #endif
 
 #define EAGL_DEBUG(...) do { if (g_debug) fprintf(stderr, "EAGL(shim): " __VA_ARGS__); } while (0)
+static uint32_t g_frame = 1; static long g_live_sum_hits;       // frame counter (glFlush) and checksum-triggered refreshes of small live images
 static int g_argb_src;          // texImageIOSurface: the 4-byte source is A,R,G,B (set by attachImage for surfaces without a fourcc)
 // Live IOSurface textures: iOS binds an IOSurface as texture storage, so a producer that writes the surface after the bind (glyph renderers, snapshot
 // decoders, Control Center material) is seen at once. The shim copies at bind time; to keep the same behaviour every uploaded surface is remembered with its
 // IOSurface seed and the texture is re-uploaded when it is bound again (glBindTexture) after the seed changed.
-typedef struct { void *ctx; GLuint name; IOSurfaceRef surf; uint32_t seed, w, h, plane; GLenum ifmt, fmt, type; BOOL invert; BOOL wrapped; BOOL argb; } LiveSrc;      // argb: the 4-byte source is A,R,G,B (g_argb_src at upload), kept for the re-uploads
+typedef struct { void *ctx; GLuint name; IOSurfaceRef surf; uint32_t seed, w, h, plane; GLenum ifmt, fmt, type; BOOL invert; BOOL wrapped; BOOL argb; uint32_t sum, frame; } LiveSrc;      // argb: the 4-byte source is A,R,G,B (g_argb_src at upload), kept for the re-uploads
 #define MAX_LIVE 768
 static LiveSrc g_live[MAX_LIVE]; static int g_nlive; static pthread_mutex_t g_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_wrapsample;              // BGL_WRAPSAMPLE=1 (marker word "wrapsample"): sample client-memory IOSurfaces with the GPU instead of copying them (experimental)
@@ -463,7 +464,7 @@ static void pipe_count_sync(EAGLContext *c) {
     size_t w = 0, h = 0; for (int i = 0; i < c->_private->natt; i++) { size_t aw = IOSurfaceGetWidth(c->_private->att[i].surf); if (aw > w) { w = aw; h = IOSurfaceGetHeight(c->_private->att[i].surf); } }
     if (w >= 1000 && h >= 2000 && ++g_ps_syncs % 60 == 0) pipe_stats_report();
 }
-static void shim_glFlush(void) { double t = g_debug ? now_ms() : 0; mesa_glFlush(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
+static void shim_glFlush(void) { g_frame++; double t = g_debug ? now_ms() : 0; mesa_glFlush(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
 static void shim_glFinish(void) { double t = g_debug ? now_ms() : 0; mesa_glFinish(); if (g_debug) g_ps_flush_ms += now_ms() - t; EAGLContext *c = cur_ctx(); if (c && c->_private->natt) { sync_attached(c); pipe_count_sync(c); } }
 
 // Dirty tracking of the display-size attachments: the render server draws into one texture per frame (through an FBO) and flushes; copying both of its
@@ -903,6 +904,18 @@ static void h_BindTexture(GLenum target, GLuint name) {
     for (int i = 0; i < g_nlive; i++) if (g_live[i].ctx == c && g_live[i].name == name) {
         uint32_t now = IOSurfaceGetSeed(g_live[i].surf);
         if (now != g_live[i].seed) { g_live[i].seed = now; e = g_live[i]; hit = YES; }
+        // Small images (glyphs, list icons): the seed alone misses writers. In the Photos app on the Moto G6 Plus icons stayed empty or half
+        // drawn (the surface was attached before or while the app filled it and its seed did not move afterwards). Once per frame, compare a
+        // checksum of the surface's bytes instead; the memory is mapped, no lock is taken for the read.
+        else if (!g_live[i].wrapped && (uint64_t)g_live[i].w * g_live[i].h <= 40000 && g_live[i].frame != g_frame) {
+            g_live[i].frame = g_frame;
+            const uint8_t *b = IOSurfaceGetBaseAddress(g_live[i].surf); size_t n = IOSurfaceGetAllocSize(g_live[i].surf), lim = (size_t)IOSurfaceGetBytesPerRow(g_live[i].surf) * g_live[i].h;
+            if (lim && lim < n) n = lim;
+            if (b && n >= 8 && IOSurfaceGetPlaneCount(g_live[i].surf) == 0) {
+                uint32_t sum = 2166136261u; for (size_t k = 0; k + 8 <= n; k += 8) { uint64_t q; memcpy(&q, b + k, 8); sum = (sum ^ (uint32_t)q ^ (uint32_t)(q >> 32)) * 16777619u; }
+                if (sum != g_live[i].sum) { g_live[i].sum = sum; e = g_live[i]; hit = YES; g_live_sum_hits++; }    // also the first time: the upload may have caught it empty
+            }
+        }
         break;
     }
     pthread_mutex_unlock(&g_live_lock);
@@ -911,7 +924,7 @@ static void h_BindTexture(GLenum target, GLuint name) {
     g_reupload = 1; g_argb_src = e.argb;      // without this the re-upload put the glyphs' alpha byte back into red (tab bar glyphs invisible)
     [c texImageIOSurface:e.surf target:GL_TEXTURE_2D internalFormat:e.ifmt width:e.w height:e.h format:e.fmt type:e.type plane:e.plane invert:e.invert];
     g_reupload = 0; g_argb_src = 0; g_live_reuploads++;
-    if (g_debug) { static int n; if (n++ < 100) fprintf(stderr, "EAGL(shim): live surface %u re-uploaded into texture %u (seed changed)\n", IOSurfaceGetID(e.surf), name); }
+    if (g_debug) { static int n; if (n++ < 100) fprintf(stderr, "EAGL(shim): live surface %u re-uploaded into texture %u (seed or contents changed; %ld by contents so far)\n", IOSurfaceGetID(e.surf), name, g_live_sum_hits); }
 }
 static void (*o_DeleteTextures)(GLsizei, const GLuint *);
 static void h_DeleteTextures(GLsizei n, const GLuint *t) {
