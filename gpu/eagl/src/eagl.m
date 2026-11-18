@@ -44,6 +44,7 @@
 #endif
 
 #define EAGL_DEBUG(...) do { if (g_debug) fprintf(stderr, "EAGL(shim): " __VA_ARGS__); } while (0)
+static uint8_t g_smp_used[2048], g_smp_known[2048];       // per GL program: units its sampler uniforms use (fbk_pre); forgotten when the program is linked again
 static long g_vcm_copies, g_vcm_reuses, g_fbk_copies, g_p0_draws;      // statistics for the PIPE line
 static uint32_t g_frame = 1; static long g_live_sum_hits;       // frame counter (glFlush) and checksum-triggered refreshes of small live images
 static int g_argb_src;          // texImageIOSurface: the 4-byte source is A,R,G,B (set by attachImage for surfaces without a fourcc)
@@ -565,6 +566,22 @@ static unsigned fbk_pre(struct _EAGLContextPrivate *p) {
     if (!p->fb_tex) return 0;
     for (int u = 0; u < 4; u++) if (p->unit_tex[u] == p->fb_tex) mask |= 1u << u;
     if (!mask) return 0;
+    // Only when the program really samples that unit: a destination texture left bound on a unit from an earlier pass is not a render-to-self
+    // draw (in the Photos app that was one full copy of the display per flush for nothing). Sampler units per program are read once.
+    {
+        GLuint pr = p->cur_prog;
+        if (!pr) return 0;                      // program-0 draws have their own handling (p0_pre)
+        if (pr < 2048) {
+            if (!g_smp_known[pr]) {
+                GLint nu = 0; uint8_t m = 0; glGetProgramiv(pr, GL_ACTIVE_UNIFORMS, &nu);
+                for (GLint i = 0; i < nu; i++) { char nm[64]; GLint sz = 0, v = -1; GLenum ty = 0; glGetActiveUniform(pr, (GLuint)i, sizeof nm, NULL, &sz, &ty, nm);
+                    if (ty == GL_SAMPLER_2D) { GLint l = glGetUniformLocation(pr, nm); if (l >= 0) { glGetUniformiv(pr, l, &v); if (v >= 0 && v < 8) m |= (uint8_t)(1u << v); } } }
+                g_smp_used[pr] = m; g_smp_known[pr] = 1;
+            }
+            mask &= g_smp_used[pr];
+            if (!mask) return 0;
+        }
+    }
     static int off = -1, tick; if (off < 0 || !(tick++ & 255)) off = getenv("BGL_NO_FEEDBACK_COPY") != NULL || access("/private/var/tmp/bgl-nofbk", F_OK) == 0;
     if (off) return 0;
     p->vc_valid = 0; g_fbk_copies++; // the scratch texture is about to hold something else
@@ -1036,6 +1053,7 @@ static void h_CompileShader(GLuint sh) {
 static void (*o_LinkProgram)(GLuint);
 static void h_LinkProgram(GLuint prog) {
     o_LinkProgram(prog);
+    if (prog < 2048) g_smp_known[prog] = 0;
     if (!g_debug) return;
     { GLuint as[4]; GLsizei an = 0; glGetAttachedShaders(prog, 4, &an, as);
       for (GLsizei i = 0; i < an; i++) for (int j = 0; j < g_rect_nsh; j++) if (as[i] == g_rect_sh[j] && g_rect_nprog < 32) g_rect_prog[g_rect_nprog++] = prog; }
