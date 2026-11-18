@@ -134,6 +134,7 @@ struct _EAGLContextPrivate {
     GLuint unit_tex[8]; int act; GLuint fb_tex; GLuint fbk_tex; int fbk_w, fbk_h; long fbk_n;
     // program 0 emulation (p0_pre): the program CoreAnimation has current, where it keeps its vertex matrix, our stand-in programs
     GLuint cur_prog; const GLfloat *vmat; GLuint p0_prog[4]; GLint p0_umat[4], p0_utm[4]; long p0_n;
+    void *ca_ctx;                   // CoreAnimation's CA::OGL::GLContext for this context (eagl_macro_enter), NULL until found
     EAGLContext *owner;             // not retained: the context this block belongs to (eagl_macro_enter)
 };
 
@@ -642,6 +643,7 @@ static void fbk_dbg_post(void) {
 // Moto G6 Plus, softpipe and Adreno alike). Stand-in: texel (times the vertex colour when that array is enabled), same vertex layout as CA's
 // generated programs (attribute 0 position, 1 colour, 2 texcoord0 in texels), CA's own vertex matrix (the pointer it last gave glUniformMatrix4fv
 // for location 0) and texmat0 = 1 / size of the bound texture, as it sets for its own programs.
+static int safe_read(const void *addr, void *out, size_t n);
 static void (*o_UseProgram)(GLuint);
 static void (*o_UniformMatrix4fv)(GLint, GLsizei, GLboolean, const GLfloat *);
 static void h_UseProgram(GLuint prog) { o_UseProgram(prog); EAGLContext *c = cur_ctx(); if (c) c->_private->cur_prog = prog; }
@@ -669,6 +671,16 @@ static GLuint p0_build(int kind, GLint *umat, GLint *utm) {       // 0 = texture
 static int p0_pre(struct _EAGLContextPrivate *p) {
     static int off = -1; if (off < 0) off = getenv("BGL_NO_PROGRAM0") != NULL;
     if (off || !p->vmat) return 0;
+    // Which shader function CoreAnimation wants (its ContextState, byte 0x10; codes from CA::OGL::MetalContext::TextureFunction_codes): the GL
+    // renderer of iOS 16.7 has no shader for some of them and draws with program 0. Seen on the lock screen: 0x14 "c4p" and 0x1c "ds8" (downsample
+    // by 8: the backdrop copy the vibrancy passes work on), which are plain texture draws here, and 0x2d "vcm" (vibrant colour matrix), which
+    // CoreAnimation's GL path already emulates with its own passes (copy, colour matrix in place, masked draw back): drawing the layer itself as
+    // well put its raw colours on screen (the red gradient over the wallpaper). So 0x2d..0x2f (vcm, vdk, vlt) are left undrawn.
+    int fn = -1;
+    if (p->ca_ctx) { void *state = NULL; uint8_t b = 0; if (safe_read((const char *)p->ca_ctx + 0x10, &state, sizeof state) && state && safe_read((const char *)state + 0x10, &b, 1)) fn = b; }
+    { static int all = -1, tick; if (all < 0 || !(tick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); all = 0; if (mf) { all = fgetc(mf) == '3'; fclose(mf); } }
+      if (!all && fn >= 0x2d && fn <= 0x2f) { static long nv; if (g_debug && (nv++ < 4 || !(nv % 5000))) fprintf(stderr, "EAGL(shim): program-0 draw for CA function 0x%x left undrawn (#%ld)\n", fn, nv); return 0; }
+      if (g_debug && fn >= 0 && fn != 0x14 && fn != 0x1c && !(fn >= 0x2d && fn <= 0x2f)) { static int seen[256]; if (!seen[fn]++) fprintf(stderr, "EAGL(shim): program-0 draw for CA function 0x%x: drawn as texture * colour (first time)\n", fn); } }
     GLint en1 = 0; glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en1);
     GLuint tex = p->unit_tex[0];
     int kind = tex ? (en1 ? 1 : 0) : 2;
@@ -695,7 +707,7 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
     // that is a red (alpha 1 -> 0) gradient surface put over the wallpaper right after a darkened copy of the backdrop was drawn: it looks like a
     // mask, not content, and drawing it as texel * colour paints a red veil the CPU-composited UI does not have. Left undrawn, as before the
     // stand-in existed. /private/var/tmp/bgl-p0mode = 3 draws it.
-    if (tex && glIsEnabled(GL_BLEND) && p->fb_tex && p->fb_tex != tex) {
+    if (getenv("BGL_P0_WHOLE_SURFACE_SKIP") && tex && glIsEnabled(GL_BLEND) && p->fb_tex && p->fb_tex != tex) {   // superseded by the function test above
         static int keep = -1, tick; if (keep < 0 || !(tick++ & 63)) { FILE *mf = fopen("/private/var/tmp/bgl-p0mode", "r"); keep = 0; if (mf) { keep = fgetc(mf) == '3'; fclose(mf); } }
         GLint dw = 0, dh = 0, st = 0; void *pp = NULL;
         o_BindTexture(GL_TEXTURE_2D, p->fb_tex); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &dw); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &dh); o_BindTexture(GL_TEXTURE_2D, p->unit_tex[p->act]);
@@ -712,6 +724,10 @@ static int p0_pre(struct _EAGLContextPrivate *p) {
         GLint en2 = 0; void *tp = NULL; glGetVertexAttribiv(2, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en2); glGetVertexAttribPointerv(2, GL_VERTEX_ATTRIB_ARRAY_POINTER, &tp);
         GLint st = 0; glGetVertexAttribiv(2, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st); const float *t = tp;
         fprintf(stderr, "EAGL(shim): program-0 draw #%ld: kind %d texture %u (%dx%d) dest %u blend %d colour array %d texcoord array %d", p->p0_n, kind, tex, w, h, p->fb_tex, glIsEnabled(GL_BLEND), en1, en2);
+        { uint8_t st[0x1b8]; void *state = NULL;
+          if (p->ca_ctx && safe_read((const char *)p->ca_ctx + 0x10, &state, sizeof state) && state && safe_read(state, st, sizeof st))
+              fprintf(stderr, " CA function 0x%x blend 0x%x flags 0x%x images %02x %02x", st[0x10], st[0x1b0], st[0x1b1], st[0x11], st[0x12]);
+          else fprintf(stderr, " CA state unknown (ctx %p)", p->ca_ctx); }
         if (en2 && t && st) fprintf(stderr, " texcoords (%g %g) (%g %g) (%g %g) (%g %g)", t[0], t[1], *(const float *)((const char *)t + st), *(const float *)((const char *)t + st + 4),
                                     *(const float *)((const char *)t + 2 * st), *(const float *)((const char *)t + 2 * st + 4), *(const float *)((const char *)t + 3 * st), *(const float *)((const char *)t + 3 * st + 4));
         { GLint ty = 0, no = 0, cst = 0; void *cp = NULL; glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty); glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &no);
@@ -1016,9 +1032,25 @@ static void eagl_install_hooks(void) {
 // below that issue GL: make that context current on this thread when it is not. iOS 16.7's CoreAnimation hands the context
 // to CA::OGL::GLESContext and calls GL through the macro context from its render thread without +setCurrentContext:, so Mesa
 // (which only knows the thread's current context) dropped every call ("function is no-op", black screen on the Moto G6 Plus).
-void eagl_macro_enter(void *rend) {
-    if (rend == t_cur_priv || !rend) return;
+// x19 / x23: the caller's registers of those names (the forwarders pass them). In CA::OGL::GLContext's methods x19 is `this` and x23 the macro
+// context (this + 0x7f8, iOS 16.7.16): the first call where x23 is our macro context and the object at x19 really holds it there gives us
+// CoreAnimation's context, whose state says which shader function and blend function a draw is for (see p0_pre).
+#include <mach/mach.h>
+static int safe_read(const void *addr, void *out, size_t n) {
+    vm_size_t got = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)addr, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n;
+}
+void eagl_macro_enter(void *rend, void *x19, void *x23) {
+    if (!rend) return;
     struct _EAGLContextPrivate *p = rend;
+    if (!p->ca_ctx && x19 && x23 == (void *)p->macro) {
+        void *held = NULL;
+        if (safe_read((const char *)x19 + 0x7f8, &held, sizeof held) && held == (void *)p->macro) {
+            p->ca_ctx = x19;
+            if (g_debug) fprintf(stderr, "EAGL(shim): CoreAnimation's GL context object is at %p\n", x19);
+        }
+    }
+    if (rend == t_cur_priv) return;
     static int n; if (g_debug && n++ < 8) fprintf(stderr, "EAGL(shim): context %p made current on thread %p by a GL call\n", p->owner, (void *)pthread_self());
     if (p->owner) [EAGLContext setCurrentContext:p->owner];
 }
@@ -1132,7 +1164,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 }
 
 - (BOOL)renderbufferStorage:(NSUInteger)target fromDrawable:(id<EAGLDrawable>)drawable {
-    eagl_macro_enter(_private);
+    eagl_macro_enter(_private, NULL, NULL);
     struct _EAGLContextPrivate *p = _private;
     if (cur_ctx() != self || target != GL_RENDERBUFFER) return NO;
     GLint rb = 0;
@@ -1178,7 +1210,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 }
 
 - (BOOL)presentRenderbuffer:(NSUInteger)target {
-    eagl_macro_enter(_private);
+    eagl_macro_enter(_private, NULL, NULL);
     struct _EAGLContextPrivate *p = _private;
     if (cur_ctx() != self || target != GL_RENDERBUFFER) return NO;
     GLint rb = 0;
@@ -1207,7 +1239,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 
 // --- IOSurface ---
 - (BOOL)attachImage:(NSUInteger)image toCoreSurface:(IOSurfaceRef)surface invertedRender:(BOOL)inverted {
-    eagl_macro_enter(_private);
+    eagl_macro_enter(_private, NULL, NULL);
     // `image` is a GL TARGET (CoreAnimation passes GL_TEXTURE_2D = 3553, found by dumping the server's calls on the phone): the image
     // currently bound at that target gets the IOSurface as its storage. A plain object name (our own tests) is still accepted.
     struct _EAGLContextPrivate *p = _private;
@@ -1277,7 +1309,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 - (BOOL)texImageIOSurface:(IOSurfaceRef)ioSurface target:(NSUInteger)target internalFormat:(NSUInteger)internalFormat
                     width:(uint32_t)width height:(uint32_t)height format:(NSUInteger)format type:(NSUInteger)type
                     plane:(uint32_t)plane invert:(BOOL)invert {
-    eagl_macro_enter(_private);
+    eagl_macro_enter(_private, NULL, NULL);
     if (ioSurface) EAGL_DEBUG("texImageIOSurface source: surface %u fourcc %08x planes %zu %zux%zu bpr %zu\n", IOSurfaceGetID(ioSurface), (unsigned)IOSurfaceGetPixelFormat(ioSurface), IOSurfaceGetPlaneCount(ioSurface), IOSurfaceGetWidth(ioSurface), IOSurfaceGetHeight(ioSurface), IOSurfaceGetBytesPerRow(ioSurface));
     if (g_debug && ioSurface && IOSurfaceGetWidth(ioSurface) * IOSurfaceGetHeight(ioSurface) >= 400000 && IOSurfaceLock(ioSurface, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
         const uint8_t *q = IOSurfaceGetBaseAddress(ioSurface); size_t qb = IOSurfaceGetBytesPerRow(ioSurface), qh = IOSurfaceGetHeight(ioSurface), qw = IOSurfaceGetWidth(ioSurface), nz = 0, tot = 0;
